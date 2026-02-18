@@ -95,8 +95,7 @@ If building for VR/XR:
 
 - **Runtime Loading:** The ability to load new worlds dynamically while inside the headset (runtime) is currently not supported.
 
-## Credits
+## Acknowledgements & Credits 
+This project was created as part of the SensAI Hack(https://sensaihack.com/) - Worlds in Action. 
 
-- **Aras Pranckevičius**
-- **Johannes Tscharn**
-- **Rik Turnbull**
+Powered by SensAI Hackademy (https://sensaihackademy.com/). 
