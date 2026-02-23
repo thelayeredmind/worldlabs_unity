@@ -2157,7 +2157,7 @@ namespace WorldLabs.Editor
             GUILayout.Space(5);
             
             WorldLabsEditorWindow._loadToScene = EditorGUILayout.Toggle("Load to Scene", WorldLabsEditorWindow._loadToScene);
-            
+
             GUILayout.Space(5);
             EditorGUILayout.HelpBox("If enabled, the Gaussian Splat will be added to the active scene. Otherwise, the folder will open in Explorer.", MessageType.Info);
 

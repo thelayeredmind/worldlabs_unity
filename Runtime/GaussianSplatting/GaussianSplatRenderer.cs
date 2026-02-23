@@ -75,9 +75,7 @@ namespace GaussianSplatting.Runtime
         {
             int count = 0;
             foreach (var splat in m_ActiveSplats)
-            {
-                count += splat.Item1.asset.splatCount;
-            }
+                count += splat.Item1.splatCount;
             return count;
         }
 
@@ -231,6 +229,10 @@ namespace GaussianSplatting.Runtime
         }
         public GaussianSplatAsset m_Asset;
 
+        // Runtime-loaded data (no AssetDatabase required, works in builds).
+        // Set via LoadFromRuntimeData(); mutually exclusive with m_Asset.
+        RuntimeSplatData m_RuntimeData;
+
         [Range(0.1f, 2.0f)] [Tooltip("Additional scaling factor for the splats")]
         public float m_SplatScale = 1.0f;
         [Range(0.05f, 20.0f)]
@@ -379,14 +381,17 @@ namespace GaussianSplatting.Runtime
             CopySplats,
         }
 
+        public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
+
         public bool HasValidAsset =>
-            m_Asset != null &&
-            m_Asset.splatCount > 0 &&
-            m_Asset.formatVersion == GaussianSplatAsset.kCurrentVersion &&
-            m_Asset.posDataSize > 0 &&
-            m_Asset.otherDataSize > 0 &&
-            m_Asset.shDataSize > 0 &&
-            m_Asset.colorDataSize > 0;
+            HasValidRuntimeData ||
+            (m_Asset != null &&
+             m_Asset.splatCount > 0 &&
+             m_Asset.formatVersion == GaussianSplatAsset.kCurrentVersion &&
+             m_Asset.posDataSize > 0 &&
+             m_Asset.otherDataSize > 0 &&
+             m_Asset.shDataSize > 0 &&
+             m_Asset.colorDataSize > 0);
         public bool HasValidRenderSetup => m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null;
 
         const int kGpuViewDataSize = 40;
@@ -402,6 +407,18 @@ namespace GaussianSplatting.Runtime
 
             UpdateRessources();
         }
+
+        /// <summary>
+        /// Load a world at runtime from pre-processed byte buffers.
+        /// Clears any previously assigned <see cref="m_Asset"/>; works in builds without AssetDatabase.
+        /// </summary>
+        public void LoadFromRuntimeData(RuntimeSplatData data)
+        {
+            m_RuntimeData = data;
+            m_Asset       = null;
+            if (m_MatSplats != null) // already initialized
+                UpdateRessources();
+        }
         
         static int SplatIndexToTextureIndex(uint idx)                                                                                                                                                                                  
         {
@@ -416,9 +433,15 @@ namespace GaussianSplatting.Runtime
         public void UpdateRessources()
         {
             DisposeResourcesForAsset();
-            
-            if (!HasValidAsset) 
+
+            if (!HasValidAsset)
                 return;
+
+            if (HasValidRuntimeData)
+            {
+                LoadFromRuntimeDataInternal(m_RuntimeData);
+                return;
+            }
 
             // Initialize m_LayerActivationState if null (default to all layers active)
             if (m_LayerActivationState == null)
@@ -530,7 +553,7 @@ namespace GaussianSplatting.Runtime
                 m_GpuChunksValid = false;
             }
             
-            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_Asset.splatCount, kGpuViewDataSize);
+            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize);
             m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
             // cube indices, most often we use only the first quad
             m_GpuIndexBuffer.SetData(new ushort[]
@@ -556,6 +579,106 @@ namespace GaussianSplatting.Runtime
             {
                 InitSortBuffers(splatCount);
             }
+        }
+
+        // Returns the packed format integer consumed by shaders and compute shaders.
+        uint GetSplatFormat()
+        {
+            if (HasValidRuntimeData)
+                return (uint)m_RuntimeData.posFormat | ((uint)m_RuntimeData.scaleFormat << 8) | ((uint)m_RuntimeData.shFormat << 16);
+            return (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
+        }
+
+        uint GetSplatPosFormatInt()
+        {
+            if (HasValidRuntimeData)
+                return (uint)m_RuntimeData.posFormat;
+            return (uint)m_Asset.posFormat;
+        }
+
+        void LoadFromRuntimeDataInternal(RuntimeSplatData data)
+        {
+            m_SplatCount = data.splatCount;
+
+            // Build NativeArrays from managed byte[] and upload to GPU.
+            int posLen   = RuntimeSplatProcessing.NextMultipleOf(data.posData.Length,   4);
+            int othLen   = RuntimeSplatProcessing.NextMultipleOf(data.othData.Length,   4);
+            int shLen    = RuntimeSplatProcessing.NextMultipleOf(data.shData.Length,    4);
+            int colLen   = data.colData.Length;
+            int chkLen   = data.chkData?.Length ?? 0;
+
+            var posDataArr   = new NativeArray<byte>(posLen, Allocator.Temp);
+            var otherDataArr = new NativeArray<byte>(othLen, Allocator.Temp);
+            var shDataArr    = new NativeArray<byte>(shLen,  Allocator.Temp);
+            var colorDataArr = new NativeArray<byte>(colLen, Allocator.TempJob);
+            var chunkDataArr = new NativeArray<byte>(chkLen, Allocator.Temp);
+
+            NativeArray<byte>.Copy(data.posData,              posDataArr,   data.posData.Length);
+            NativeArray<byte>.Copy(data.othData,              otherDataArr, data.othData.Length);
+            NativeArray<byte>.Copy(data.shData,               shDataArr,    data.shData.Length);
+            NativeArray<byte>.Copy(data.colData,              colorDataArr, data.colData.Length);
+            if (data.chkData != null)
+                NativeArray<byte>.Copy(data.chkData, chunkDataArr, data.chkData.Length);
+
+            m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, posDataArr.Length / 4, 4) { name = "GaussianPosData" };
+            m_GpuPosData.SetData(posDataArr);
+
+            m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, otherDataArr.Length / 4, 4) { name = "GaussianOtherData" };
+            m_GpuOtherData.SetData(otherDataArr);
+
+            m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, shDataArr.Length / 4, 4) { name = "GaussianSHData" };
+            m_GpuSHData.SetData(shDataArr);
+
+            var convertedColorData = GaussianImageCreator.CreateColorData(colorDataArr.Reinterpret<float4>(1), data.colorFormat);
+            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(m_SplatCount);
+            var texFormat = GaussianSplatAsset.ColorFormatToGraphics(data.colorFormat);
+            var tex = new Texture2D(texWidth, texHeight, texFormat,
+                TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate)
+                { name = "GaussianColorData" };
+            tex.SetPixelData(convertedColorData, 0);
+            tex.Apply(false, true);
+            m_GpuColorData = tex;
+            convertedColorData.Dispose();
+
+            if (chkLen > 0)
+            {
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
+                    chkLen / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>(),
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
+                m_GpuChunks.SetData(chunkDataArr);
+                m_GpuChunksValid = true;
+            }
+            else
+            {
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1,
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
+                m_GpuChunksValid = false;
+            }
+
+            // No layer buffer needed for runtime single-layer data.
+            m_GpuLayerData = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 4) { name = "GaussianLayerData" };
+
+            m_GpuView        = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize);
+            m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
+            m_GpuIndexBuffer.SetData(new ushort[]
+            {
+                0, 1, 2, 1, 3, 2,
+                4, 6, 5, 5, 6, 7,
+                0, 2, 4, 4, 2, 6,
+                1, 5, 3, 5, 7, 3,
+                0, 4, 1, 4, 5, 1,
+                2, 3, 6, 3, 7, 6
+            });
+
+            posDataArr.Dispose();
+            otherDataArr.Dispose();
+            shDataArr.Dispose();
+            colorDataArr.Dispose();
+            chunkDataArr.Dispose();
+
+            UpdateSortingType(m_gpuSortType);
+            if (m_CSSplatUtilities != null && m_Sorter != null)
+                InitSortBuffers(m_SplatCount);
         }
 
         void InitSortBuffers(int count)
@@ -662,8 +785,7 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.OrderBuffer, m_GpuSortKeys);
 
             cmb.SetComputeIntParam(cs, Props.SplatBitsValid, m_GpuEditSelected != null && m_GpuEditDeleted != null ? 1 : 0);
-            uint format = (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
-            cmb.SetComputeIntParam(cs, Props.SplatFormat, (int)format);
+            cmb.SetComputeIntParam(cs, Props.SplatFormat, (int)GetSplatFormat());
             cmb.SetComputeIntParam(cs, Props.SplatCount, m_SplatCount);
             cmb.SetComputeIntParam(cs, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
 
@@ -682,8 +804,7 @@ namespace GaussianSplatting.Runtime
             mat.SetBuffer(Props.SplatSelectedBits, m_GpuEditSelected ?? m_GpuPosData);
             mat.SetBuffer(Props.SplatDeletedBits, m_GpuEditDeleted ?? m_GpuPosData);
             mat.SetInt(Props.SplatBitsValid, m_GpuEditSelected != null && m_GpuEditDeleted != null ? 1 : 0);
-            uint format = (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
-            mat.SetInteger(Props.SplatFormat, (int)format);
+            mat.SetInteger(Props.SplatFormat, (int)GetSplatFormat());
             mat.SetInteger(Props.SplatCount, m_SplatCount);
             mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
             mat.SetInteger(Props.OptimizeForQuest, m_OptimizeForQuest ? 1 : 0);
@@ -812,7 +933,7 @@ namespace GaussianSplatting.Runtime
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatChunks, m_GpuChunks);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatPos, m_GpuPosData);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatLayer, m_GpuLayerData);
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)m_Asset.posFormat);
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)GetSplatPosFormatInt());
             cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
@@ -832,12 +953,16 @@ namespace GaussianSplatting.Runtime
                 Initialize();
             }
             
-            var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
-            if (m_PrevAsset != m_Asset || m_PrevHash != curHash || m_centerEyeCamera == null)
+            // Skip asset-change detection when using runtime data (it never changes via m_Asset).
+            if (!HasValidRuntimeData)
             {
-                m_PrevAsset = m_Asset;
-                m_PrevHash = curHash;
-                CreateResourcesForAsset();
+                var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
+                if (m_PrevAsset != m_Asset || m_PrevHash != curHash || m_centerEyeCamera == null)
+                {
+                    m_PrevAsset = m_Asset;
+                    m_PrevHash  = curHash;
+                    CreateResourcesForAsset();
+                }
             }
             
             if ((m_Sorter == null || m_Sorter.activeType != m_gpuSortType) && splatCount > 0)

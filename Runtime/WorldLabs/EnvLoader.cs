@@ -7,132 +7,132 @@ namespace WorldLabs.API
 {
     /// <summary>
     /// Utility class to load environment variables from a .env file.
+    ///
+    /// Resolution order:
+    ///   1. Resources TextAsset "WorldLabs/worldlabs_env" — embedded by the build
+    ///      preprocessor; works on ALL platforms including Android/Pico.
+    ///   2. System.IO file path — project root in the Editor, custom path if provided.
+    ///   3. System environment variables (fallback).
     /// </summary>
     public static class EnvLoader
     {
+        // Resource path written by BuildEnvCopier before each build.
+        internal const string ResourcesPath = "WorldLabs/worldlabs_env";
+
         private static Dictionary<string, string> _envVariables;
         private static bool _isLoaded = false;
 
         /// <summary>
-        /// Loads environment variables from a .env file in the project root.
+        /// Loads environment variables.
         /// </summary>
-        /// <param name="filePath">Optional custom path to the .env file. Defaults to project root.</param>
+        /// <param name="filePath">
+        /// Optional explicit file path. When null the standard resolution order is used.
+        /// </param>
         public static void Load(string filePath = null)
         {
             _envVariables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+            // ── 1. Embedded Resources TextAsset (works on Android / all platforms) ──
             if (string.IsNullOrEmpty(filePath))
             {
-                // Look for .env in project root (parent of Assets folder)
+                var textAsset = Resources.Load<TextAsset>(ResourcesPath);
+                if (textAsset != null)
+                {
+                    ParseContent(textAsset.text);
+                    Debug.Log($"[EnvLoader] Loaded {_envVariables.Count} variables from embedded Resources.");
+                    _isLoaded = true;
+                    return;
+                }
+            }
+
+            // ── 2. File system ────────────────────────────────────────────────────
+            if (string.IsNullOrEmpty(filePath))
+            {
+                // In the Editor, read straight from the project root for convenience.
                 string projectRoot = Directory.GetParent(Application.dataPath).FullName;
                 filePath = Path.Combine(projectRoot, ".env");
             }
 
             if (!File.Exists(filePath))
             {
-                Debug.LogWarning($"[EnvLoader] .env file not found at: {filePath}");
+                Debug.LogWarning($"[EnvLoader] .env not found at '{filePath}' and no embedded resource present.");
                 _isLoaded = true;
                 return;
             }
 
             try
             {
-                string[] lines = File.ReadAllLines(filePath);
-                foreach (string line in lines)
-                {
-                    // Skip empty lines and comments
-                    string trimmedLine = line.Trim();
-                    if (string.IsNullOrEmpty(trimmedLine) || trimmedLine.StartsWith("#"))
-                    {
-                        continue;
-                    }
-
-                    // Parse KEY=VALUE format
-                    int equalsIndex = trimmedLine.IndexOf('=');
-                    if (equalsIndex > 0)
-                    {
-                        string key = trimmedLine.Substring(0, equalsIndex).Trim();
-                        string value = trimmedLine.Substring(equalsIndex + 1).Trim();
-
-                        // Remove surrounding quotes if present
-                        if ((value.StartsWith("\"") && value.EndsWith("\"")) ||
-                            (value.StartsWith("'") && value.EndsWith("'")))
-                        {
-                            value = value.Substring(1, value.Length - 2);
-                        }
-
-                        _envVariables[key] = value;
-                    }
-                }
-
-                _isLoaded = true;
-                Debug.Log($"[EnvLoader] Loaded {_envVariables.Count} environment variables from .env");
+                ParseContent(File.ReadAllText(filePath));
+                Debug.Log($"[EnvLoader] Loaded {_envVariables.Count} variables from '{filePath}'.");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[EnvLoader] Failed to load .env file: {ex.Message}");
-                _isLoaded = true;
+                Debug.LogError($"[EnvLoader] Failed to read '{filePath}': {ex.Message}");
             }
+
+            _isLoaded = true;
         }
 
         /// <summary>
-        /// Gets an environment variable value.
-        /// First checks the loaded .env file, then falls back to system environment variables.
+        /// Gets an environment variable. Checks .env first, then system environment.
         /// </summary>
-        /// <param name="key">The environment variable key.</param>
-        /// <param name="defaultValue">Default value if not found.</param>
-        /// <returns>The environment variable value or default.</returns>
         public static string Get(string key, string defaultValue = null)
         {
-            if (!_isLoaded)
-            {
-                Load();
-            }
+            if (!_isLoaded) Load();
 
-            // First check .env variables
             if (_envVariables != null && _envVariables.TryGetValue(key, out string value))
-            {
                 return value;
-            }
 
-            // Fall back to system environment variables
-            string envValue = Environment.GetEnvironmentVariable(key);
-            if (!string.IsNullOrEmpty(envValue))
-            {
-                return envValue;
-            }
-
-            return defaultValue;
+            string sysValue = Environment.GetEnvironmentVariable(key);
+            return !string.IsNullOrEmpty(sysValue) ? sysValue : defaultValue;
         }
 
-        /// <summary>
-        /// Checks if an environment variable exists.
-        /// </summary>
-        /// <param name="key">The environment variable key.</param>
-        /// <returns>True if the variable exists.</returns>
+        /// <summary>Returns true if the key exists in .env or system environment.</summary>
         public static bool HasKey(string key)
         {
-            if (!_isLoaded)
-            {
-                Load();
-            }
+            if (!_isLoaded) Load();
 
             if (_envVariables != null && _envVariables.ContainsKey(key))
-            {
                 return true;
-            }
 
             return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(key));
         }
 
-        /// <summary>
-        /// Reloads the .env file.
-        /// </summary>
+        /// <summary>Discards cached values and reloads.</summary>
         public static void Reload()
         {
             _isLoaded = false;
             _envVariables = null;
             Load();
+        }
+
+        // ── Internal ──────────────────────────────────────────────────────────
+
+        static void ParseContent(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return;
+
+            foreach (string raw in content.Split('\n'))
+            {
+                string line = raw.Trim();
+                if (string.IsNullOrEmpty(line) || line.StartsWith("#")) continue;
+
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+
+                string key   = line.Substring(0, eq).Trim();
+                string value = line.Substring(eq + 1).Trim();
+
+                // Strip surrounding quotes
+                if (value.Length >= 2 &&
+                    ((value[0] == '"' && value[value.Length - 1] == '"') ||
+                     (value[0] == '\'' && value[value.Length - 1] == '\'')))
+                {
+                    value = value.Substring(1, value.Length - 2);
+                }
+
+                _envVariables[key] = value;
+            }
         }
     }
 }
