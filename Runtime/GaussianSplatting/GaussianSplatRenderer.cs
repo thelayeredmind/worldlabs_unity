@@ -154,6 +154,7 @@ namespace GaussianSplatting.Runtime
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
+                mpb.SetFloat(GaussianSplatRenderer.Props.AlphaDiscardThreshold, gs.m_AlphaDiscardThreshold);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
 
@@ -243,6 +244,13 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Show only Spherical Harmonics contribution, using gray color")]
         public bool m_SHOnly;
         
+        [Range(0, 1f)] [Tooltip("Splats with peak opacity below this value are culled before rasterization")]
+        public float m_ContributionCullThreshold = 0.05f;
+        [Range(0, 0.5f)] [Tooltip("Fragment alpha below this value is discarded. Controls splat edge softness vs. fill rate.")]
+        public float m_AlphaDiscardThreshold = 0.05f;
+
+        public bool test;
+
         [Range(1,30)] [Tooltip("Sort splats only every N frames")]
         public int m_SortNthFrame = 1;
 
@@ -278,6 +286,8 @@ namespace GaussianSplatting.Runtime
         internal bool m_GpuChunksValid;
         internal GraphicsBuffer m_GpuView;
         internal GraphicsBuffer m_GpuIndexBuffer;
+        internal GraphicsBuffer m_GpuVisibleIndices;
+        internal GraphicsBuffer m_GpuIndirectArgs;
         internal Camera m_centerEyeCamera;
         internal Matrix4x4 m_centerCamMatrix;
         public bool m_OptimizeForQuest;
@@ -327,6 +337,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int SplatCount = Shader.PropertyToID("_SplatCount");
             public static readonly int SHOrder = Shader.PropertyToID("_SHOrder");
             public static readonly int SHOnly = Shader.PropertyToID("_SHOnly");
+            public static readonly int ContributionCullThreshold = Shader.PropertyToID("_ContributionCullThreshold");
+            public static readonly int AlphaDiscardThreshold = Shader.PropertyToID("_AlphaDiscardThreshold");
             public static readonly int DisplayIndex = Shader.PropertyToID("_DisplayIndex");
             public static readonly int DisplayChunks = Shader.PropertyToID("_DisplayChunks");
             public static readonly int GaussianSplatRT = Shader.PropertyToID("_GaussianSplatRT");
@@ -351,6 +363,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int SplatPosMouseDown = Shader.PropertyToID("_SplatPosMouseDown");
             public static readonly int SplatOtherMouseDown = Shader.PropertyToID("_SplatOtherMouseDown");
             public static readonly int OptimizeForQuest = Shader.PropertyToID("_OptimizeForQuest");
+            public static readonly int VisibleIndices = Shader.PropertyToID("_VisibleIndices");
+            public static readonly int IndirectArgs = Shader.PropertyToID("_IndirectArgs");
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -379,6 +393,8 @@ namespace GaussianSplatting.Runtime
             ScaleSelection,
             ExportData,
             CopySplats,
+            InitCompact,
+            CompactVisible,
         }
 
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
@@ -905,6 +921,7 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatOpacityScale, m_OpacityScale);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.ContributionCullThreshold, m_ContributionCullThreshold);
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);

@@ -39,6 +39,8 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropCSSplatUtilities_fidelityFxSort;
         SerializedProperty m_gpuSortType;
         SerializedProperty m_PropOptimizeForQuest;
+        SerializedProperty m_PropContributionCullThreshold;
+        SerializedProperty m_PropAlphaDiscardThreshold;
 
         bool m_ResourcesExpanded = false;
         int m_CameraIndex = 0;
@@ -82,6 +84,8 @@ namespace GaussianSplatting.Editor
             m_PropCSSplatUtilities_fidelityFxSort = serializedObject.FindProperty("m_CSSplatUtilities_fidelityFX");
             m_gpuSortType = serializedObject.FindProperty("m_gpuSortType");
             m_PropOptimizeForQuest = serializedObject.FindProperty("m_OptimizeForQuest");
+            m_PropContributionCullThreshold = serializedObject.FindProperty("m_ContributionCullThreshold");
+            m_PropAlphaDiscardThreshold = serializedObject.FindProperty("m_AlphaDiscardThreshold");
             s_AllEditors.Add(this);
             
             // Auto-assign resources if not set
@@ -157,6 +161,8 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.PropertyField(m_CenterEyeOnly);
             }
             EditorGUILayout.PropertyField(m_PropOptimizeForQuest);
+            EditorGUILayout.PropertyField(m_PropContributionCullThreshold);
+            EditorGUILayout.PropertyField(m_PropAlphaDiscardThreshold);
 
             if (gs.HasValidAsset)
             {

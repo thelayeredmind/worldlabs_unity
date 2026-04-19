@@ -33,6 +33,7 @@ StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
 uint _OptimizeForQuest;
+half _AlphaDiscardThreshold;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
@@ -43,11 +44,18 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 
 	float4 centerClipPos = view.pos;
 
+	// Respect compute-side contribution cull or behind-camera before any recalc
+	if (centerClipPos.w <= 0)
+	{
+		o.vertex = asfloat(0x7fc00000); // NaN discards the primitive
+		return o;
+	}
+
 	// Need to recalculate here for Quest (Why tho?)
 	if (_OptimizeForQuest) {
 		SplatData splat = LoadSplatData(instID);
 		float3 centerWorldPos = mul(unity_ObjectToWorld, float4(splat.pos, 1)).xyz;
-	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));;
+	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
 	}
 
 	bool behindCam = centerClipPos.w <= 0;
@@ -111,7 +119,7 @@ half4 frag (v2f i) : SV_Target
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
 	
-    if (alpha < 0.05)
+    if (alpha < _AlphaDiscardThreshold)
         discard;
 
     half4 res = half4(i.col.rgb * alpha, alpha);
