@@ -10,7 +10,7 @@ Shader "Gaussian Splatting/Render Splats"
             ZWrite Off
             Blend OneMinusDstAlpha One
             Cull Off
-            
+
 CGPROGRAM
 #pragma vertex vert
 #pragma fragment frag
@@ -111,7 +111,7 @@ half4 frag (v2f i) : SV_Target
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
 	
-    if (alpha < 1.0/255.0)
+    if (alpha < 0.05)
         discard;
 
     half4 res = half4(i.col.rgb * alpha, alpha);

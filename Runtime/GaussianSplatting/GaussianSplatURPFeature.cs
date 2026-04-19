@@ -26,16 +26,20 @@ namespace GaussianSplatting.Runtime
                 m_RenderTarget?.Release();
             }
 
+            const float k_ResolutionScale = 0.7f;
+
             public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
             {
                 RenderTextureDescriptor rtDesc = renderingData.cameraData.cameraTargetDescriptor;
                 rtDesc.depthBufferBits = 0;
                 rtDesc.msaaSamples = 1;
                 rtDesc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
-                RenderingUtils.ReAllocateIfNeeded(ref m_RenderTarget, rtDesc, FilterMode.Point, TextureWrapMode.Clamp, name: "_GaussianSplatRT");
+                rtDesc.width = Mathf.Max(1, Mathf.RoundToInt(rtDesc.width * k_ResolutionScale));
+                rtDesc.height = Mathf.Max(1, Mathf.RoundToInt(rtDesc.height * k_ResolutionScale));
+                RenderingUtils.ReAllocateIfNeeded(ref m_RenderTarget, rtDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_GaussianSplatRT");
                 cmd.SetGlobalTexture(m_RenderTarget.name, m_RenderTarget.nameID);
 
-                ConfigureTarget(m_RenderTarget, m_Renderer.cameraDepthTargetHandle);
+                ConfigureTarget(m_RenderTarget);
                 ConfigureClear(ClearFlag.Color, new Color(0,0,0,0));
             }
 

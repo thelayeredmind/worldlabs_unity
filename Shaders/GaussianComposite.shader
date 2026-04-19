@@ -31,10 +31,12 @@ v2f vert (uint vtxID : SV_VertexID)
 }
 
 Texture2D _GaussianSplatRT;
+SamplerState sampler_GaussianSplatRT;
 
 half4 frag (v2f i) : SV_Target
 {
-    half4 col = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
+    float2 uv = i.vertex.xy / _ScreenParams.xy;
+    half4 col = _GaussianSplatRT.SampleLevel(sampler_GaussianSplatRT, uv, 0);
     col.rgb = GammaToLinearSpace(col.rgb);
     col.a = saturate(col.a * 1.5);
     return col;
