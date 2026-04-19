@@ -149,6 +149,7 @@ namespace GaussianSplatting.Runtime
                 mpb.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, gs.m_GpuView);
 
                 mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
+                mpb.SetBuffer(GaussianSplatRenderer.Props.VisibleIndices, gs.m_GpuVisibleIndices);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
@@ -162,6 +163,11 @@ namespace GaussianSplatting.Runtime
                 gs.CalcViewData(cmb, cam, matrix);
                 cmb.EndSample(s_ProfCalcView);
 
+                // compact visible splats into a dense index list for indirect draw
+                bool useIndirect = gs.m_RenderMode == GaussianSplatRenderer.RenderMode.Splats;
+                if (useIndirect)
+                    gs.CompactVisibleSplats(cmb);
+
                 // draw
                 int indexCount = 6;
                 int instanceCount = gs.splatCount;
@@ -172,7 +178,10 @@ namespace GaussianSplatting.Runtime
                     instanceCount = gs.m_GpuChunksValid ? gs.m_GpuChunks.count : 0;
 
                 cmb.BeginSample(s_ProfDraw);
-                cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, 0, topology, indexCount, instanceCount, mpb);
+                if (useIndirect && gs.m_GpuIndirectArgs != null)
+                    cmb.DrawProceduralIndirect(gs.m_GpuIndexBuffer, matrix, displayMat, 0, topology, gs.m_GpuIndirectArgs, 0, mpb);
+                else
+                    cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, 0, topology, indexCount, instanceCount, mpb);
                 cmb.EndSample(s_ProfDraw);
             }
             return matComposite;
@@ -393,8 +402,6 @@ namespace GaussianSplatting.Runtime
             ScaleSelection,
             ExportData,
             CopySplats,
-            InitCompact,
-            CompactVisible,
         }
 
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
@@ -570,6 +577,9 @@ namespace GaussianSplatting.Runtime
             }
             
             m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize);
+            m_GpuVisibleIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 4) { name = "GaussianVisibleIndices" };
+            m_GpuIndirectArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Raw, 5, 4) { name = "GaussianIndirectArgs" };
+            m_GpuIndirectArgs.SetData(new uint[] { 6, 0, 0, 0, 0 }); // indexCount, instanceCount, startIndex, baseVertex, startInstance
             m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
             // cube indices, most often we use only the first quad
             m_GpuIndexBuffer.SetData(new ushort[]
@@ -675,6 +685,9 @@ namespace GaussianSplatting.Runtime
             m_GpuLayerData = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 4) { name = "GaussianLayerData" };
 
             m_GpuView        = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize);
+            m_GpuVisibleIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 4) { name = "GaussianVisibleIndices" };
+            m_GpuIndirectArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Raw, 5, 4) { name = "GaussianIndirectArgs" };
+            m_GpuIndirectArgs.SetData(new uint[] { 6, 0, 0, 0, 0 }); // indexCount, instanceCount, startIndex, baseVertex, startInstance
             m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
             m_GpuIndexBuffer.SetData(new ushort[]
             {
@@ -843,6 +856,8 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuChunks);
 
             DisposeBuffer(ref m_GpuView);
+            DisposeBuffer(ref m_GpuVisibleIndices);
+            DisposeBuffer(ref m_GpuIndirectArgs);
             DisposeBuffer(ref m_GpuIndexBuffer);
             DisposeBuffer(ref m_GpuSortDistances);
             DisposeBuffer(ref m_GpuSortKeys);
@@ -925,6 +940,26 @@ namespace GaussianSplatting.Runtime
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
+        }
+
+        internal void CompactVisibleSplats(CommandBuffer cmb)
+        {
+            if (m_CSSplatUtilities == null || m_GpuVisibleIndices == null || m_GpuIndirectArgs == null) return;
+
+            int kInit = m_CSSplatUtilities.FindKernel("CSInitCompact");
+            int kCompact = m_CSSplatUtilities.FindKernel("CSCompactVisible");
+
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, kInit, Props.IndirectArgs, m_GpuIndirectArgs);
+            cmb.DispatchCompute(m_CSSplatUtilities, kInit, 1, 1, 1);
+
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, kCompact, Props.SplatSortKeys, m_GpuSortKeys);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, kCompact, Props.SplatViewData, m_GpuView);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, kCompact, Props.VisibleIndices, m_GpuVisibleIndices);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, kCompact, Props.IndirectArgs, m_GpuIndirectArgs);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
+
+            m_CSSplatUtilities.GetKernelThreadGroupSizes(kCompact, out uint gsX, out _, out _);
+            cmb.DispatchCompute(m_CSSplatUtilities, kCompact, (m_SplatCount + (int)gsX - 1) / (int)gsX, 1, 1);
         }
 
         internal void SortPoints(CommandBuffer cmd, Camera cam, Matrix4x4 matrix)
