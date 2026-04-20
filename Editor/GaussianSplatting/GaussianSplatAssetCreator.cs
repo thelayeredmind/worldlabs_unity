@@ -426,7 +426,7 @@ namespace GaussianSplatting.Editor
                 }
                 CreatePositionsData(splats, pathPos, ref dataHash);
                 CreateOtherData(splats, pathOther, ref dataHash, shIndices);
-                CreateSimpleColorData(splats, pathCol, ref dataHash);
+                CreateColorData(splats, pathCol, ref dataHash);
                 if (!splatSHIndices.IsCreated) CreateSHData(splats, pathSh, ref dataHash, clusteredSHs);
 
                 asset.SetDataHash(dataHash);
