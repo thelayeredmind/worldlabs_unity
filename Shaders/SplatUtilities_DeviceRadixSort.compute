@@ -28,10 +28,6 @@
 #pragma kernel Scan
 #pragma kernel Downsweep
 
-// Stream compaction for indirect draw
-#pragma kernel CSInitCompact
-#pragma kernel CSCompactVisible
-
 // GPU sorting needs wave ops
 #pragma require wavebasic
 #pragma require waveballot
@@ -94,7 +90,6 @@ float _SplatScale;
 float _SplatOpacityScale;
 uint _SHOrder;
 uint _SHOnly;
-float _ContributionCullThreshold;
 
 uint _SplatCutoutsCount;
 
@@ -284,16 +279,6 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     bool behindCam = centerClipPos.w <= 0;
     if (!behindCam)
     {
-        // Frustum cull: skip splats outside the view frustum.
-        // Margin of 0.3 in NDC to avoid popping for splats with large screen-space extents.
-        float3 ndc = centerClipPos.xyz / centerClipPos.w;
-        if (any(abs(ndc.xy) > 1.3) || ndc.z < -0.1 || ndc.z > 1.1)
-        {
-            view.pos.w = 0;
-            _SplatViewData[idx] = view;
-            return;
-        }
-
         float4 boxRot = splat.rot;
         float3 boxSize = splat.scale;
 
@@ -316,15 +301,6 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         half4 col;
         col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
         col.a = min(splat.opacity * opacityScale, 65000);
-
-        // Cull splats below threshold before rasterization (more efficient than fragment discard)
-        if (col.a < _ContributionCullThreshold)
-        {
-            view.pos.w = 0;
-            _SplatViewData[idx] = view;
-            return;
-        }
-
         view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
         view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
     }
@@ -835,57 +811,4 @@ void CSCopySplats (uint3 id : SV_DispatchThreadID)
         uint dstBitIdx = dstIdx & 31;
         _CopyDstEditDeleted.InterlockedOr(dstWordIdx * 4, 1u << dstBitIdx);
     }
-}
-
-RWStructuredBuffer<uint> _VisibleIndices;
-RWByteAddressBuffer _IndirectArgs;
-
-[numthreads(1, 1, 1)]
-void CSInitCompact(uint3 id : SV_DispatchThreadID)
-{
-    _IndirectArgs.Store(4, 0u); // zero instance count before compaction
-}
-
-groupshared uint gs_scan[GROUP_SIZE];
-groupshared uint gs_groupBase;
-
-// Hillis-Steele inclusive prefix sum + atomic group slot claim.
-// Processes _SplatSortKeys in back-to-front order (the sort output).
-// Each group of 1024 threads claims a contiguous range in _VisibleIndices,
-// preserving back-to-front ordering without wave intrinsics.
-[numthreads(GROUP_SIZE, 1, 1)]
-void CSCompactVisible(uint3 id : SV_DispatchThreadID, uint gid : SV_GroupIndex)
-{
-    uint i = id.x;
-    uint origIdx = 0;
-    uint vis = 0;
-    if (i < _SplatCount)
-    {
-        origIdx = _SplatSortKeys[i];
-        vis = (_SplatViewData[origIdx].pos.w > 0) ? 1u : 0u;
-    }
-
-    gs_scan[gid] = vis;
-    GroupMemoryBarrierWithGroupSync();
-
-    // Parallel inclusive prefix sum (log2(GROUP_SIZE) = 10 steps)
-    [unroll]
-    for (uint stride = 1; stride < GROUP_SIZE; stride <<= 1)
-    {
-        uint val = (gid >= stride) ? gs_scan[gid - stride] : 0u;
-        GroupMemoryBarrierWithGroupSync();
-        gs_scan[gid] += val;
-        GroupMemoryBarrierWithGroupSync();
-    }
-    // gs_scan[gid] = inclusive count of visible in [0..gid] within this group
-
-    uint localOffset = gs_scan[gid] - vis; // exclusive: my output slot within group
-    uint groupCount = gs_scan[GROUP_SIZE - 1]; // total visible in this group
-
-    if (gid == GROUP_SIZE - 1 && groupCount > 0)
-        _IndirectArgs.InterlockedAdd(4, groupCount, gs_groupBase);
-    GroupMemoryBarrierWithGroupSync();
-
-    if (vis)
-        _VisibleIndices[gs_groupBase + localOffset] = origIdx;
 }

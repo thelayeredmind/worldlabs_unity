@@ -21,7 +21,6 @@ CGPROGRAM
 #include "Packages/com.worldlabs.gaussian-splatting/Shaders/GaussianSplatting.hlsl"
 
 StructuredBuffer<uint> _OrderBuffer;
-StructuredBuffer<uint> _VisibleIndices;
 
 struct v2f
 {
@@ -39,7 +38,7 @@ half _AlphaDiscardThreshold;
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
 	v2f o = (v2f)0;
-    instID = _VisibleIndices[instID];
+    instID = _OrderBuffer[instID];
 
 	SplatViewData view = _SplatViewData[instID];
 

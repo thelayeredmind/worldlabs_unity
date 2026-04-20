@@ -15,21 +15,18 @@ namespace GaussianSplatting.Runtime
     // ReSharper disable once InconsistentNaming
     class GaussianSplatURPFeature : ScriptableRendererFeature
     {
-        [Range(0.25f, 1.0f)]
-        [Tooltip("Scale applied to the splat render texture resolution. Lower = faster but softer.")]
-        public float resolutionScale = 0.7f;
-
         class GSRenderPass : ScriptableRenderPass
         {
             RTHandle m_RenderTarget;
             internal ScriptableRenderer m_Renderer = null;
             internal CommandBuffer m_Cmb = null;
-            internal float m_ResolutionScale = 0.7f;
 
             public void Dispose()
             {
                 m_RenderTarget?.Release();
             }
+
+            const float k_ResolutionScale = 0.7f;
 
             public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
             {
@@ -37,8 +34,8 @@ namespace GaussianSplatting.Runtime
                 rtDesc.depthBufferBits = 0;
                 rtDesc.msaaSamples = 1;
                 rtDesc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
-                rtDesc.width = Mathf.Max(1, Mathf.RoundToInt(rtDesc.width * m_ResolutionScale));
-                rtDesc.height = Mathf.Max(1, Mathf.RoundToInt(rtDesc.height * m_ResolutionScale));
+                rtDesc.width = Mathf.Max(1, Mathf.RoundToInt(rtDesc.width * k_ResolutionScale));
+                rtDesc.height = Mathf.Max(1, Mathf.RoundToInt(rtDesc.height * k_ResolutionScale));
                 RenderingUtils.ReAllocateIfNeeded(ref m_RenderTarget, rtDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_GaussianSplatRT");
                 cmd.SetGlobalTexture(m_RenderTarget.name, m_RenderTarget.nameID);
 
@@ -90,7 +87,6 @@ namespace GaussianSplatting.Runtime
             if (!m_HasCamera)
                 return;
             m_Pass.m_Renderer = renderer;
-            m_Pass.m_ResolutionScale = resolutionScale;
             renderer.EnqueuePass(m_Pass);
         }
 
