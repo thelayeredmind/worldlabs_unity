@@ -846,28 +846,46 @@ void CSInitCompact(uint3 id : SV_DispatchThreadID)
     _IndirectArgs.Store(4, 0u); // zero instance count before compaction
 }
 
+groupshared uint gs_scan[GROUP_SIZE];
+groupshared uint gs_groupBase;
+
+// Hillis-Steele inclusive prefix sum + atomic group slot claim.
+// Processes _SplatSortKeys in back-to-front order (the sort output).
+// Each group of 1024 threads claims a contiguous range in _VisibleIndices,
+// preserving back-to-front ordering without wave intrinsics.
 [numthreads(GROUP_SIZE, 1, 1)]
-void CSCompactVisible(uint3 id : SV_DispatchThreadID)
+void CSCompactVisible(uint3 id : SV_DispatchThreadID, uint gid : SV_GroupIndex)
 {
     uint i = id.x;
-    bool visible = false;
     uint origIdx = 0;
-
+    uint vis = 0;
     if (i < _SplatCount)
     {
         origIdx = _SplatSortKeys[i];
-        visible = _SplatViewData[origIdx].pos.w > 0;
+        vis = (_SplatViewData[origIdx].pos.w > 0) ? 1u : 0u;
     }
 
-    // Wave-level prefix sum preserves back-to-front sort order within each wavefront.
-    uint waveCount = WaveActiveCountBits(visible);
-    uint wavePrefixCount = WavePrefixCountBits(visible);
+    gs_scan[gid] = vis;
+    GroupMemoryBarrierWithGroupSync();
 
-    uint waveStart = 0;
-    if (WaveIsFirstLane() && waveCount > 0)
-        _IndirectArgs.InterlockedAdd(4, waveCount, waveStart);
-    waveStart = WaveReadLaneFirst(waveStart);
+    // Parallel inclusive prefix sum (log2(GROUP_SIZE) = 10 steps)
+    [unroll]
+    for (uint stride = 1; stride < GROUP_SIZE; stride <<= 1)
+    {
+        uint val = (gid >= stride) ? gs_scan[gid - stride] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gs_scan[gid] += val;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    // gs_scan[gid] = inclusive count of visible in [0..gid] within this group
 
-    if (visible)
-        _VisibleIndices[waveStart + wavePrefixCount] = origIdx;
+    uint localOffset = gs_scan[gid] - vis; // exclusive: my output slot within group
+    uint groupCount = gs_scan[GROUP_SIZE - 1]; // total visible in this group
+
+    if (gid == GROUP_SIZE - 1 && groupCount > 0)
+        _IndirectArgs.InterlockedAdd(4, groupCount, gs_groupBase);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (vis)
+        _VisibleIndices[gs_groupBase + localOffset] = origIdx;
 }

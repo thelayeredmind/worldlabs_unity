@@ -164,7 +164,9 @@ namespace GaussianSplatting.Runtime
                 cmb.EndSample(s_ProfCalcView);
 
                 // compact visible splats into a dense index list for indirect draw
-                bool useIndirect = gs.m_RenderMode == GaussianSplatRenderer.RenderMode.Splats;
+                // only for game cameras — scene/preview cameras share the same buffer and would corrupt each other
+                bool useIndirect = gs.m_RenderMode == GaussianSplatRenderer.RenderMode.Splats
+                                   && cam.cameraType == CameraType.Game;
                 if (useIndirect)
                     gs.CompactVisibleSplats(cmb);
 
