@@ -544,14 +544,7 @@ namespace GaussianSplatting.Runtime
             m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, shDataArr.Length / 4, 4) { name = "GaussianSHData" };
             m_GpuSHData.SetData(shDataArr);
 
-            var convertedColorData = GaussianImageCreator.CreateColorData(colorDataArr.Reinterpret<float4>(1), asset.colorFormat);
-            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(m_SplatCount);
-            var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
-            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
-            tex.SetPixelData(convertedColorData, 0);
-            tex.Apply(false, true);
-            m_GpuColorData = tex;
-            convertedColorData.Dispose();
+            m_GpuColorData = CreateColorTexture(colorDataArr, asset.colorFormat, m_SplatCount);
             
             if (chunkDataArr.Length > 0)
             {
@@ -645,16 +638,7 @@ namespace GaussianSplatting.Runtime
             m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, shDataArr.Length / 4, 4) { name = "GaussianSHData" };
             m_GpuSHData.SetData(shDataArr);
 
-            var convertedColorData = GaussianImageCreator.CreateColorData(colorDataArr.Reinterpret<float4>(1), data.colorFormat);
-            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(m_SplatCount);
-            var texFormat = GaussianSplatAsset.ColorFormatToGraphics(data.colorFormat);
-            var tex = new Texture2D(texWidth, texHeight, texFormat,
-                TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate)
-                { name = "GaussianColorData" };
-            tex.SetPixelData(convertedColorData, 0);
-            tex.Apply(false, true);
-            m_GpuColorData = tex;
-            convertedColorData.Dispose();
+            m_GpuColorData = CreateColorTexture(colorDataArr, data.colorFormat, m_SplatCount);
 
             if (chkLen > 0)
             {
@@ -808,6 +792,29 @@ namespace GaussianSplatting.Runtime
             UpdateCutoutsBuffer();
             cmb.SetComputeIntParam(cs, Props.SplatCutoutsCount, m_Cutouts?.Length ?? 0);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatCutouts, m_GpuEditCutouts);
+        }
+
+        static Texture2D CreateColorTexture(NativeArray<byte> colorDataArr, GaussianSplatAsset.ColorFormat colorFormat, int splatCount)
+        {
+            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(splatCount);
+            var texFormat = GaussianSplatAsset.ColorFormatToGraphics(colorFormat);
+            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
+            bool preCompressed = GraphicsFormatUtility.IsCompressedFormat(texFormat) &&
+                                 colorDataArr.Length == (int)GraphicsFormatUtility.ComputeMipmapSize(texWidth, texHeight, texFormat);
+            if (preCompressed)
+            {
+                // BC7 bytes were compressed at import time — upload directly (works on Quest)
+                tex.SetPixelData(colorDataArr, 0);
+            }
+            else
+            {
+                // Raw float32 from legacy import — convert at runtime (Editor only for compressed formats)
+                var convertedColorData = GaussianImageCreator.CreateColorData(colorDataArr.Reinterpret<float4>(1), colorFormat);
+                tex.SetPixelData(convertedColorData, 0);
+                convertedColorData.Dispose();
+            }
+            tex.Apply(false, true);
+            return tex;
         }
 
         internal void SetAssetDataOnMaterial(MaterialPropertyBlock mat)
