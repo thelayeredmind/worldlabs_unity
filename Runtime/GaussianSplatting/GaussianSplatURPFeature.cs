@@ -15,7 +15,7 @@ namespace GaussianSplatting.Runtime
     // ReSharper disable once InconsistentNaming
     class GaussianSplatURPFeature : ScriptableRendererFeature
     {
-        [Range(0.25f, 1.0f)]
+        [Range(0.1f, 1.0f)]
         [Tooltip("Scale applied to the splat render texture resolution. Lower = faster but softer.")]
         public float resolutionScale = 0.7f;
 
