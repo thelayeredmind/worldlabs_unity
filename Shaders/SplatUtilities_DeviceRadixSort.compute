@@ -90,6 +90,7 @@ float _SplatScale;
 float _SplatOpacityScale;
 uint _SHOrder;
 uint _SHOnly;
+float _ContributionCullThreshold;
 
 uint _SplatCutoutsCount;
 
@@ -301,6 +302,15 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         half4 col;
         col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
         col.a = min(splat.opacity * opacityScale, 65000);
+        
+        // Cull splats below threshold before rasterization (more efficient than fragment discard)
+        if (col.a < _ContributionCullThreshold)
+        {
+            view.pos.w = 0;
+            _SplatViewData[idx] = view;
+            return;
+        }
+
         view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
         view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
     }
