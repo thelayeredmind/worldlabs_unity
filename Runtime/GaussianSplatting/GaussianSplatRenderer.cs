@@ -172,7 +172,8 @@ namespace GaussianSplatting.Runtime
                     instanceCount = gs.m_GpuChunksValid ? gs.m_GpuChunks.count : 0;
 
                 cmb.BeginSample(s_ProfDraw);
-                cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, 0, topology, indexCount, instanceCount, mpb);
+                int shaderPass = (gs.m_RenderMode == GaussianSplatRenderer.RenderMode.Splats && gs.m_OpaqueExperiment) ? 1 : 0;
+                cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, shaderPass, topology, indexCount, instanceCount, mpb);
                 cmb.EndSample(s_ProfDraw);
             }
             return matComposite;
@@ -250,6 +251,10 @@ namespace GaussianSplatting.Runtime
         public float m_AlphaDiscardThreshold = 0.05f;
 
         public bool test;
+
+        [Header("Debug Experiments")]
+        [Tooltip("GSP-CULL-01: Sort front-to-back and render opaque. Measures overdraw lower bound — output looks wrong by design.")]
+        public bool m_OpaqueExperiment;
 
         [Range(1,30)] [Tooltip("Sort splats only every N frames")]
         public int m_SortNthFrame = 1;
@@ -365,6 +370,7 @@ namespace GaussianSplatting.Runtime
             public static readonly int OptimizeForQuest = Shader.PropertyToID("_OptimizeForQuest");
             public static readonly int VisibleIndices = Shader.PropertyToID("_VisibleIndices");
             public static readonly int IndirectArgs = Shader.PropertyToID("_IndirectArgs");
+            public static readonly int InvertSort = Shader.PropertyToID("_InvertSort");
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -961,6 +967,7 @@ namespace GaussianSplatting.Runtime
             cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.InvertSort, m_OpaqueExperiment ? 1 : 0);
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcDistances, out uint gsX, out _, out _);
             cmd.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
 

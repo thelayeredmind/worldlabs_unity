@@ -41,6 +41,7 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropOptimizeForQuest;
         SerializedProperty m_PropContributionCullThreshold;
         SerializedProperty m_PropAlphaDiscardThreshold;
+        SerializedProperty m_PropOpaqueExperiment;
 
         bool m_ResourcesExpanded = false;
         int m_CameraIndex = 0;
@@ -86,6 +87,7 @@ namespace GaussianSplatting.Editor
             m_PropOptimizeForQuest = serializedObject.FindProperty("m_OptimizeForQuest");
             m_PropContributionCullThreshold = serializedObject.FindProperty("m_ContributionCullThreshold");
             m_PropAlphaDiscardThreshold = serializedObject.FindProperty("m_AlphaDiscardThreshold");
+            m_PropOpaqueExperiment = serializedObject.FindProperty("m_OpaqueExperiment");
             s_AllEditors.Add(this);
             
             // Auto-assign resources if not set
@@ -201,6 +203,9 @@ namespace GaussianSplatting.Editor
 
             EditorGUILayout.Space();
             GUILayout.Label("Debugging Tweaks", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(m_PropOpaqueExperiment);
+            if (m_PropOpaqueExperiment.boolValue)
+                EditorGUILayout.HelpBox("GSP-CULL-01: Opaque front-to-back mode active. Output looks wrong by design — compare OVR Metrics App GPU Time against normal render for overdraw lower bound.", MessageType.Info);
             EditorGUILayout.PropertyField(m_PropRenderMode);
             if (m_PropRenderMode.intValue is (int)GaussianSplatRenderer.RenderMode.DebugPoints or (int)GaussianSplatRenderer.RenderMode.DebugPointIndices)
                 EditorGUILayout.PropertyField(m_PropPointDisplaySize);
