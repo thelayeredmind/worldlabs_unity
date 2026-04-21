@@ -115,7 +115,17 @@ namespace GaussianSplatting.Editor
                 if (useChunks) File.WriteAllBytes(pathChunk, runtimeData.chkData);
                 File.WriteAllBytes(pathPos,   runtimeData.posData);
                 File.WriteAllBytes(pathOther, runtimeData.othData);
-                File.WriteAllBytes(pathCol,   runtimeData.colData);
+                // BC7 must be pre-compressed at import time — EditorUtility.CompressTexture
+                // is not available on Quest, so the renderer cannot compress at load time.
+                byte[] colBytes = runtimeData.colData;
+                if (formatColor == GaussianSplatAsset.ColorFormat.BC7)
+                {
+                    using var native = new NativeArray<byte>(runtimeData.colData, Allocator.TempJob);
+                    var compressed = GaussianImageCreator.CreateColorData(native.Reinterpret<float4>(1), formatColor);
+                    colBytes = compressed.ToArray();
+                    compressed.Dispose();
+                }
+                File.WriteAllBytes(pathCol,   colBytes);
                 File.WriteAllBytes(pathSh,    runtimeData.shData);
 
                 var dataHash = new Hash128((uint)inputSplats.Length, (uint)GaussianSplatAsset.kCurrentVersion, 0, 0);
