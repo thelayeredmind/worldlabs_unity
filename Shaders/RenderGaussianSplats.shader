@@ -5,11 +5,26 @@ Shader "Gaussian Splatting/Render Splats"
     {
         Tags { "RenderType"="Transparent" "Queue"="Transparent" }
 
+        // Pass 0 — GSP-CULL-02: alpha-blend with per-pixel stencil overdraw cap
         Pass
         {
             ZWrite Off
             Blend OneMinusDstAlpha One
             Cull Off
+
+            // Stencil buffer acts as a per-pixel draw counter.
+            // Splats render back-to-front; the farthest N layers pass, nearer ones are discarded.
+            // Ref [_StencilOverdrawCap]: compare against the cap value set at runtime.
+            // Comp Greater: pass fragment when stencil < Ref (i.e. count not yet reached).
+            // Pass IncrSat: increment stencil on write, saturate at 255.
+            // Fail Keep: keep stencil unchanged when cap is exceeded (fragment discarded).
+            Stencil
+            {
+                Ref [_StencilOverdrawCap]
+                Comp Greater
+                Pass IncrSat
+                Fail Keep
+            }
 
 CGPROGRAM
 #pragma vertex vert
