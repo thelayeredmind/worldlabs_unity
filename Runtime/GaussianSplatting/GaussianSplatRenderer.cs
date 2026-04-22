@@ -110,8 +110,19 @@ namespace GaussianSplatting.Runtime
             return true;
         }
 
+        // Returns true if any active renderer has m_OpaqueExperiment enabled.
+        // Used by the URP feature to decide whether a depth+stencil surface is required.
+        public bool AnyOpaqueExperiment()
+        {
+            foreach (var kvp in m_ActiveSplats)
+                if (kvp.Item1.m_OpaqueExperiment) return true;
+            return false;
+        }
+
         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
-        public Material SortAndRenderSplats(Camera cam, CommandBuffer cmb)
+        // passOverride: when >= 0, forces this shader pass regardless of per-renderer flags.
+        //   0 = transparent (default), 1 = opaque experiment, 2 = depth prepass, 3 = proximity transparent.
+        public Material SortAndRenderSplats(Camera cam, CommandBuffer cmb, int passOverride = -1)
         {
             Material matComposite = null;
             foreach (var kvp in m_ActiveSplats)
@@ -171,8 +182,15 @@ namespace GaussianSplatting.Runtime
                 if (gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds)
                     instanceCount = gs.m_GpuChunksValid ? gs.m_GpuChunks.count : 0;
 
+                int shaderPass;
+                if (passOverride >= 0)
+                    shaderPass = passOverride;
+                else if (gs.m_RenderMode == GaussianSplatRenderer.RenderMode.Splats && gs.m_OpaqueExperiment)
+                    shaderPass = 1;
+                else
+                    shaderPass = 0;
+
                 cmb.BeginSample(s_ProfDraw);
-                int shaderPass = (gs.m_RenderMode == GaussianSplatRenderer.RenderMode.Splats && gs.m_OpaqueExperiment) ? 1 : 0;
                 cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, shaderPass, topology, indexCount, instanceCount, mpb);
                 cmb.EndSample(s_ProfDraw);
             }
@@ -255,6 +273,10 @@ namespace GaussianSplatting.Runtime
         [Header("Debug Experiments")]
         [Tooltip("GSP-CULL-01: Sort front-to-back and render opaque. Measures overdraw lower bound — output looks wrong by design.")]
         public bool m_OpaqueExperiment;
+
+        [Tooltip("GSP-CULL-03: Depth proximity transparency. Requires depthProximityTransparency enabled in GaussianSplatURPFeature. " +
+                 "Enables Pass 2 (Z-prepass) + Pass 3 (transparent + proximity cull) instead of Pass 0.")]
+        public bool m_DepthProximityExperiment;
 
         [Range(1,30)] [Tooltip("Sort splats only every N frames")]
         public int m_SortNthFrame = 1;
@@ -371,6 +393,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int VisibleIndices = Shader.PropertyToID("_VisibleIndices");
             public static readonly int IndirectArgs = Shader.PropertyToID("_IndirectArgs");
             public static readonly int InvertSort = Shader.PropertyToID("_InvertSort");
+            public static readonly int ZTest = Shader.PropertyToID("_ZTest");
+            public static readonly int DepthBlendOp = Shader.PropertyToID("_DepthBlendOp");
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -740,6 +764,19 @@ namespace GaussianSplatting.Runtime
             m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
             m_MatDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
             m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
+
+            // Pass 1 ZTest: Vulkan/Quest uses reversed-Z (near=1, far=0) so the correct
+            // front-to-back depth test is GEqual, not LEqual as on DirectX/PCVR.
+            int zTestValue = SystemInfo.usesReversedZBuffer
+                ? (int)UnityEngine.Rendering.CompareFunction.GreaterEqual
+                : (int)UnityEngine.Rendering.CompareFunction.LessEqual;
+            m_MatSplats.SetInt(Props.ZTest, zTestValue);
+
+            // Pass 2 BlendOp for the depth prepass RT:
+            // reversed-Z: keep highest depth (nearest) → BlendOp.Max (4)
+            // conventional-Z: keep lowest depth (nearest) → BlendOp.Min (3)
+            int depthBlendOp = SystemInfo.usesReversedZBuffer ? 4 : 3;
+            m_MatSplats.SetInt(Props.DepthBlendOp, depthBlendOp);
 
             GaussianSplatRenderSystem.instance.RegisterSplat(this);
             UpdateRessources();
