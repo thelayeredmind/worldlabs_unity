@@ -25,6 +25,7 @@ Shader "Gaussian Splatting/Render Splats"
                 Pass IncrSat
                 Fail Keep
             }
+			
 
 CGPROGRAM
 #pragma vertex vert
@@ -85,9 +86,21 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 		o.col.b = f16tof32(view.color.y >> 16);
 		o.col.a = f16tof32(view.color.y);
 
+		// Vertex-side cull: read opacity before selection may override col.a to -1.
+		float opacity = max(o.col.a, 0);
+		if (opacity < _AlphaDiscardThreshold)
+		{
+			o.vertex = asfloat(0x7fc00000);
+			return o;
+		}
+
+		// Tight quad: shrink to the radius where gaussian(r)*opacity == threshold.
+		// Eliminates giant low-opacity splats; fragments outside still hit the discard.
+		float r_tight = sqrt(-log(max(_AlphaDiscardThreshold / opacity, 1e-5)));
+
 		uint idx = vtxID;
 		float2 quadPos = float2(idx&1, (idx>>1)&1) * 2.0 - 1.0;
-		quadPos *= 2;
+		quadPos *= min(r_tight, 2.0);
 
 		o.pos = quadPos;
 
@@ -144,15 +157,16 @@ half4 frag (v2f i) : SV_Target
 ENDCG
         }
 
-        // Pass 1 — GSP-CULL-01: opaque front-to-back experiment
+        // Pass 1 — GSP-CULL-01: opaque front-to-back experiment (EZ-01 complete)
         // ZWrite On + Blend Off: depth buffer rejects occluded fragments for free.
         // Output looks wrong (no transparency accumulation) but measures overdraw lower bound.
         //
-        // Fixes vs original:
+        // EZ-01 changes:
         //   - ZTest [_ZTest]: platform-aware (LEqual on DX/PCVR, GEqual on Vulkan/Quest reversed-Z)
         //   - Vertex-side opacity cull: primitives with peak alpha < threshold emit NaN → no rasterization
         //   - Tight quad sizing: quad shrunk to radius where gaussian * opacity = threshold → no fragment ever below threshold
         //   - Fragment discard removed: enables hardware early-Z on Adreno (discard disables it)
+        //   - _OptimizeForQuest removed: eliminates 60B × 3M vertex re-fetch that inflated vertex time to 39%
         Pass
         {
             ZWrite On
@@ -181,7 +195,6 @@ struct v2f
 StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
-uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
@@ -192,18 +205,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 	SplatViewData view = _SplatViewData[instID];
 
 	float4 centerClipPos = view.pos;
-
-	if (centerClipPos.w <= 0)
-	{
-		o.vertex = asfloat(0x7fc00000);
-		return o;
-	}
-
-	if (_OptimizeForQuest) {
-		SplatData splat = LoadSplatData(instID);
-		float3 centerWorldPos = mul(unity_ObjectToWorld, float4(splat.pos, 1)).xyz;
-	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
-	}
 
 	if (centerClipPos.w <= 0)
 	{
@@ -256,11 +257,10 @@ ENDCG
         }
 
         // Pass 2 — Depth Z-Prepass for GSP-CULL-03 (depth proximity transparency)
-        // Draws all splats and records the nearest-splat NDC depth per pixel into a R32F color RT.
-        // BlendOp [_DepthBlendOp] is Max on reversed-Z (Vulkan/Quest) or Min on conventional-Z (DX/PCVR):
-        //   reversed-Z: near=1, far=0 → Max keeps the closest (highest) depth value
-        //   conventional-Z: near=0, far=1 → Min keeps the closest (lowest) depth value
-        // Draw order does not matter because the blend op finds the nearest per pixel automatically.
+        // Stores linear eye depth (metres, 1/i.vertex.w) per pixel into a R32F color RT.
+        // BlendOp Min retains the nearest (smallest linear depth) per pixel — platform-independent.
+        // No NDC, no _ZBufferParams, no reversed-Z branching needed.
+        // Draw order does not matter; BlendOp Min finds nearest across all draw calls automatically.
         // Vertex uses tight quads + vertex-side cull (same as Pass 1) so no discard is needed.
         Pass
         {
@@ -345,12 +345,13 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     return o;
 }
 
-// Output NDC depth as color into the R32F prepass RT.
-// BlendOp Min/Max retains the nearest-splat depth per pixel across all draw calls.
+// Output linear eye depth (metres) into the R32F prepass RT.
+// i.vertex.w = 1/eye_z (perspective divide residual) → 1/i.vertex.w = eye_z in metres.
+// Platform-independent: no _ZBufferParams, no reversed-Z handling needed.
+// BlendOp Min retains the nearest (smallest) value per pixel across all draw calls.
 float4 frag (v2f i) : SV_Target
 {
-	// i.vertex.z is the post-perspective NDC depth [0,1] (reversed or not depending on platform)
-	return float4(i.vertex.z, 0, 0, 0);
+	return float4(1.0 / i.vertex.w, 0, 0, 0);
 }
 
 ENDCG
@@ -399,7 +400,8 @@ ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
 uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
-float _ProximityDepthRange;
+float _ProximityLinearRange;
+float _ProximityOpacityBoost;
 
 Texture2D<float> _GaussianPrepassDepth;
 
@@ -468,26 +470,26 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 
 half4 frag (v2f i) : SV_Target
 {
-	// Proximity cull: reject fragments too far behind the nearest splat surface.
-	// Uses integer texel coordinates (i.vertex.xy is pixel position in the scaled RT).
-	float frontDepth = _GaussianPrepassDepth.Load(int3((int2)i.vertex.xy, 0));
+	// Proximity cull: discard fragments within _ProximityLinearRange metres of the
+	// nearest splat surface at this pixel — these are redundant same-surface layers.
+	// Fragments beyond the range (distinct surface) and the front surface itself pass.
+	//
+	// frontLinear: linear eye depth stored by Pass 2 as 1/i.vertex.w (metres).
+	// fragLinear:  same quantity for this fragment, computed identically.
+	// Platform-independent — no _ZBufferParams, no reversed-Z branching.
+	float frontLinear = _GaussianPrepassDepth.Load(int3((int2)i.vertex.xy, 0));
+	float fragLinear  = 1.0 / i.vertex.w;
 
-	// On reversed-Z (Vulkan/Quest): higher depth = closer to camera.
-	// Fragment is "behind" when its depth is lower (farther) than frontDepth.
-	// On conventional-Z (DX/PCVR): fragment is "behind" when its depth is higher.
-#if defined(UNITY_REVERSED_Z)
-	float behindDist = frontDepth - i.vertex.z;
-#else
-	float behindDist = i.vertex.z - frontDepth;
-#endif
-	if (behindDist > _ProximityDepthRange)
+	// layerDist > 0 when this fragment is farther (deeper) than the front surface.
+	float layerDist = fragLinear - frontLinear;
+	if (layerDist > 0.0 && layerDist < _ProximityLinearRange)
 		discard;
 
 	float power = -dot(i.pos, i.pos);
 	half alpha = exp(power);
 	if (i.col.a >= 0)
 	{
-		alpha = saturate(alpha * i.col.a);
+		alpha = saturate(alpha * i.col.a * _ProximityOpacityBoost);
 	}
 	else
 	{
