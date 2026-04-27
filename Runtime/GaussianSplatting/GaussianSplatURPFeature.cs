@@ -28,22 +28,17 @@ namespace GaussianSplatting.Runtime
 
         [Space]
         [Tooltip("GSP-CULL-03: Depth proximity transparency. " +
-                 "A Z-prepass records the nearest splat depth per pixel. The transparent pass then discards " +
-                 "fragments within ProximityLinearRange metres of that surface (same-surface overdraw), " +
-                 "keeping only splats that represent distinct depth layers. " +
+                 "A Z-prepass records the nearest splat depth per pixel; the transparent pass then discards " +
+                 "fragments more than ProximityDepthRange behind that surface. " +
+                 "Preserves correct alpha blending for visible layers while eliminating deep overdraw. " +
                  "Requires two render passes (one RT switch on TBDR).")]
         public bool depthProximityTransparency = false;
 
-        [Range(0.01f, 2.0f)]
-        [Tooltip("Linear depth shell (metres) around the nearest surface. Fragments landing inside " +
-                 "this shell are discarded as redundant same-surface overdraw. " +
-                 "0.01 = barely anything culled. 1.0 = aggressive, only distinct surfaces survive.")]
-        public float proximityLinearRange = 0.1f;
-
-        [Range(1.0f, 8.0f)]
-        [Tooltip("Opacity multiplier applied to surviving fragments to compensate for discarded layers. " +
-                 "Increase when surfaces look too transparent after proximity culling.")]
-        public float proximityOpacityBoost = 1.0f;
+        [Range(0.001f, 0.2f)]
+        [Tooltip("NDC depth range behind the front surface that still renders. " +
+                 "Smaller = tighter cull (faster, may lose thin background detail). " +
+                 "Start at 0.02 and increase if background splats are clipped.")]
+        public float proximityDepthRange = 0.02f;
 
         class GSRenderPass : ScriptableRenderPass
         {
@@ -56,13 +51,11 @@ namespace GaussianSplatting.Runtime
             internal float m_ResolutionScale = 0.7f;
             internal int m_StencilOverdrawCap = 0;
             internal bool m_UseDepthProximity = false;
-            internal float m_ProximityLinearRange = 0.1f;
-            internal float m_ProximityOpacityBoost = 1.0f;
+            internal float m_ProximityDepthRange = 0.02f;
 
-            static readonly int s_StencilOverdrawCapId      = Shader.PropertyToID("_StencilOverdrawCap");
-            static readonly int s_PrepassDepthId             = Shader.PropertyToID("_GaussianPrepassDepth");
-            static readonly int s_ProximityLinearRangeId     = Shader.PropertyToID("_ProximityLinearRange");
-            static readonly int s_ProximityOpacityBoostId    = Shader.PropertyToID("_ProximityOpacityBoost");
+            static readonly int s_StencilOverdrawCapId   = Shader.PropertyToID("_StencilOverdrawCap");
+            static readonly int s_PrepassDepthId          = Shader.PropertyToID("_GaussianPrepassDepth");
+            static readonly int s_ProximityDepthRangeId   = Shader.PropertyToID("_ProximityDepthRange");
 
             public void Dispose()
             {
@@ -145,12 +138,15 @@ namespace GaussianSplatting.Runtime
 
                 if (m_UseDepthProximity)
                 {
-                    // --- Pass 2: Z-prepass → nearest splat linear eye depth per pixel ---
-                    // Prepass stores 1/i.vertex.w (linear eye depth in metres, larger = farther).
-                    // BlendOp Min keeps the nearest (smallest) value.
-                    // Clear to a large sentinel so any real splat depth wins on first write.
+                    // --- Pass 2: Z-prepass → nearest splat depth per pixel ---
+                    // Clear prepass RT: reversed-Z far=0, conventional-Z far=1.
+                    // Since BlendOp Max (reversed) / Min (conventional) is used, initialising to the
+                    // opposite extreme ensures the first real depth value wins.
+                    Color prepassClear = SystemInfo.usesReversedZBuffer
+                        ? new Color(0, 0, 0, 0)   // reversed-Z: near=1, far=0 → clear to 0
+                        : new Color(1, 1, 1, 1);   // conventional: near=0, far=1 → clear to 1
                     m_Cmb.SetRenderTarget(m_PrepassDepthTarget);
-                    m_Cmb.ClearRenderTarget(false, true, new Color(1e9f, 0, 0, 0));
+                    m_Cmb.ClearRenderTarget(false, true, prepassClear);
 
                     Material matComposite = system.SortAndRenderSplats(cam, m_Cmb, passOverride: 2);
 
@@ -169,8 +165,7 @@ namespace GaussianSplatting.Runtime
                     }
                     m_Cmb.SetGlobalTexture(s_PrepassDepthId, m_PrepassDepthTarget);
                     m_Cmb.SetGlobalInteger(s_StencilOverdrawCapId, m_StencilOverdrawCap);
-                    m_Cmb.SetGlobalFloat(s_ProximityLinearRangeId,  m_ProximityLinearRange);
-                    m_Cmb.SetGlobalFloat(s_ProximityOpacityBoostId, m_ProximityOpacityBoost);
+                    m_Cmb.SetGlobalFloat(s_ProximityDepthRangeId, m_ProximityDepthRange);
 
                     system.SortAndRenderSplats(cam, m_Cmb, passOverride: 3);
 
@@ -183,38 +178,6 @@ namespace GaussianSplatting.Runtime
                 else
                 {
                     // Standard path: Pass 0 (transparent) or Pass 1 (opaque experiment).
-                    //
-                    // Explicitly bind the render targets in the command buffer here. Relying on
-                    // ConfigureTarget / ConfigureClear (set in OnCameraSetup) to implicitly bind
-                    // the depth target is not reliable in Unity 6 URP — the depth attachment may
-                    // not be connected when the command buffer actually executes, so ClearRenderTarget
-                    // and ZWrite both miss the allocated depth surface.
-                    //
-                    // On Vulkan/Quest (reversed-Z), ConfigureClear always clears depth to 1.0 which
-                    // is NEAR — ZTest GEqual rejects every fragment and nothing renders. The explicit
-                    // SetRenderTarget + ClearRenderTarget below fixes this by clearing to the correct
-                    // far value (0.0 for reversed-Z, 1.0 otherwise) after binding the correct target.
-                    if (m_DepthStencilTarget != null)
-                    {
-                        m_Cmb.SetRenderTarget(m_RenderTarget, m_DepthStencilTarget);
-                        if (system.AnyOpaqueExperiment())
-                        {
-                            float farDepth = SystemInfo.usesReversedZBuffer ? 0f : 1f;
-                            m_Cmb.ClearRenderTarget(clearDepth: true, clearColor: true,
-                                backgroundColor: Color.black, depth: farDepth);
-                        }
-                        else
-                        {
-                            m_Cmb.ClearRenderTarget(clearDepth: true, clearColor: true,
-                                backgroundColor: Color.black, depth: 1f);
-                        }
-                    }
-                    else
-                    {
-                        m_Cmb.SetRenderTarget(m_RenderTarget);
-                        m_Cmb.ClearRenderTarget(clearDepth: false, clearColor: true, backgroundColor: Color.black);
-                    }
-
                     m_Cmb.SetGlobalInteger(s_StencilOverdrawCapId, m_StencilOverdrawCap);
 
                     Material matComposite = system.SortAndRenderSplats(cam, m_Cmb);
@@ -259,9 +222,8 @@ namespace GaussianSplatting.Runtime
             m_Pass.m_Renderer            = renderer;
             m_Pass.m_ResolutionScale      = resolutionScale;
             m_Pass.m_StencilOverdrawCap   = stencilOverdrawCap;
-            m_Pass.m_UseDepthProximity     = depthProximityTransparency;
-            m_Pass.m_ProximityLinearRange  = proximityLinearRange;
-            m_Pass.m_ProximityOpacityBoost = proximityOpacityBoost;
+            m_Pass.m_UseDepthProximity    = depthProximityTransparency;
+            m_Pass.m_ProximityDepthRange  = proximityDepthRange;
             renderer.EnqueuePass(m_Pass);
         }
 

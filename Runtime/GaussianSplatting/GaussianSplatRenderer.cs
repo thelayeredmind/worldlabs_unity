@@ -772,9 +772,11 @@ namespace GaussianSplatting.Runtime
                 : (int)UnityEngine.Rendering.CompareFunction.LessEqual;
             m_MatSplats.SetInt(Props.ZTest, zTestValue);
 
-            // Pass 2 BlendOp: prepass stores linear eye depth (metres, larger = farther).
-            // BlendOp Min retains the nearest (smallest) value — platform-independent.
-            m_MatSplats.SetInt(Props.DepthBlendOp, (int)UnityEngine.Rendering.BlendOp.Min);
+            // Pass 2 BlendOp for the depth prepass RT:
+            // reversed-Z: keep highest depth (nearest) → BlendOp.Max (4)
+            // conventional-Z: keep lowest depth (nearest) → BlendOp.Min (3)
+            int depthBlendOp = SystemInfo.usesReversedZBuffer ? 4 : 3;
+            m_MatSplats.SetInt(Props.DepthBlendOp, depthBlendOp);
 
             GaussianSplatRenderSystem.instance.RegisterSplat(this);
             UpdateRessources();
