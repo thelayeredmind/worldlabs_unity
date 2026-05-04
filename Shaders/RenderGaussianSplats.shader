@@ -49,6 +49,9 @@ ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
 uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
+uint _SceneDepthOcclusionEnabled;
+
+Texture2D _CameraDepthTexture;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
@@ -112,6 +115,23 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 
 half4 frag (v2f i) : SV_Target
 {
+	// Manual scene depth occlusion: discard fragments behind opaque geometry.
+	// ZTest cannot be used because URP 17 render graph doesn't honour SetRenderTarget depth
+	// bindings in the compatibility Execute path. Instead we sample _CameraDepthTexture,
+	// which URP generates when ConfigureInput(Depth) is requested.
+	if (_SceneDepthOcclusionEnabled)
+	{
+		// Load by integer pixel coords — avoids sampler format issues with D24_S8
+		float sceneDepth = _CameraDepthTexture.Load(int3((int2)i.vertex.xy, 0)).r;
+		// Reversed-Z (Vulkan/Quest): near=1, far=0. Splat is behind scene when splatZ < sceneDepth.
+		// Conventional-Z (DX): near=0, far=1. Splat is behind scene when splatZ > sceneDepth.
+#if defined(UNITY_REVERSED_Z)
+		if (i.vertex.z < sceneDepth) discard;
+#else
+		if (i.vertex.z > sceneDepth) discard;
+#endif
+	}
+
 	float power = -dot(i.pos, i.pos);
 	half alpha = exp(power);
 	if (i.col.a >= 0)

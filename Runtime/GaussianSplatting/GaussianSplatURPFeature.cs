@@ -15,6 +15,11 @@ namespace GaussianSplatting.Runtime
     // ReSharper disable once InconsistentNaming
     class GaussianSplatURPFeature : ScriptableRendererFeature
     {
+        [Tooltip("Render splats directly into the camera color+depth buffers instead of an isolated RT. " +
+                 "Splats will be depth-tested against opaque meshes (ZTest LEqual) so geometry correctly occludes them. " +
+                 "Disables resolution scaling and the composite blit. Use this to verify scene depth interaction.")]
+        public bool renderDirectToCamera = false;
+
         [Range(0.1f, 1.0f)]
         [Tooltip("Scale applied to the splat render texture resolution. Lower = faster but softer.")]
         public float resolutionScale = 0.7f;
@@ -52,10 +57,12 @@ namespace GaussianSplatting.Runtime
             internal int m_StencilOverdrawCap = 0;
             internal bool m_UseDepthProximity = false;
             internal float m_ProximityDepthRange = 0.02f;
+            internal bool m_RenderDirectToCamera = false;
 
-            static readonly int s_StencilOverdrawCapId   = Shader.PropertyToID("_StencilOverdrawCap");
-            static readonly int s_PrepassDepthId          = Shader.PropertyToID("_GaussianPrepassDepth");
-            static readonly int s_ProximityDepthRangeId   = Shader.PropertyToID("_ProximityDepthRange");
+            static readonly int s_StencilOverdrawCapId        = Shader.PropertyToID("_StencilOverdrawCap");
+            static readonly int s_PrepassDepthId               = Shader.PropertyToID("_GaussianPrepassDepth");
+            static readonly int s_ProximityDepthRangeId        = Shader.PropertyToID("_ProximityDepthRange");
+            static readonly int s_SceneDepthOcclusionEnabledId = Shader.PropertyToID("_SceneDepthOcclusionEnabled");
 
             public void Dispose()
             {
@@ -66,6 +73,10 @@ namespace GaussianSplatting.Runtime
 
             public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
             {
+                // Only request depth copy when occlusion is active — avoids ~8MB DRAM copy overhead otherwise.
+                if (m_RenderDirectToCamera)
+                    ConfigureInput(ScriptableRenderPassInput.Depth);
+
                 RenderTextureDescriptor rtDesc = renderingData.cameraData.cameraTargetDescriptor;
                 rtDesc.msaaSamples = 1;
                 int w = Mathf.Max(1, Mathf.RoundToInt(rtDesc.width * m_ResolutionScale));
@@ -179,6 +190,7 @@ namespace GaussianSplatting.Runtime
                 {
                     // Standard path: Pass 0 (transparent) or Pass 1 (opaque experiment).
                     m_Cmb.SetGlobalInteger(s_StencilOverdrawCapId, m_StencilOverdrawCap);
+                    m_Cmb.SetGlobalInteger(s_SceneDepthOcclusionEnabledId, m_RenderDirectToCamera ? 1 : 0);
 
                     Material matComposite = system.SortAndRenderSplats(cam, m_Cmb);
 
@@ -197,10 +209,7 @@ namespace GaussianSplatting.Runtime
 
         public override void Create()
         {
-            m_Pass = new GSRenderPass
-            {
-                renderPassEvent = RenderPassEvent.BeforeRenderingTransparents
-            };
+            m_Pass = new GSRenderPass();
         }
 
         public override void OnCameraPreCull(ScriptableRenderer renderer, in CameraData cameraData)
@@ -219,11 +228,15 @@ namespace GaussianSplatting.Runtime
         {
             if (!m_HasCamera)
                 return;
-            m_Pass.m_Renderer            = renderer;
-            m_Pass.m_ResolutionScale      = resolutionScale;
-            m_Pass.m_StencilOverdrawCap   = stencilOverdrawCap;
-            m_Pass.m_UseDepthProximity    = depthProximityTransparency;
-            m_Pass.m_ProximityDepthRange  = proximityDepthRange;
+            m_Pass.m_Renderer              = renderer;
+            m_Pass.m_ResolutionScale        = resolutionScale;
+            m_Pass.m_StencilOverdrawCap     = stencilOverdrawCap;
+            m_Pass.m_UseDepthProximity      = depthProximityTransparency;
+            m_Pass.m_ProximityDepthRange    = proximityDepthRange;
+            m_Pass.m_RenderDirectToCamera   = renderDirectToCamera;
+            m_Pass.renderPassEvent = renderDirectToCamera
+                ? RenderPassEvent.AfterRenderingSkybox
+                : RenderPassEvent.BeforeRenderingTransparents;
             renderer.EnqueuePass(m_Pass);
         }
 
