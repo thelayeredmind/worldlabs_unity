@@ -50,8 +50,10 @@ uint _SplatBitsValid;
 uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 uint _SceneDepthOcclusionEnabled;
+float2 _GaussianRTSize;
 
 Texture2D _CameraDepthTexture;
+SamplerState sampler_point_clamp;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
@@ -121,8 +123,10 @@ half4 frag (v2f i) : SV_Target
 	// which URP generates when ConfigureInput(Depth) is requested.
 	if (_SceneDepthOcclusionEnabled)
 	{
-		// Load by integer pixel coords — avoids sampler format issues with D24_S8
-		float sceneDepth = _CameraDepthTexture.Load(int3((int2)i.vertex.xy, 0)).r;
+		// i.vertex.xy is in scaled-RT pixel space. _ScreenParams.xy is the scaled RT size,
+		// so dividing gives [0,1] UV. On DX the RT Y is flipped vs the depth texture.
+		float2 uv = i.vertex.xy / _GaussianRTSize;
+		float sceneDepth = _CameraDepthTexture.SampleLevel(sampler_point_clamp, uv, 0).r;
 		// Reversed-Z (Vulkan/Quest): near=1, far=0. Splat is behind scene when splatZ < sceneDepth.
 		// Conventional-Z (DX): near=0, far=1. Splat is behind scene when splatZ > sceneDepth.
 #if defined(UNITY_REVERSED_Z)

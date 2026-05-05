@@ -58,11 +58,14 @@ namespace GaussianSplatting.Runtime
             internal bool m_UseDepthProximity = false;
             internal float m_ProximityDepthRange = 0.02f;
             internal bool m_RenderDirectToCamera = false;
+            int m_RTWidth = 1;
+            int m_RTHeight = 1;
 
             static readonly int s_StencilOverdrawCapId        = Shader.PropertyToID("_StencilOverdrawCap");
             static readonly int s_PrepassDepthId               = Shader.PropertyToID("_GaussianPrepassDepth");
             static readonly int s_ProximityDepthRangeId        = Shader.PropertyToID("_ProximityDepthRange");
             static readonly int s_SceneDepthOcclusionEnabledId = Shader.PropertyToID("_SceneDepthOcclusionEnabled");
+            static readonly int s_GaussianRTSizeId             = Shader.PropertyToID("_GaussianRTSize");
 
             public void Dispose()
             {
@@ -81,6 +84,8 @@ namespace GaussianSplatting.Runtime
                 rtDesc.msaaSamples = 1;
                 int w = Mathf.Max(1, Mathf.RoundToInt(rtDesc.width * m_ResolutionScale));
                 int h = Mathf.Max(1, Mathf.RoundToInt(rtDesc.height * m_ResolutionScale));
+                m_RTWidth = w;
+                m_RTHeight = h;
 
                 // Color RT — no depth bits on this descriptor; depth comes from m_DepthStencilTarget.
                 var colorDesc = rtDesc;
@@ -191,6 +196,7 @@ namespace GaussianSplatting.Runtime
                     // Standard path: Pass 0 (transparent) or Pass 1 (opaque experiment).
                     m_Cmb.SetGlobalInteger(s_StencilOverdrawCapId, m_StencilOverdrawCap);
                     m_Cmb.SetGlobalInteger(s_SceneDepthOcclusionEnabledId, m_RenderDirectToCamera ? 1 : 0);
+                    m_Cmb.SetGlobalVector(s_GaussianRTSizeId, new Vector2(m_RTWidth, m_RTHeight));
 
                     Material matComposite = system.SortAndRenderSplats(cam, m_Cmb);
 
