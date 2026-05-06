@@ -96,14 +96,15 @@ namespace GaussianSplatting.Runtime
             if (m_ActiveSplats.Count == 0)
                 return false;
 
-            // sort them by depth from camera
+            // sort by render order first, then by depth from camera (higher order = rendered last = on top)
             var camTr = cam.transform;
             m_ActiveSplats.Sort((a, b) =>
             {
-                var trA = a.Item1.transform;
-                var trB = b.Item1.transform;
-                var posA = camTr.InverseTransformPoint(trA.position);
-                var posB = camTr.InverseTransformPoint(trB.position);
+                var orderA = a.Item1.m_RenderOrder;
+                var orderB = b.Item1.m_RenderOrder;
+                if (orderA != orderB) return orderB.CompareTo(orderA);
+                var posA = camTr.InverseTransformPoint(a.Item1.transform.position);
+                var posB = camTr.InverseTransformPoint(b.Item1.transform.position);
                 return posA.z.CompareTo(posB.z);
             });
 
@@ -277,6 +278,9 @@ namespace GaussianSplatting.Runtime
         [Tooltip("GSP-CULL-03: Depth proximity transparency. Requires depthProximityTransparency enabled in GaussianSplatURPFeature. " +
                  "Enables Pass 2 (Z-prepass) + Pass 3 (transparent + proximity cull) instead of Pass 0.")]
         public bool m_DepthProximityExperiment;
+
+        [Tooltip("Render order relative to other splats. Higher value = rendered last = on top. Splats with equal order are sorted by camera depth.")]
+        public int m_RenderOrder;
 
         [Range(1,30)] [Tooltip("Sort splats only every N frames")]
         public int m_SortNthFrame = 1;

@@ -27,6 +27,7 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropSHOrder;
         SerializedProperty m_PropSHOnly;
         SerializedProperty m_CenterEyeOnly;
+        SerializedProperty m_PropRenderOrder;
         SerializedProperty m_PropSortNthFrame;
         SerializedProperty m_PropRenderMode;
         SerializedProperty m_PropPointDisplaySize;
@@ -72,6 +73,7 @@ namespace GaussianSplatting.Editor
             m_PropOpacityScale = serializedObject.FindProperty("m_OpacityScale");
             m_PropSHOrder = serializedObject.FindProperty("m_SHOrder");
             m_PropSHOnly = serializedObject.FindProperty("m_SHOnly");
+            m_PropRenderOrder = serializedObject.FindProperty("m_RenderOrder");
             m_PropSortNthFrame = serializedObject.FindProperty("m_SortNthFrame");
             m_CenterEyeOnly = serializedObject.FindProperty("m_CenterEyeOnly");
             m_PropRenderMode = serializedObject.FindProperty("m_RenderMode");
@@ -156,6 +158,7 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.PropertyField(m_PropOpacityScale);
             EditorGUILayout.PropertyField(m_PropSHOrder);
             EditorGUILayout.PropertyField(m_PropSHOnly);
+            EditorGUILayout.PropertyField(m_PropRenderOrder);
             EditorGUILayout.PropertyField(m_gpuSortType);
             if (gs.m_gpuSortType != GpuSorting.SortType.None)
             {
