@@ -142,6 +142,8 @@ namespace GaussianSplatting.Runtime
                     gs.m_LastSortedFrame = Time.frameCount;
                 }
 
+                gs.EnsureMaterials();
+
                 // cache view
                 kvp.Item2.Clear();
                 Material displayMat = gs.m_RenderMode switch
@@ -754,6 +756,18 @@ namespace GaussianSplatting.Runtime
             Initialize();
         }
         
+        public void EnsureMaterials()
+        {
+            if (m_MatSplats != null) return;
+            if (m_ShaderSplats == null || m_ShaderComposite == null || m_ShaderDebugPoints == null || m_ShaderDebugBoxes == null) return;
+            if (!SystemInfo.supportsComputeShaders) return;
+
+            m_MatSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
+            m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
+            m_MatDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
+            m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
+        }
+
         private void Initialize()
         {
             UpdateSortingType(m_gpuSortType);
