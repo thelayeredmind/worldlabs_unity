@@ -16,6 +16,7 @@
 #pragma kernel CSScaleSelection
 #pragma kernel CSExportData
 #pragma kernel CSCopySplats
+#pragma kernel CSDeleteSelectedWithParams
 
 // DeviceRadixSort
 #pragma multi_compile __ KEY_UINT KEY_INT KEY_FLOAT
@@ -822,5 +823,52 @@ void CSCopySplats (uint3 id : SV_DispatchThreadID)
         uint dstWordIdx = dstIdx / 32;
         uint dstBitIdx = dstIdx & 31;
         _CopyDstEditDeleted.InterlockedOr(dstWordIdx * 4, 1u << dstBitIdx);
+    }
+}
+
+// Delete selected splats filtered by opacity.
+// density  = opacity threshold [0..1]: splats at or below this opacity are fully deleted
+// softness = fade width below the threshold [0..1]: 0 = hard cut, 1 = linear ramp
+// A splat in the selection is deleted if its opacity < density, with a probabilistic ramp in the softness zone.
+// We use a deterministic hash of the splat index as the random value so the result is frame-stable.
+float _DeleteDensity;
+float _DeleteSoftness;
+RWByteAddressBuffer _SplatDeletedBitsRW; // write-capable alias bound only for this kernel
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    uint wordIdx = idx / 32;
+    uint bitIdx = idx & 31;
+
+    // only act on selected splats
+    uint selVal = _SplatSelectedBits.Load(wordIdx * 4);
+    if (!(selVal & (1u << bitIdx)))
+        return;
+
+    // already deleted — skip
+    uint delVal = _SplatDeletedBitsRW.Load(wordIdx * 4);
+    if (delVal & (1u << bitIdx))
+        return;
+
+    // read opacity (sigmoid value, 0..1)
+    float opacity = (float)LoadSplatData(idx).opacity;
+
+    // ramp: deleteProb=1 when opacity=0, ramps to 0 as opacity approaches density
+    float lo = max(0.0, _DeleteDensity - _DeleteSoftness * _DeleteDensity);
+    float deleteProb = 1.0 - smoothstep(lo, max(lo + 1e-5, _DeleteDensity), opacity);
+
+    // deterministic per-splat hash (Wang hash) — frame-stable result
+    uint h = idx;
+    h ^= h >> 16; h *= 0x45d9f3b; h ^= h >> 16;
+    float rnd = (h & 0xFFFF) / 65535.0;
+
+    if (rnd < deleteProb)
+    {
+        _SplatDeletedBitsRW.InterlockedOr(wordIdx * 4, 1u << bitIdx);
     }
 }

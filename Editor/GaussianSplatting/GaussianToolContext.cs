@@ -142,7 +142,7 @@ namespace GaussianSplatting.Editor
                     // draw cutout gizmos
                     Handles.color = new Color(1,0,1,0.7f);
                     var prevMatrix = Handles.matrix;
-                    foreach (var cutout in gs.m_Cutouts)
+                    foreach (var cutout in gs.m_Cutouts ?? Array.Empty<GaussianCutout>())
                     {
                         if (!cutout)
                             continue;

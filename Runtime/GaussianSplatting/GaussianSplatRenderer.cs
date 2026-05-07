@@ -401,6 +401,9 @@ namespace GaussianSplatting.Runtime
             public static readonly int InvertSort = Shader.PropertyToID("_InvertSort");
             public static readonly int ZTest = Shader.PropertyToID("_ZTest");
             public static readonly int DepthBlendOp = Shader.PropertyToID("_DepthBlendOp");
+            public static readonly int DeleteDensity = Shader.PropertyToID("_DeleteDensity");
+            public static readonly int DeleteSoftness = Shader.PropertyToID("_DeleteSoftness");
+            public static readonly int SplatDeletedBitsRW = Shader.PropertyToID("_SplatDeletedBitsRW");
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -429,8 +432,7 @@ namespace GaussianSplatting.Runtime
             ScaleSelection,
             ExportData,
             CopySplats,
-            InitCompact,
-            CompactVisible,
+            DeleteSelectedWithParams,
         }
 
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
@@ -1320,6 +1322,96 @@ namespace GaussianSplatting.Runtime
             UpdateEditCountsAndBounds();
             if (editDeletedSplats != 0)
                 editModified = true;
+        }
+
+        // Returns a CPU snapshot of the deleted bits buffer for undo. Call before any destructive op.
+        public uint[] SnapshotDeletedBits()
+        {
+            if (!EnsureEditingBuffers()) return null;
+            var snap = new uint[m_GpuEditDeleted.count];
+            m_GpuEditDeleted.GetData(snap);
+            return snap;
+        }
+
+        // Returns a CPU snapshot of the selected bits buffer (needed for Separate).
+        public uint[] SnapshotSelectedBits()
+        {
+            if (!EnsureEditingBuffers()) return null;
+            var snap = new uint[m_GpuEditSelected.count];
+            m_GpuEditSelected.GetData(snap);
+            return snap;
+        }
+
+        // Restores a previously snapshotted deleted-bits buffer (used by undo).
+        public void RestoreDeletedBits(uint[] snapshot)
+        {
+            if (snapshot == null || m_GpuEditDeleted == null) return;
+            m_GpuEditDeleted.SetData(snapshot);
+            UpdateEditCountsAndBounds();
+            editModified = true;
+        }
+
+        // Probabilistic delete filtered by opacity. density = threshold [0..1], softness = fade width [0..1].
+        public void EditDeleteSelectedWithParams(float density, float softness)
+        {
+            if (!EnsureEditingBuffers()) return;
+
+            using var cmb = new CommandBuffer { name = "SplatDeleteWithParams" };
+            SetAssetDataOnCS(cmb, KernelIndices.DeleteSelectedWithParams);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.DeleteSelectedWithParams, Props.SplatDeletedBitsRW, m_GpuEditDeleted);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteDensity, density);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteSoftness, softness);
+            DispatchUtilsAndExecute(cmb, KernelIndices.DeleteSelectedWithParams, m_SplatCount);
+
+            EditDeselectAll();
+            UpdateEditCountsAndBounds();
+            if (editDeletedSplats != 0)
+                editModified = true;
+        }
+
+        // Reads GPU buffers back to CPU byte arrays. Only valid for VeryHigh (no chunks) assets.
+        // Returns false if this renderer uses chunk compression.
+        public bool EditReadbackBuffers(out byte[] posData, out byte[] otherData, out byte[] shData, out byte[] colorData)
+        {
+            posData = otherData = shData = colorData = null;
+            if (asset.chunkDataSize > 0)
+                return false;
+            if (!EnsureEditingBuffers()) return false;
+
+            posData   = new byte[m_GpuPosData.count   * m_GpuPosData.stride];
+            otherData = new byte[m_GpuOtherData.count * m_GpuOtherData.stride];
+            shData    = new byte[m_GpuSHData.count    * m_GpuSHData.stride];
+            m_GpuPosData.GetData(posData);
+            m_GpuOtherData.GetData(otherData);
+            m_GpuSHData.GetData(shData);
+
+            // Color is a RenderTexture — blit to a readable Texture2D first
+            var rt = m_GpuColorData as RenderTexture;
+            if (rt == null)
+            {
+                // Already a plain Texture2D (shouldn't happen for VeryHigh, but handle it)
+                var tex = m_GpuColorData as Texture2D;
+                colorData = tex != null ? tex.GetRawTextureData() : null;
+            }
+            else
+            {
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                var readable = new Texture2D(rt.width, rt.height, rt.graphicsFormat, UnityEngine.Experimental.Rendering.TextureCreationFlags.None);
+                readable.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0, false);
+                readable.Apply();
+                RenderTexture.active = prev;
+                colorData = readable.GetRawTextureData();
+                UnityEngine.Object.DestroyImmediate(readable);
+            }
+
+            return colorData != null;
+        }
+
+        // Marks all currently selected splats as deleted (for use after Separate exports them).
+        public void EditDeleteSelection()
+        {
+            EditDeleteSelected();
         }
 
         public void EditSelectAll()

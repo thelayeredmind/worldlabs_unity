@@ -20,6 +20,8 @@ namespace GaussianSplatting.Editor
     public class GaussianSplatRendererEditor : UnityEditor.Editor
     {
         const string kPrefExportBake = "nesnausk.GaussianSplatting.ExportBakeTransform";
+        const string kPrefDeleteDensity = "nesnausk.GaussianSplatting.DeleteDensity";
+        const string kPrefDeleteSoftness = "nesnausk.GaussianSplatting.DeleteSoftness";
 
         SerializedProperty m_PropAsset;
         SerializedProperty m_PropSplatScale;
@@ -48,6 +50,12 @@ namespace GaussianSplatting.Editor
         int m_CameraIndex = 0;
 
         bool m_ExportBakeTransform;
+        float m_DeleteDensity = 1f;
+        float m_DeleteSoftness = 0f;
+
+        // Undo stack for GPU deleted-bits state. Each entry is (renderer, snapshot).
+        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] snap)> s_DeleteUndoStack = new();
+        static bool s_UndoHandlerRegistered;
 
         static int s_EditStatsUpdateCounter = 0;
 
@@ -67,6 +75,8 @@ namespace GaussianSplatting.Editor
         public void OnEnable()
         {
             m_ExportBakeTransform = EditorPrefs.GetBool(kPrefExportBake, false);
+            m_DeleteDensity  = EditorPrefs.GetFloat(kPrefDeleteDensity, 1f);
+            m_DeleteSoftness = EditorPrefs.GetFloat(kPrefDeleteSoftness, 0f);
 
             m_PropAsset = serializedObject.FindProperty("m_Asset");
             m_PropSplatScale = serializedObject.FindProperty("m_SplatScale");
@@ -336,6 +346,24 @@ namespace GaussianSplatting.Editor
             Selection.activeObject = targetGs;
         }
 
+        static void EnsureUndoHandler()
+        {
+            if (s_UndoHandlerRegistered) return;
+            s_UndoHandlerRegistered = true;
+            Undo.undoRedoPerformed += () =>
+            {
+                if (s_DeleteUndoStack.Count > 0)
+                {
+                    var (gs, snap) = s_DeleteUndoStack.Pop();
+                    if (gs != null)
+                    {
+                        gs.RestoreDeletedBits(snap);
+                        RepaintAll();
+                    }
+                }
+            };
+        }
+
         void EditGUI(GaussianSplatRenderer gs)
         {
             ++s_EditStatsUpdateCounter;
@@ -418,6 +446,43 @@ namespace GaussianSplatting.Editor
                 EditorPrefs.SetBool(kPrefExportBake, m_ExportBakeTransform);
             }
 
+            // Delete controls
+            EditorGUILayout.Space();
+            GUILayout.Label("Delete Selected", EditorStyles.boldLabel);
+            EditorGUI.BeginChangeCheck();
+            m_DeleteDensity  = EditorGUILayout.Slider(new GUIContent("Density",  "Opacity threshold: 1 = delete all selected, 0 = delete nothing"), m_DeleteDensity,  0f, 1f);
+            m_DeleteSoftness = EditorGUILayout.Slider(new GUIContent("Softness", "Fade width below threshold: 0 = hard cut, 1 = full ramp"), m_DeleteSoftness, 0f, 1f);
+            if (EditorGUI.EndChangeCheck())
+            {
+                EditorPrefs.SetFloat(kPrefDeleteDensity,  m_DeleteDensity);
+                EditorPrefs.SetFloat(kPrefDeleteSoftness, m_DeleteSoftness);
+            }
+            using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
+            {
+                if (GUILayout.Button("Delete Selected"))
+                {
+                    EnsureUndoHandler();
+                    var snapshot = gs.SnapshotDeletedBits();
+                    gs.EditDeleteSelectedWithParams(m_DeleteDensity, m_DeleteSoftness);
+                    s_DeleteUndoStack.Push((gs, snapshot));
+                    // Push a dummy Undo record so Ctrl+Z fires undoRedoPerformed
+                    Undo.RecordObject(gs, "Delete Splats");
+                    EditorUtility.SetDirty(gs);
+                    RepaintAll();
+                }
+            }
+
+            // Separate selection
+            EditorGUILayout.Space();
+            using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0 || gs.asset.chunkDataSize > 0))
+            {
+                if (GUILayout.Button("Separate Selection to New Asset"))
+                    GaussianSplatSeparator.Separate(gs);
+            }
+            if (gs.asset.chunkDataSize > 0)
+                EditorGUILayout.HelpBox("Separate requires VeryHigh quality (no chunk compression)", MessageType.None);
+
+            EditorGUILayout.Space();
             if (GUILayout.Button("Export PLY"))
                 ExportPlyFile(gs, m_ExportBakeTransform);
             if (asset.posFormat > GaussianSplatAsset.VectorFormat.Norm16 ||
