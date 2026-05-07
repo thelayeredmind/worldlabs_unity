@@ -402,7 +402,9 @@ namespace GaussianSplatting.Runtime
             public static readonly int ZTest = Shader.PropertyToID("_ZTest");
             public static readonly int DepthBlendOp = Shader.PropertyToID("_DepthBlendOp");
             public static readonly int DeleteDensity = Shader.PropertyToID("_DeleteDensity");
-            public static readonly int DeleteSoftness = Shader.PropertyToID("_DeleteSoftness");
+            public static readonly int DeleteHardness = Shader.PropertyToID("_DeleteHardness");
+            public static readonly int DeleteSelectionCenter = Shader.PropertyToID("_DeleteSelectionCenter");
+            public static readonly int DeleteSelectionExtents = Shader.PropertyToID("_DeleteSelectionExtents");
             public static readonly int SplatDeletedBitsRW = Shader.PropertyToID("_SplatDeletedBitsRW");
         }
 
@@ -1351,16 +1353,68 @@ namespace GaussianSplatting.Runtime
             editModified = true;
         }
 
-        // Probabilistic delete filtered by opacity. density = threshold [0..1], softness = fade width [0..1].
-        public void EditDeleteSelectedWithParams(float density, float softness)
+        // Restores a previously snapshotted selected-bits buffer (used by undo to reinstate the selection).
+        public void RestoreSelectedBits(uint[] snapshot)
+        {
+            if (snapshot == null || m_GpuEditSelected == null) return;
+            m_GpuEditSelected.SetData(snapshot);
+            UpdateEditCountsAndBounds();
+        }
+
+        // Reads pos + selected bits back to CPU and computes tight bounds in raw GPU position space.
+        bool ComputeRawSelectionBounds(out Vector3 center, out Vector3 extents)
+        {
+            center = extents = Vector3.zero;
+            if (m_GpuPosData == null || m_GpuEditSelected == null) return false;
+
+            var posBytes = new byte[m_GpuPosData.count * m_GpuPosData.stride];
+            var selWords = new uint[m_GpuEditSelected.count];
+            m_GpuPosData.GetData(posBytes);
+            m_GpuEditSelected.GetData(selWords);
+
+            var delWords = new uint[m_GpuEditDeleted.count];
+            m_GpuEditDeleted.GetData(delWords);
+
+            Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+            bool any = false;
+            int stride = m_GpuPosData.stride; // 12 for Float32
+            for (int i = 0; i < m_SplatCount; i++)
+            {
+                int w = i >> 5; int b = i & 31;
+                if ((selWords[w] & (1u << b)) == 0) continue;
+                if ((delWords[w] & (1u << b)) != 0) continue;
+                float x = System.BitConverter.ToSingle(posBytes, i * stride + 0);
+                float y = System.BitConverter.ToSingle(posBytes, i * stride + 4);
+                float z = System.BitConverter.ToSingle(posBytes, i * stride + 8);
+                var p = new Vector3(x, y, z);
+                min = Vector3.Min(min, p);
+                max = Vector3.Max(max, p);
+                any = true;
+            }
+            if (!any) return false;
+            center  = (min + max) * 0.5f;
+            extents = Vector3.Max((max - min) * 0.5f, Vector3.one * 1e-5f);
+            return true;
+        }
+
+        // Delete selected splats filtered by opacity. density = threshold [0..1], hardness = edge sharpness [0..1].
+        public void EditDeleteSelectedWithParams(float density, float hardness)
         {
             if (!EnsureEditingBuffers()) return;
+
+            // Compute raw-position-space bounds by reading back pos + selected bits on CPU.
+            // This avoids any matrix transform ambiguity — s.pos in the kernel is the same float3 we read here.
+            if (!ComputeRawSelectionBounds(out Vector3 rawCenter, out Vector3 rawExtents))
+                return;
 
             using var cmb = new CommandBuffer { name = "SplatDeleteWithParams" };
             SetAssetDataOnCS(cmb, KernelIndices.DeleteSelectedWithParams);
             cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.DeleteSelectedWithParams, Props.SplatDeletedBitsRW, m_GpuEditDeleted);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteDensity, density);
-            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteSoftness, softness);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteHardness, hardness);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.DeleteSelectionCenter, rawCenter);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.DeleteSelectionExtents, rawExtents);
             DispatchUtilsAndExecute(cmb, KernelIndices.DeleteSelectedWithParams, m_SplatCount);
 
             EditDeselectAll();

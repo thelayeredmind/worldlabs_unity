@@ -826,14 +826,16 @@ void CSCopySplats (uint3 id : SV_DispatchThreadID)
     }
 }
 
-// Delete selected splats filtered by opacity.
-// density  = opacity threshold [0..1]: splats at or below this opacity are fully deleted
-// softness = fade width below the threshold [0..1]: 0 = hard cut, 1 = linear ramp
-// A splat in the selection is deleted if its opacity < density, with a probabilistic ramp in the softness zone.
-// We use a deterministic hash of the splat index as the random value so the result is frame-stable.
+// Delete selected splats filtered by opacity and distance from selection center.
+// density  [0..1]: at 1 all selected splats are candidates; at 0 nothing is deleted.
+//                  within candidates, high-opacity splats survive, low-opacity splats are deleted.
+// hardness [0..1]: at 1 every selected splat is treated equally (flat cut).
+//                  at 0 effective density fades from full at the selection center to zero at the boundary.
 float _DeleteDensity;
-float _DeleteSoftness;
-RWByteAddressBuffer _SplatDeletedBitsRW; // write-capable alias bound only for this kernel
+float _DeleteHardness;
+float3 _DeleteSelectionCenter;  // world space
+float3 _DeleteSelectionExtents; // world space, always > 0
+RWByteAddressBuffer _SplatDeletedBitsRW;
 
 [numthreads(GROUP_SIZE,1,1)]
 void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
@@ -845,29 +847,33 @@ void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
     uint wordIdx = idx / 32;
     uint bitIdx = idx & 31;
 
-    // only act on selected splats
     uint selVal = _SplatSelectedBits.Load(wordIdx * 4);
     if (!(selVal & (1u << bitIdx)))
         return;
 
-    // already deleted — skip
     uint delVal = _SplatDeletedBitsRW.Load(wordIdx * 4);
     if (delVal & (1u << bitIdx))
         return;
 
-    // read opacity (sigmoid value, 0..1)
-    float opacity = (float)LoadSplatData(idx).opacity;
+    SplatData s = LoadSplatData(idx);
+    float opacity = (float)s.opacity;
 
-    // ramp: deleteProb=1 when opacity=0, ramps to 0 as opacity approaches density
-    float lo = max(0.0, _DeleteDensity - _DeleteSoftness * _DeleteDensity);
-    float deleteProb = 1.0 - smoothstep(lo, max(lo + 1e-5, _DeleteDensity), opacity);
+    // Use raw GPU position space — same as LoadSplatPosValue, matching rawCenter/rawExtents from C#.
+    float3 localOffset = abs((float3)s.pos - _DeleteSelectionCenter) / _DeleteSelectionExtents;
+    float t = saturate(max(localOffset.x, max(localOffset.y, localOffset.z)));
 
-    // deterministic per-splat hash (Wang hash) — frame-stable result
-    uint h = idx;
-    h ^= h >> 16; h *= 0x45d9f3b; h ^= h >> 16;
-    float rnd = (h & 0xFFFF) / 65535.0;
+    // Density curve: skewed so slider feels linear in splat-count space.
+    float t0 = 1.0 - pow(1.0 - _DeleteDensity, 3.0);
+    float densityCurved = smoothstep(0.0, 1.0, t0);
 
-    if (rnd < deleteProb)
+    // Hardness: fraction of selection that is the full-density core.
+    // Inside core (t <= hardness): threshold = densityCurved, full deletion per density.
+    // Outside core: threshold fades to 0 at boundary — fewer splats qualify.
+    float outsideCore = smoothstep(_DeleteHardness, 1.0, t); // 0 inside core, 1 at boundary
+    float outsideCurved = pow(outsideCore, 3.0);             // skew so fade stays full longer
+    float threshold = densityCurved * (1.0 - outsideCurved);
+
+    if (opacity <= threshold)
     {
         _SplatDeletedBitsRW.InterlockedOr(wordIdx * 4, 1u << bitIdx);
     }

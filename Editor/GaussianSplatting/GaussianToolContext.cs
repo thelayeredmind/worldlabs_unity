@@ -33,6 +33,17 @@ namespace GaussianSplatting.Editor
 
         static void HandleKeyboardCommands(Event evt, GaussianSplatRenderer gs)
         {
+            // Intercept Ctrl+Z before Unity's undo system so we can restore GPU state + selection
+            // without Unity reverting serialized fields (e.g. m_IsActive on the GameObject).
+            if (evt.type == EventType.KeyDown && evt.keyCode == KeyCode.Z && EditorGUI.actionKey && !evt.shift)
+            {
+                if (GaussianSplatRendererEditor.PopDeleteUndo())
+                {
+                    evt.Use();
+                    return;
+                }
+            }
+
             if (evt.type != EventType.ValidateCommand && evt.type != EventType.ExecuteCommand)
                 return;
             bool execute = evt.type == EventType.ExecuteCommand;
@@ -158,11 +169,18 @@ namespace GaussianSplatting.Editor
                     }
 
                     Handles.matrix = prevMatrix;
-                    // draw selection bounding box
+                    // draw selection bounding box + hardness core gizmo
                     if (gs.editSelectedSplats > 0)
                     {
                         var selBounds = GaussianSplatRendererEditor.TransformBounds(gs.transform, gs.editSelectedBounds);
+                        Handles.color = new Color(1, 1, 1, 0.5f);
                         Handles.DrawWireCube(selBounds.center, selBounds.size);
+
+                        // Core ellipsoid: each axis scaled by hardness, matching the kernel's per-axis t computation
+                        float hardness = GaussianSplatRendererEditor.DeleteHardness;
+                        Vector3 coreSize = selBounds.size * hardness;
+                        Handles.color = new Color(1, 0.3f, 0.1f, 0.8f);
+                        Handles.DrawWireCube(selBounds.center, coreSize);
                     }
                     // draw drag rectangle
                     if (GUIUtility.hotControl == id && evt.mousePosition != m_MouseStartDragPos)

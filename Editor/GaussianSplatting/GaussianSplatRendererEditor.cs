@@ -15,13 +15,13 @@ using GaussianSplatRenderer = GaussianSplatting.Runtime.GaussianSplatRenderer;
 
 namespace GaussianSplatting.Editor
 {
-    [CustomEditor(typeof(GaussianSplatRenderer))]
+[CustomEditor(typeof(GaussianSplatRenderer))]
     [CanEditMultipleObjects]
     public class GaussianSplatRendererEditor : UnityEditor.Editor
     {
         const string kPrefExportBake = "nesnausk.GaussianSplatting.ExportBakeTransform";
         const string kPrefDeleteDensity = "nesnausk.GaussianSplatting.DeleteDensity";
-        const string kPrefDeleteSoftness = "nesnausk.GaussianSplatting.DeleteSoftness";
+        const string kPrefDeleteHardness = "nesnausk.GaussianSplatting.DeleteHardness";
 
         SerializedProperty m_PropAsset;
         SerializedProperty m_PropSplatScale;
@@ -51,11 +51,12 @@ namespace GaussianSplatting.Editor
 
         bool m_ExportBakeTransform;
         float m_DeleteDensity = 1f;
-        float m_DeleteSoftness = 0f;
+        float m_DeleteHardness = 1f;
 
-        // Undo stack for GPU deleted-bits state. Each entry is (renderer, snapshot).
-        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] snap)> s_DeleteUndoStack = new();
-        static bool s_UndoHandlerRegistered;
+        public static float DeleteHardness { get; private set; } = 1f;
+
+        // Undo stack for GPU state. Each entry is deleted-bits snapshot + selected-bits snapshot to restore after undo.
+        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] deletedSnap, uint[] selectedSnap)> s_DeleteUndoStack = new();
 
         static int s_EditStatsUpdateCounter = 0;
 
@@ -70,13 +71,14 @@ namespace GaussianSplatting.Editor
         {
             foreach (var e in s_AllEditors)
                 e.Repaint();
+            SceneView.RepaintAll();
         }
 
         public void OnEnable()
         {
             m_ExportBakeTransform = EditorPrefs.GetBool(kPrefExportBake, false);
             m_DeleteDensity  = EditorPrefs.GetFloat(kPrefDeleteDensity, 1f);
-            m_DeleteSoftness = EditorPrefs.GetFloat(kPrefDeleteSoftness, 0f);
+            m_DeleteHardness = EditorPrefs.GetFloat(kPrefDeleteHardness, 1f);
 
             m_PropAsset = serializedObject.FindProperty("m_Asset");
             m_PropSplatScale = serializedObject.FindProperty("m_SplatScale");
@@ -346,22 +348,21 @@ namespace GaussianSplatting.Editor
             Selection.activeObject = targetGs;
         }
 
-        static void EnsureUndoHandler()
+        // Called by the Undo Delete button. Returns true if something was restored.
+        public static bool PopDeleteUndo()
         {
-            if (s_UndoHandlerRegistered) return;
-            s_UndoHandlerRegistered = true;
-            Undo.undoRedoPerformed += () =>
-            {
-                if (s_DeleteUndoStack.Count > 0)
-                {
-                    var (gs, snap) = s_DeleteUndoStack.Pop();
-                    if (gs != null)
-                    {
-                        gs.RestoreDeletedBits(snap);
-                        RepaintAll();
-                    }
-                }
-            };
+            if (s_DeleteUndoStack.Count == 0) return false;
+            var (gs, deletedSnap, selectedSnap) = s_DeleteUndoStack.Pop();
+            if (gs == null) return false;
+            // Ensure the GameObject and renderer are active before touching GPU buffers.
+            gs.gameObject.SetActive(true);
+            gs.enabled = true;
+            gs.RestoreDeletedBits(deletedSnap);
+            gs.RestoreSelectedBits(selectedSnap);
+            Selection.activeGameObject = gs.gameObject;
+            ToolManager.SetActiveContext<GaussianToolContext>();
+            RepaintAll();
+            return true;
         }
 
         void EditGUI(GaussianSplatRenderer gs)
@@ -450,27 +451,47 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.Space();
             GUILayout.Label("Delete Selected", EditorStyles.boldLabel);
             EditorGUI.BeginChangeCheck();
-            m_DeleteDensity  = EditorGUILayout.Slider(new GUIContent("Density",  "Opacity threshold: 1 = delete all selected, 0 = delete nothing"), m_DeleteDensity,  0f, 1f);
-            m_DeleteSoftness = EditorGUILayout.Slider(new GUIContent("Softness", "Fade width below threshold: 0 = hard cut, 1 = full ramp"), m_DeleteSoftness, 0f, 1f);
+            m_DeleteDensity  = EditorGUILayout.Slider(new GUIContent("Density",  "How much of the selection is deleted. 1 = all candidates, 0 = nothing. Transparent splats go first."), m_DeleteDensity,  0f, 1f);
+            m_DeleteHardness = EditorGUILayout.Slider(new GUIContent("Hardness", "Edge falloff. 1 = uniform cut across selection. 0 = full density at center, fades to zero at the selection boundary."), m_DeleteHardness, 0f, 1f);
+            DeleteHardness = m_DeleteHardness;
             if (EditorGUI.EndChangeCheck())
             {
                 EditorPrefs.SetFloat(kPrefDeleteDensity,  m_DeleteDensity);
-                EditorPrefs.SetFloat(kPrefDeleteSoftness, m_DeleteSoftness);
+                EditorPrefs.SetFloat(kPrefDeleteHardness, m_DeleteHardness);
             }
             using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
             {
                 if (GUILayout.Button("Delete Selected"))
                 {
-                    EnsureUndoHandler();
-                    var snapshot = gs.SnapshotDeletedBits();
-                    gs.EditDeleteSelectedWithParams(m_DeleteDensity, m_DeleteSoftness);
-                    s_DeleteUndoStack.Push((gs, snapshot));
-                    // Push a dummy Undo record so Ctrl+Z fires undoRedoPerformed
-                    Undo.RecordObject(gs, "Delete Splats");
-                    EditorUtility.SetDirty(gs);
+                    var deletedSnap  = gs.SnapshotDeletedBits();
+                    var selectedSnap = gs.SnapshotSelectedBits();
+                    gs.EditDeleteSelectedWithParams(m_DeleteDensity, m_DeleteHardness);
+                    if (gs.editDeletedSplats > 0)
+                    {
+                        s_DeleteUndoStack.Push((gs, deletedSnap, selectedSnap));
+                        EditorUtility.SetDirty(gs);
+                    }
                     RepaintAll();
                 }
             }
+
+            // Delete undo / commit
+            int undoCount = s_DeleteUndoStack.Count;
+            GUILayout.BeginHorizontal();
+            using (new EditorGUI.DisabledScope(undoCount == 0))
+            {
+                if (GUILayout.Button($"Undo Delete ({undoCount})"))
+                    PopDeleteUndo();
+            }
+            using (new EditorGUI.DisabledScope(!gs.editModified || gs.asset.chunkDataSize > 0))
+            {
+                if (GUILayout.Button("Commit to Disk"))
+                {
+                    s_DeleteUndoStack.Clear();
+                    GaussianSplatCommitter.Commit(gs);
+                }
+            }
+            GUILayout.EndHorizontal();
 
             // Separate selection
             EditorGUILayout.Space();
