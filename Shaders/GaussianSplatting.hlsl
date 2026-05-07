@@ -193,6 +193,11 @@ uint3 SplatIndexToPixelIndex(uint idx)
     return res;
 }
 
+// Chunk layout (64 bytes, std430-safe offsets):
+//  0: colR, colG, colB, colA  (4×uint = 16B)
+// 16: posX.xy, posY.xy, posZ.xy (3×float2 = 24B)
+// 40: sclX, sclY, sclZ        (3×uint = 12B)
+// 52: shR, shG, shB            (3×uint = 12B)
 struct SplatChunkInfo
 {
     uint colR, colG, colB, colA;
@@ -201,8 +206,26 @@ struct SplatChunkInfo
     uint shR, shG, shB;
 };
 
-StructuredBuffer<SplatChunkInfo> _SplatChunks;
+// Raw buffer avoids Vulkan std430 StructuredBuffer alignment issues with mixed uint/float2 layout
+ByteAddressBuffer _SplatChunks;
 uint _SplatChunkCount;
+
+SplatChunkInfo LoadSplatChunk(uint chunkIdx)
+{
+    uint base = chunkIdx * 64;
+    SplatChunkInfo c;
+    uint4 col = _SplatChunks.Load4(base);
+    c.colR = col.x; c.colG = col.y; c.colB = col.z; c.colA = col.w;
+    uint4 posXY  = _SplatChunks.Load4(base + 16);
+    uint4 posZsc = _SplatChunks.Load4(base + 32);
+    c.posX = float2(asfloat(posXY.x),  asfloat(posXY.y));
+    c.posY = float2(asfloat(posXY.z),  asfloat(posXY.w));
+    c.posZ = float2(asfloat(posZsc.x), asfloat(posZsc.y));
+    c.sclX = posZsc.z; c.sclY = posZsc.w;
+    uint4 scsh = _SplatChunks.Load4(base + 48);
+    c.sclZ = scsh.x; c.shR = scsh.y; c.shG = scsh.z; c.shB = scsh.w;
+    return c;
+}
 
 static const uint kChunkSize = 256;
 
@@ -413,7 +436,7 @@ float3 LoadSplatPos(uint idx)
     uint chunkIdx = idx / kChunkSize;
     if (chunkIdx < _SplatChunkCount)
     {
-        SplatChunkInfo chunk = _SplatChunks[chunkIdx];
+        SplatChunkInfo chunk = LoadSplatChunk(chunkIdx);
         float3 posMin = float3(chunk.posX.x, chunk.posY.x, chunk.posZ.x);
         float3 posMax = float3(chunk.posX.y, chunk.posY.y, chunk.posZ.y);
         pos = lerp(posMin, posMax, pos);
@@ -566,7 +589,7 @@ SplatData LoadSplatData(uint idx)
     uint chunkIdx = idx / kChunkSize;
     if (chunkIdx < _SplatChunkCount)
     {
-        SplatChunkInfo chunk = _SplatChunks[chunkIdx];
+        SplatChunkInfo chunk = LoadSplatChunk(chunkIdx);
         float3 posMin = float3(chunk.posX.x, chunk.posY.x, chunk.posZ.x);
         float3 posMax = float3(chunk.posX.y, chunk.posY.y, chunk.posZ.y);
         half3 sclMin = half3(f16tof32(chunk.sclX    ), f16tof32(chunk.sclY    ), f16tof32(chunk.sclZ    ));
