@@ -7,7 +7,7 @@ using UnityEngine;
 
 namespace GaussianSplatting.Editor
 {
-    //[EditorTool("Gaussian Move Tool", typeof(GaussianSplatRenderer), typeof(GaussianToolContext))]
+    [EditorTool("Gaussian Move Tool", typeof(GaussianSplatRenderer), typeof(GaussianToolContext))]
     class GaussianMoveTool : GaussianTool
     {
         public override void OnToolGUI(EditorWindow window)

@@ -8,21 +8,18 @@ using UnityEngine;
 
 namespace GaussianSplatting.Editor
 {
-    //[EditorToolContext("GaussianSplats", typeof(GaussianSplatRenderer)), Icon(k_IconPath)]
+    [EditorToolContext("GaussianSplats", typeof(GaussianSplatRenderer)), Icon(k_IconPath)]
     class GaussianToolContext : EditorToolContext
     {
-        const string k_IconPath = "Packages/org.nesnausk.gaussian-splatting/Editor/Icons/GaussianContext.png";
+        const string k_IconPath = "Packages/com.worldlabs.gaussian-splatting/Editor/GaussianSplatting/Icons/GaussianContext.png";
 
         Vector2 m_MouseStartDragPos;
 
         protected override Type GetEditorToolType(Tool tool)
         {
-            if (tool == Tool.Move)
-                return typeof(GaussianMoveTool);
-            //if (tool == Tool.Rotate)
-            //    return typeof(GaussianRotateTool); // not correctly working yet
-            //if (tool == Tool.Scale)
-            //    return typeof(GaussianScaleTool); // not working correctly yet when the GS itself has scale
+            if (tool == Tool.Move)   return typeof(GaussianMoveTool);
+            if (tool == Tool.Rotate) return typeof(GaussianRotateTool);
+            if (tool == Tool.Scale)  return typeof(GaussianScaleTool);
             return null;
         }
 

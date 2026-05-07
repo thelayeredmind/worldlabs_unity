@@ -468,7 +468,7 @@ namespace GaussianSplatting.Runtime
         {
             m_RuntimeData = data;
             m_Asset       = null;
-            if (m_MatSplats != null) // already initialized
+            if (m_MatSplats != null)
                 UpdateRessources();
         }
         
@@ -584,17 +584,16 @@ namespace GaussianSplatting.Runtime
             
             if (chunkDataArr.Length > 0)
             {
-                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
-                    chunkDataArr.Length / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>(),
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) {name = "GaussianChunkData"};
+                // Raw buffer: avoids Vulkan std430 alignment issues with mixed uint/float2 struct layout
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw, chunkDataArr.Length / 4, 4) {name = "GaussianChunkData"};
                 m_GpuChunks.SetData(chunkDataArr);
                 m_GpuChunksValid = true;
             }
             else
             {
-                // just a dummy chunk buffer
-                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1,
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) {name = "GaussianChunkData"};
+                // dummy raw buffer (1 chunk worth of bytes)
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw,
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>() / 4, 4) {name = "GaussianChunkData"};
                 m_GpuChunksValid = false;
             }
             
@@ -651,6 +650,7 @@ namespace GaussianSplatting.Runtime
             int shLen    = RuntimeSplatProcessing.NextMultipleOf(data.shData.Length,    4);
             int colLen   = data.colData.Length;
             int chkLen   = data.chkData?.Length ?? 0;
+            int chunkInfoSize = UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>();
 
             var posDataArr   = new NativeArray<byte>(posLen, Allocator.Temp);
             var otherDataArr = new NativeArray<byte>(othLen, Allocator.Temp);
@@ -678,16 +678,16 @@ namespace GaussianSplatting.Runtime
 
             if (chkLen > 0)
             {
-                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
-                    chkLen / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>(),
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
+                // Raw buffer: avoids Vulkan std430 alignment issues with mixed uint/float2 struct layout
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw, chkLen / 4, 4) { name = "GaussianChunkData" };
                 m_GpuChunks.SetData(chunkDataArr);
                 m_GpuChunksValid = true;
             }
             else
             {
-                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1,
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
+                // dummy raw buffer (1 chunk worth of bytes)
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw,
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>() / 4, 4) { name = "GaussianChunkData" };
                 m_GpuChunksValid = false;
             }
 
@@ -1391,11 +1391,10 @@ namespace GaussianSplatting.Runtime
             if (newSplatCount == splatCount)
                 return;
 
-            
-            // Need to fix editing. Another time
-            int posStride = 0; //(int)(asset.posData.dataSize / asset.splatCount);
-            int otherStride = 0; //(int)(asset.otherData.dataSize / asset.splatCount);
-            int shStride = 0; // (int) (asset.shData.dataSize / asset.splatCount);
+            // Derive strides from loaded GPU buffers — format-agnostic, works with WL layer structure
+            int posStride   = m_GpuPosData.count   * m_GpuPosData.stride   / m_SplatCount;
+            int otherStride = m_GpuOtherData.count * m_GpuOtherData.stride / m_SplatCount;
+            int shStride    = m_GpuSHData.count    * m_GpuSHData.stride    / m_SplatCount;
 
             // create new GPU buffers
             var newPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, newSplatCount * posStride / 4, 4) { name = "GaussianPosData" };

@@ -361,8 +361,6 @@ namespace GaussianSplatting.Editor
 
                 // Save them right away only once
                 CreateSHData(inputSplats, pathClusteredSh, ref dataHash, clusteredSHs);
-                AssetDatabase.Refresh(ImportAssetOptions.ForceUncompressedImport);
-                asset.SetClusteredSHAssetFile(AssetDatabase.LoadAssetAtPath<TextAsset>(pathClusteredSh));
             }
 
             var inputSplatsLayered = new Dictionary<int, NativeArray<InputSplatData>>();
@@ -441,6 +439,13 @@ namespace GaussianSplatting.Editor
             var savedAsset = CreateOrReplaceAsset(asset, assetPath);
 
             EditorUtility.DisplayProgressBar(kProgressTitle, "Saving assets", 0.99f);
+            if (m_FormatSH >= GaussianSplatAsset.SHFormat.Cluster64k)
+            {
+                AssetDatabase.ImportAsset(pathClusteredSh, ImportAssetOptions.ForceUncompressedImport);
+                var shAsset = AssetDatabase.LoadAssetAtPath<TextAsset>(pathClusteredSh);
+                savedAsset.SetClusteredSHAssetFile(shAsset);
+                EditorUtility.SetDirty(savedAsset);
+            }
             AssetDatabase.SaveAssets();
             EditorUtility.ClearProgressBar();
 

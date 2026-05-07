@@ -7,7 +7,6 @@ using UnityEngine;
 
 namespace GaussianSplatting.Editor
 {
-    /* not working correctly yet
     [EditorTool("Gaussian Rotate Tool", typeof(GaussianSplatRenderer), typeof(GaussianToolContext))]
     class GaussianRotateTool : GaussianTool
     {
@@ -66,5 +65,4 @@ namespace GaussianSplatting.Editor
             }
         }
     }
-    */
 }

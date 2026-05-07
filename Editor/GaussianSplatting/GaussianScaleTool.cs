@@ -7,7 +7,6 @@ using UnityEngine;
 
 namespace GaussianSplatting.Editor
 {
-    /* // not working correctly yet when the GS itself has scale
     [EditorTool("Gaussian Scale Tool", typeof(GaussianSplatRenderer), typeof(GaussianToolContext))]
     class GaussianScaleTool : GaussianTool
     {
@@ -64,5 +63,4 @@ namespace GaussianSplatting.Editor
             }
         }
     }
-    */
 }
