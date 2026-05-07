@@ -2,42 +2,13 @@
 
 ## Project Context
 
-This is a Unity package that wraps Aras Pranckevičius's [UnityGaussianSplatting](https://github.com/aras-p/UnityGaussianSplatting) with a WorldLabs API client for text-to-3D generation and runtime splat loading. The Gaussian Splat renderer is the performance-critical component.
+This is a work of WorldLabs Integration for Unity (the last original commit is at d573119ed976823fe481f21cb4fcdeedb7b2ff49)
+WorldLabs Integration for Unity is a Unity package that wraps Aras Pranckevičius's [UnityGaussianSplatting](https://github.com/aras-p/UnityGaussianSplatting) with a WorldLabs API client for text-to-3D generation and runtime splat loading, and weak Meta Quest 3 optimization as after-thought. The Gaussian Splat renderer is the performance-critical component. It is a package, so only source code lives here. The assets and test scenes can be found at D:\Dev\work\arkanum\Kitchen_of_Memories\KOM_TechTests. The goal of this personal repository is to address the real Architecture/Algorithm limitations of the Quest 3 and to extend the package to allow for production ready workflows: like correct occlusion behavior, great editor tooling, right automatisms for efficiency.
 
 **Current problem:** 25fps on Quest 3 (target: 70fps). Root cause is bandwidth exhaustion on Adreno 740 — the renderer was designed for desktop (RTX 3080 Ti class) and makes assumptions about memory bandwidth, cache size, and pipeline architecture that are invalid on TBDR mobile GPUs.
 
 **Reference branch for the optimization work:**  
-`d:\Dev\playground\unity\arghyasur1991-UnityGaussianSplatting` (feature/quest-stereo-perf)
-
-**Merge strategy and analysis documents:**  
-`d:\Dev\playground\unity\GaussianSplatTest\GaussianSplat_Quest3_MergeStrategy.md`
-
----
-
-## Role Division
-
-### Seb (human) owns:
-- All C# orchestration code — `GaussianSplatRenderer.cs`, `GaussianSplatURPFeature.cs`
-- Buffer lifecycle (creation, destruction, resize)
-- Render scheduling logic (when things run, how many times, in what order)
-- Sort scheduling (`ShouldSort`, `OnSorted`, frame counter logic)
-- Stereo detection and camera matrix extraction
-- Inspector properties and Unity editor integration
-- WorldLabs-specific code: `RuntimeSplatData`, layer system, API client
-- Project settings changes (URP renderer asset, stencil buffer, render features)
-- Build and device testing
-
-Seb is strong at CPU-level C# architecture, software patterns, and human-facing API design. Metal/GPU-facing code is his stated weak area — frame explanations and reviews in C# terms where possible.
-
-### Claude owns:
-- All HLSL/ShaderLab code — compute shaders, vertex shaders, fragment shaders
-- GPU algorithm design (sort strategy, culling kernels, covariance math)
-- Shader constant layout and buffer struct definitions
-- Explaining what GPU code does and why it matters for Adreno specifically
-
-Claude writes GPU code, explains it clearly enough for Seb to integrate it correctly, and reviews that the C# → shader handoff (buffer handles, dispatch counts, shader constants) is wired up right.
-
----
+`d:\Dev\playground\unity\arghyasur1991-UnityGaussianSplatting` (Has been surpassed however by now)
 
 ## WorldLabs-Specific Code — Do Not Remove
 
