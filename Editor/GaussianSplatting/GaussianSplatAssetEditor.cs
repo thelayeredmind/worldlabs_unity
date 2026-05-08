@@ -11,28 +11,44 @@ namespace GaussianSplatting.Editor
     [CanEditMultipleObjects]
     public class GaussianSplatAssetEditor : UnityEditor.Editor
     {
+        SerializedProperty m_MobileQualityProp;
+
+
+        void OnEnable()
+        {
+            m_MobileQualityProp = serializedObject.FindProperty("m_MobileQuality");
+        }
+
         public override void OnInspectorGUI()
         {
             var gs = target as GaussianSplatAsset;
             if (!gs)
                 return;
 
-            using var _ = new EditorGUI.DisabledScope(true);
-
-            if (targets.Length == 1)
-                SingleAssetGUI(gs);
-            else
+            using (new EditorGUI.DisabledScope(true))
             {
-                int totalCount = 0;
-                foreach (var tgt in targets)
+                if (targets.Length == 1)
+                    SingleAssetGUI(gs);
+                else
                 {
-                    var gss = tgt as GaussianSplatAsset;
-                    if (gss)
+                    int totalCount = 0;
+                    foreach (var tgt in targets)
                     {
-                        totalCount += gss.splatCount;
+                        var gss = tgt as GaussianSplatAsset;
+                        if (gss) totalCount += gss.splatCount;
                     }
+                    EditorGUILayout.TextField("Total Splats", $"{totalCount:N0}");
                 }
-                EditorGUILayout.TextField("Total Splats", $"{totalCount:N0}");
+            }
+
+            if (gs.chunkDataSize == 0)
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Build Settings", EditorStyles.boldLabel);
+                serializedObject.Update();
+                EditorGUILayout.PropertyField(m_MobileQualityProp, new GUIContent("Mobile Quality",
+                    "Quality level used when building for Android/Quest. None = skip recompression (keep VeryHigh)."));
+                serializedObject.ApplyModifiedProperties();
             }
         }
 

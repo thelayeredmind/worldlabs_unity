@@ -18,11 +18,14 @@ namespace GaussianSplatting.Runtime
         public const int kTextureWidth = 2048; // allows up to 32M splats on desktop GPU (2k width x 16k height)
         public const int kMaxSplats = 8_600_000; // mostly due to 2GB GPU buffer size limit when exporting a splat (2GB / 248B is just over 8.6M)
 
+        public enum MobileQuality { None, Low, Medium, High }
+
         [SerializeField] int m_FormatVersion;
         [SerializeField] int m_SplatCount;
         [SerializeField] Vector3 m_BoundsMin;
         [SerializeField] Vector3 m_BoundsMax;
         [SerializeField] Hash128 m_DataHash;
+        [SerializeField] MobileQuality m_MobileQuality = MobileQuality.Low;
 
         // Cmon Unity give me serialized dictionaries
         [SerializeField] List<int2> m_LayerInfo;
@@ -32,6 +35,15 @@ namespace GaussianSplatting.Runtime
         public Vector3 boundsMin => m_BoundsMin;
         public Vector3 boundsMax => m_BoundsMax;
         public Hash128 dataHash => m_DataHash;
+        public MobileQuality mobileQuality => m_MobileQuality;
+
+        public static (VectorFormat pos, VectorFormat scale, ColorFormat color, SHFormat sh) GetFormatsForMobileQuality(MobileQuality q) => q switch
+        {
+            MobileQuality.Low    => (VectorFormat.Norm11, VectorFormat.Norm6,  ColorFormat.Norm8x4, SHFormat.Cluster16k),
+            MobileQuality.Medium => (VectorFormat.Norm11, VectorFormat.Norm11, ColorFormat.Norm8x4, SHFormat.Norm6),
+            MobileQuality.High   => (VectorFormat.Norm16, VectorFormat.Norm16, ColorFormat.Float16x4, SHFormat.Norm11),
+            _                    => (VectorFormat.Float32, VectorFormat.Float32, ColorFormat.Float32x4, SHFormat.Float32),
+        };
 
         
         // Layers and splats per layer
