@@ -87,8 +87,6 @@ namespace GaussianSplatting.Editor
                 const int shStride    = 192; // 15 × float3 + padding (16 × 12B)
                 const int colorBytesPerPixel = 16; // Float32x4
 
-                // Allocate destination texture (new splat count, padded to CalcTextureSize)
-                // We don't know newSplatCount yet, so pre-pass to count.
                 int newSplatCount = 0;
                 for (int i = 0; i < splatCount; i++)
                 {
@@ -105,13 +103,12 @@ namespace GaussianSplatting.Editor
                     return;
                 }
 
-                var (tw, th) = GaussianSplatAsset.CalcTextureSize(newSplatCount);
-                int srcTexWidth = kTexWidth;
-
+                // Color on disk is flat float4[splatCount] in splat-index order.
+                // colorData (from ReadPixels) is Morton-tiled texture bytes — we reverse the tiling here.
                 byte[] newPos   = new byte[newSplatCount * posStride];
                 byte[] newOther = new byte[newSplatCount * otherStride];
                 byte[] newSH    = new byte[newSplatCount * shStride];
-                byte[] newColor = new byte[tw * th * colorBytesPerPixel];
+                byte[] newColor = new byte[newSplatCount * colorBytesPerPixel];
 
                 int dstIdx = 0;
                 for (int i = 0; i < splatCount; i++)
@@ -121,21 +118,14 @@ namespace GaussianSplatting.Editor
                     bool isSelected = selectedBits != null && (selectedBits[wIdx] & (1u << bIdx)) != 0;
                     if (!isSelected || isDeleted) continue;
 
-                    // pos
                     Array.Copy(posData,   i * posStride,   newPos,   dstIdx * posStride,   posStride);
-                    // other
                     Array.Copy(otherData, i * otherStride, newOther, dstIdx * otherStride, otherStride);
-                    // SH
                     Array.Copy(shData,    i * shStride,    newSH,    dstIdx * shStride,    shStride);
 
-                    // color — both source and dest use the same Morton-tiled layout
+                    // Read from Morton-tiled texture position for src splat i, write flat to dst splat dstIdx
                     var (srcPx, srcPy) = SplatIndexToPixel(i);
-                    int srcByteOffset  = (srcPy * srcTexWidth + srcPx) * colorBytesPerPixel;
-
-                    var (dstPx, dstPy) = SplatIndexToPixel(dstIdx);
-                    int dstByteOffset  = (dstPy * tw + dstPx) * colorBytesPerPixel;
-
-                    Array.Copy(colorData, srcByteOffset, newColor, dstByteOffset, colorBytesPerPixel);
+                    int srcByteOffset = (srcPy * kTexWidth + srcPx) * colorBytesPerPixel;
+                    Array.Copy(colorData, srcByteOffset, newColor, dstIdx * colorBytesPerPixel, colorBytesPerPixel);
 
                     dstIdx++;
                 }

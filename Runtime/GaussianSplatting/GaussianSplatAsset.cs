@@ -135,6 +135,8 @@ namespace GaussianSplatting.Runtime
             m_clusteredSHData = clusteredSH;
         }
 
+        public void ClearLayerData() => m_layerData.Clear();
+
         public void SetAssetFiles(byte layer, TextAsset dataChunk, TextAsset dataPos, TextAsset dataOther, TextAsset dataColor, TextAsset dataSh)
         {
             var data = new LayerAssets()

@@ -8,7 +8,8 @@ using UnityEngine;
 
 namespace GaussianSplatting.Editor
 {
-    // Commits deleted-splat edits back to disk, permanently compacting the asset.
+    // Commits deleted-splat edits to disk by overwriting the asset's .bytes files in-place.
+    // Originals are backed up to the configured backup folder before any write.
     // Only works on VeryHigh (Float32, no chunk compression) assets.
     static class GaussianSplatCommitter
     {
@@ -49,11 +50,11 @@ namespace GaussianSplatting.Editor
             }
 
             if (!EditorUtility.DisplayDialog("Commit Edits",
-                    $"This will permanently remove {gs.editDeletedSplats:N0} deleted splats from the asset on disk.\n\nThis cannot be undone. Continue?",
+                    $"This will permanently remove {gs.editDeletedSplats:N0} deleted splats from the asset's data files.\n\nOriginals will be backed up first. Continue?",
                     "Commit", "Cancel"))
                 return;
 
-            EditorUtility.DisplayProgressBar("Committing Splats", "Reading GPU buffers...", 0.1f);
+            EditorUtility.DisplayProgressBar("Committing Splats", "Reading GPU buffers...", 0.05f);
             try
             {
                 if (!gs.EditReadbackBuffers(out byte[] posData, out byte[] otherData, out byte[] shData, out byte[] colorData))
@@ -65,6 +66,26 @@ namespace GaussianSplatting.Editor
 
                 int splatCount = gs.splatCount;
                 uint[] deletedBits = gs.SnapshotDeletedBits();
+
+                // Resolve source file paths before any writes
+                var layerData = gs.asset.LayerData;
+                if (layerData == null || layerData.Count == 0)
+                {
+                    EditorUtility.ClearProgressBar();
+                    EditorUtility.DisplayDialog("Error", "Asset has no layer data.", "OK");
+                    return;
+                }
+                var layer = layerData[0];
+                string pathPos   = AssetDatabase.GetAssetPath(layer.m_PosData);
+                string pathOther = AssetDatabase.GetAssetPath(layer.m_OtherData);
+                string pathSH    = AssetDatabase.GetAssetPath(layer.m_SHData);
+                string pathColor = AssetDatabase.GetAssetPath(layer.m_ColorData);
+
+                // Backup originals — include the .asset file so restore can recover splatCount too
+                EditorUtility.DisplayProgressBar("Committing Splats", "Backing up originals...", 0.15f);
+                string pathAsset = AssetDatabase.GetAssetPath(gs.asset);
+                GaussianSplatBackupManager.BackupFiles(gs.asset.name,
+                    pathPos, pathOther, pathSH, pathColor, pathAsset);
 
                 EditorUtility.DisplayProgressBar("Committing Splats", "Compacting...", 0.3f);
 
@@ -88,12 +109,12 @@ namespace GaussianSplatting.Editor
                     return;
                 }
 
-                var (tw, th) = GaussianSplatAsset.CalcTextureSize(newSplatCount);
-
+                // Color on disk is flat float4[splatCount] in splat-index order.
+                // colorData (from ReadPixels) is Morton-tiled texture bytes — we reverse the tiling here.
                 byte[] newPos   = new byte[newSplatCount * posStride];
                 byte[] newOther = new byte[newSplatCount * otherStride];
                 byte[] newSH    = new byte[newSplatCount * shStride];
-                byte[] newColor = new byte[tw * th * colorBytesPerPixel];
+                byte[] newColor = new byte[newSplatCount * colorBytesPerPixel];
 
                 int dstIdx = 0;
                 for (int i = 0; i < splatCount; i++)
@@ -106,32 +127,17 @@ namespace GaussianSplatting.Editor
                     Array.Copy(otherData, i * otherStride, newOther, dstIdx * otherStride, otherStride);
                     Array.Copy(shData,    i * shStride,    newSH,    dstIdx * shStride,    shStride);
 
+                    // Read from Morton-tiled texture position for src splat i, write flat to dst splat dstIdx
                     var (srcPx, srcPy) = SplatIndexToPixel(i);
                     int srcOff = (srcPy * kTexWidth + srcPx) * colorBytesPerPixel;
-                    var (dstPx, dstPy) = SplatIndexToPixel(dstIdx);
-                    int dstOff = (dstPy * tw + dstPx) * colorBytesPerPixel;
-                    Array.Copy(colorData, srcOff, newColor, dstOff, colorBytesPerPixel);
+                    Array.Copy(colorData, srcOff, newColor, dstIdx * colorBytesPerPixel, colorBytesPerPixel);
 
                     dstIdx++;
                 }
 
                 EditorUtility.DisplayProgressBar("Committing Splats", "Writing asset files...", 0.6f);
 
-                // Overwrite the existing .bytes files in-place
-                var layerData = gs.asset.LayerData;
-                if (layerData == null || layerData.Count == 0)
-                {
-                    EditorUtility.ClearProgressBar();
-                    EditorUtility.DisplayDialog("Error", "Asset has no layer data.", "OK");
-                    return;
-                }
-
-                var layer = layerData[0];
-                string pathPos   = AssetDatabase.GetAssetPath(layer.m_PosData);
-                string pathOther = AssetDatabase.GetAssetPath(layer.m_OtherData);
-                string pathSH    = AssetDatabase.GetAssetPath(layer.m_SHData);
-                string pathColor = AssetDatabase.GetAssetPath(layer.m_ColorData);
-
+                AssetDatabase.ReleaseCachedFileHandles();
                 File.WriteAllBytes(pathPos,   newPos);
                 File.WriteAllBytes(pathOther, newOther);
                 File.WriteAllBytes(pathSH,    newSH);
@@ -140,7 +146,7 @@ namespace GaussianSplatting.Editor
                 EditorUtility.DisplayProgressBar("Committing Splats", "Reimporting...", 0.75f);
                 AssetDatabase.Refresh(ImportAssetOptions.ForceUncompressedImport);
 
-                // Update splat count and bounds on the asset
+                // Update splat count on the existing asset (same TextAsset references, just new count)
                 EditorUtility.DisplayProgressBar("Committing Splats", "Updating asset...", 0.9f);
                 var srcAsset = gs.asset;
                 Undo.RecordObject(srcAsset, "Commit Splat Edits");
@@ -154,18 +160,16 @@ namespace GaussianSplatting.Editor
                     srcAsset.cameras,
                     new[] { new Unity.Mathematics.int2(0, newSplatCount) }
                 );
-                srcAsset.SetAssetFiles(
-                    0,
-                    null,
+                srcAsset.ClearLayerData();
+                srcAsset.SetAssetFiles(0, null,
                     layer.m_PosData,
                     layer.m_OtherData,
                     layer.m_ColorData,
-                    layer.m_SHData
-                );
+                    layer.m_SHData);
                 EditorUtility.SetDirty(srcAsset);
                 AssetDatabase.SaveAssets();
 
-                // Reload the renderer so it picks up the new splat count
+                // Reload renderer — this naturally clears editModified / editDeletedSplats
                 gs.enabled = false;
                 gs.enabled = true;
 
