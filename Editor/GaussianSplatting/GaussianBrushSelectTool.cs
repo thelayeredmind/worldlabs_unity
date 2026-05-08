@@ -19,7 +19,7 @@ namespace GaussianSplatting.Editor
         public static bool WorldSpaceMode   { get; set; }   // false = screen-space, true = world-space
 
         static float s_RadiusPx    = 80f;
-        static float s_RadiusWorld = 0.5f;
+        static float s_RadiusWorld = 2f;
 
         public static float BrushRadiusPx
         {
@@ -93,8 +93,9 @@ namespace GaussianSplatting.Editor
 
             if (WorldSpaceMode)
             {
-                Vector3 center = GetWorldCenter(gs, cam, evt.mousePosition);
-                gs.EditBrushSelectWorld(center, s_RadiusWorld, subtract);
+                Ray ray = HandleUtility.GUIPointToWorldRay(evt.mousePosition);
+                Vector3 center = GetBrushCenter(gs, ray);
+                gs.EditBrushSelectWorld(center, s_RadiusWorld, cam, subtract);
             }
             else
             {
@@ -109,29 +110,30 @@ namespace GaussianSplatting.Editor
         static Vector3 GetWorldCenter(GaussianSplatRenderer gs, Camera cam, Vector2 guiMousePos)
         {
             Ray ray = HandleUtility.GUIPointToWorldRay(guiMousePos);
+            return GetBrushCenter(gs, ray);
+        }
 
-            // Intersect ray with the splat bounds to find the depth of the far wall
-            // in the direction we're looking. This works both outside and inside the room.
+        // Returns the world-space center where the brush sphere should sit.
+        // Travels to the AABB far wall, stopping and snapping to the first splat hit.
+        static Vector3 GetBrushCenter(GaussianSplatRenderer gs, Ray ray)
+        {
             var asset = gs.asset;
             Bounds worldBounds = GaussianSplatRendererEditor.TransformBounds(gs.transform,
                 new Bounds((asset.boundsMin + asset.boundsMax) * 0.5f, asset.boundsMax - asset.boundsMin));
 
-            // Ray-AABB intersection to find far intersection point inside the bounds.
-            float depth;
+            float maxT;
             if (worldBounds.Contains(ray.origin))
-            {
-                // Inside: intersect with far face of the AABB.
-                depth = RayAABBFarT(ray, worldBounds);
-                depth = Mathf.Max(depth * 0.5f, 0.3f); // place sphere halfway to the wall
-            }
+                maxT = Mathf.Max(RayAABBFarT(ray, worldBounds), 0.3f);
             else
             {
-                // Outside: place at bounds center depth.
-                depth = Vector3.Dot(worldBounds.center - ray.origin, ray.direction);
-                depth = Mathf.Max(depth, 0.5f);
+                float d = Vector3.Dot(worldBounds.center - ray.origin, ray.direction);
+                maxT = Mathf.Max(d, 0.5f);
             }
 
-            return ray.origin + ray.direction * depth;
+            if (gs.EditFindBrushStopT(ray, s_RadiusWorld, maxT, out _, out Vector3 snapCenter))
+                return snapCenter;
+
+            return ray.origin + ray.direction * maxT;
         }
 
         // Returns the far-side t of a ray-AABB intersection (assumes ray origin is inside the box).
@@ -164,7 +166,8 @@ namespace GaussianSplatting.Editor
 
             if (WorldSpaceMode)
             {
-                Vector3 center = GetWorldCenter(gs, cam, guiMousePos);
+                Ray ray = HandleUtility.GUIPointToWorldRay(guiMousePos);
+                Vector3 center = GetBrushCenter(gs, ray);
                 Handles.color = subtract ? new Color(1f, 0.2f, 0.2f, 0.8f) : new Color(0.2f, 0.8f, 1f, 0.8f);
                 Handles.DrawWireDisc(center, Vector3.up,            s_RadiusWorld);
                 Handles.DrawWireDisc(center, Vector3.right,         s_RadiusWorld);

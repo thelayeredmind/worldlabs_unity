@@ -436,7 +436,7 @@ namespace GaussianSplatting.Editor
                     {
                         float r = EditorGUILayout.Slider(
                             new GUIContent("Brush Radius (m)", "World-space sphere radius in metres. Scroll wheel also resizes."),
-                            GaussianBrushSelectTool.BrushRadiusWorld, 0.01f, 50f);
+                            GaussianBrushSelectTool.BrushRadiusWorld, 0.1f, 20f);
                         if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushRadiusWorld = r;
                     }
                     else

@@ -935,8 +935,20 @@ void CSBrushSelectWorld (uint3 id : SV_DispatchThreadID)
         return;
 
     float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
+
+    // World-space sphere test.
     float3 delta = worldPos - _BrushCenterWorld;
     if (dot(delta, delta) > _BrushRadiusWorld * _BrushRadiusWorld)
+        return;
+
+    // Depth occlusion: reject splats behind the sphere (further from camera than center + radius).
+    // Uses linear camera-space depth to avoid NDC non-linearity issues.
+    float4 splatView  = mul(_MatrixMV, float4(worldPos, 1));
+    float4 centerView = mul(_MatrixMV, float4(_BrushCenterWorld, 1));
+    // In view space, -Z is forward. Larger -Z = further away.
+    float splatDist  = -splatView.z;
+    float centerDist = -centerView.z;
+    if (splatDist > centerDist + _BrushRadiusWorld)
         return;
 
     uint wordIdx = idx / 32;

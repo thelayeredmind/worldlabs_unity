@@ -1118,11 +1118,13 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.Dispatch((int)KernelIndices.OrBuffers, (int)((dst.count+gsX-1)/gsX), 1, 1);
         }
 
-        // Returns the world-space position of the splat whose center is closest to the ray
-        // (minimum perpendicular distance), among non-deleted splats with positive t (in front of ray origin).
-        public bool EditFindNearestSplatToRay(Ray worldRay, out Vector3 worldHit)
+        // Sweeps a sphere of radius brushRadius along the ray from minT to maxT.
+        // Returns the world position of the first splat whose center is within brushRadius of the ray,
+        // snapping the sphere center to that splat position.
+        public bool EditFindBrushStopT(Ray worldRay, float brushRadius, float maxT, out float stopT, out Vector3 snapCenter)
         {
-            worldHit = worldRay.origin + worldRay.direction * 5f;
+            stopT      = maxT;
+            snapCenter = worldRay.origin + worldRay.direction * maxT;
             if (m_GpuPosData == null) return false;
 
             var posBytes = new byte[m_GpuPosData.count * m_GpuPosData.stride];
@@ -1137,9 +1139,9 @@ namespace GaussianSplatting.Runtime
 
             Matrix4x4 o2w = transform.localToWorldMatrix;
             int stride = m_GpuPosData.stride;
-            float bestPerp2 = float.MaxValue;
-            bool found = false;
+            float hitR2 = brushRadius * brushRadius;
             Vector3 rd = worldRay.direction;
+            float minT = brushRadius * 2f;
 
             for (int i = 0; i < m_SplatCount; i++)
             {
@@ -1152,17 +1154,16 @@ namespace GaussianSplatting.Runtime
 
                 Vector3 toPoint = wpos - worldRay.origin;
                 float t = Vector3.Dot(toPoint, rd);
-                if (t <= 0) continue; // only splats in front of camera
+                if (t <= minT || t >= stopT) continue;
 
                 Vector3 perp = toPoint - rd * t;
-                float d2 = perp.sqrMagnitude;
-                if (d2 >= bestPerp2) continue;
-
-                bestPerp2 = d2;
-                worldHit  = wpos;
-                found     = true;
+                if (perp.sqrMagnitude < hitR2)
+                {
+                    stopT      = t;
+                    snapCenter = wpos; // snap sphere center to this splat's position
+                }
             }
-            return found;
+            return stopT < maxT;
         }
 
         static float SortableUintToFloat(uint v)
@@ -1337,18 +1338,21 @@ namespace GaussianSplatting.Runtime
         }
 
         // worldCenter: sphere center in world space. worldRadius: metres.
-        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, bool subtract)
+        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, Camera cam, bool subtract)
         {
             if (!EnsureEditingBuffers()) return;
 
             var tr = transform;
             Matrix4x4 matO2W = tr.localToWorldMatrix;
             Matrix4x4 matW2O = tr.worldToLocalMatrix;
+            Matrix4x4 matView = cam != null ? cam.worldToCameraMatrix : Matrix4x4.identity;
+            Matrix4x4 matMV   = matView * matO2W;
 
             using var cmb = new CommandBuffer { name = "SplatBrushSelectWorld" };
             SetAssetDataOnCS(cmb, KernelIndices.BrushSelectWorld);
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, matO2W);
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, matW2O);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, matMV);
             cmb.SetComputeVectorParam(m_CSSplatUtilities, "_BrushCenterWorld", worldCenter);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, "_BrushRadiusWorld", worldRadius);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
