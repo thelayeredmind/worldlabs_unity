@@ -17,6 +17,7 @@
 #pragma kernel CSExportData
 #pragma kernel CSCopySplats
 #pragma kernel CSDeleteSelectedWithParams
+#pragma kernel CSBrushSelect
 
 // DeviceRadixSort
 #pragma multi_compile __ KEY_UINT KEY_INT KEY_FLOAT
@@ -877,4 +878,41 @@ void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
     {
         _SplatDeletedBitsRW.InterlockedOr(wordIdx * 4, 1u << bitIdx);
     }
+}
+
+// Brush selection: adds or removes splats whose screen-space projection falls within a circle.
+// _BrushCenter:   brush center in screen pixels (same space as _VecScreenParams.xy)
+// _BrushRadius:   brush radius in screen pixels
+// _SelectionMode: 1 = add, 0 = subtract
+float2 _BrushCenter;
+float _BrushRadius;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSBrushSelect (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    float3 pos = LoadSplatPos(idx);
+    if (IsSplatCut(pos))
+        return;
+
+    // Project splat to screen space — identical to CSSelectionUpdate.
+    float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
+    float4 clipPos  = mul(_MatrixVP, float4(worldPos, 1));
+    if (clipPos.w <= 0)
+        return;
+
+    float2 pixelPos = (clipPos.xy / clipPos.w * float2(0.5, -0.5) + 0.5) * _VecScreenParams.xy;
+    float2 delta = pixelPos - _BrushCenter;
+    if (dot(delta, delta) > _BrushRadius * _BrushRadius)
+        return;
+
+    uint wordIdx = idx / 32;
+    uint bitIdx = idx & 31;
+    if (_SelectionMode)
+        _SplatSelectedBits.InterlockedOr(wordIdx * 4, 1u << bitIdx);
+    else
+        _SplatSelectedBits.InterlockedAnd(wordIdx * 4, ~(1u << bitIdx));
 }

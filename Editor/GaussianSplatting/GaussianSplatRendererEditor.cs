@@ -405,6 +405,31 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.HelpBox("Splat move/rotate/scale tools need Very High splat quality preset", MessageType.Warning);
             }
 
+            // Selection mode toggle: Box vs Brush
+            if (isToolActive)
+            {
+                bool isBrush = GaussianBrushSelectTool.BrushModeActive;
+                EditorGUILayout.Space(4f);
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Select:", GUILayout.ExpandWidth(false));
+                bool wantBox   = GUILayout.Toggle(!isBrush, "Box",   EditorStyles.miniButtonLeft);
+                bool wantBrush = GUILayout.Toggle( isBrush, "Brush", EditorStyles.miniButtonRight);
+                GUILayout.EndHorizontal();
+
+                if (wantBrush && !isBrush) GaussianBrushSelectTool.BrushModeActive = true;
+                else if (wantBox && isBrush) GaussianBrushSelectTool.BrushModeActive = false;
+
+                if (GaussianBrushSelectTool.BrushModeActive)
+                {
+                    EditorGUI.BeginChangeCheck();
+                    float newRadius = EditorGUILayout.Slider(
+                        new GUIContent("Brush Radius (px)", "Screen-space brush radius in pixels. Scroll wheel in scene view also resizes."),
+                        GaussianBrushSelectTool.BrushRadiusPx, 5f, 500f);
+                    if (EditorGUI.EndChangeCheck())
+                        GaussianBrushSelectTool.BrushRadiusPx = newRadius;
+                }
+            }
+
             EditorGUILayout.Space();
             GUILayout.BeginHorizontal();
             if (GUILayout.Button("Add Cutout"))
@@ -523,7 +548,17 @@ namespace GaussianSplatting.Editor
             {
                 EditorGUILayout.LabelField("Cut", $"{gs.editCutSplats:N0}");
                 EditorGUILayout.LabelField("Deleted", $"{gs.editDeletedSplats:N0}");
+                GUILayout.BeginHorizontal();
                 EditorGUILayout.LabelField("Selected", $"{gs.editSelectedSplats:N0}");
+                using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
+                {
+                    if (GUILayout.Button("Deselect", EditorStyles.miniButton, GUILayout.ExpandWidth(false)))
+                    {
+                        gs.EditDeselectAll();
+                        RepaintAll();
+                    }
+                }
+                GUILayout.EndHorizontal();
                 if (hasCutouts)
                 {
                     if (s_EditStatsUpdateCounter > 10)

@@ -435,6 +435,7 @@ namespace GaussianSplatting.Runtime
             ExportData,
             CopySplats,
             DeleteSelectedWithParams,
+            BrushSelect,
         }
 
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
@@ -1259,6 +1260,31 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
 
             DispatchUtilsAndExecute(cmb, KernelIndices.SelectionUpdate, m_SplatCount);
+            UpdateEditCountsAndBounds();
+        }
+
+        // brushCenter: screen pixel coordinates. brushRadius: pixels. cam: the scene view camera.
+        public void EditBrushSelect(Vector2 brushCenter, float brushRadius, Camera cam, bool subtract)
+        {
+            if (!EnsureEditingBuffers()) return;
+
+            var tr = transform;
+            Matrix4x4 matO2W = tr.localToWorldMatrix;
+            Matrix4x4 matW2O = tr.worldToLocalMatrix;
+            Matrix4x4 matView = cam.worldToCameraMatrix;
+            Matrix4x4 matProj = GL.GetGPUProjectionMatrix(cam.projectionMatrix, true);
+            Vector4 screenPar = new Vector4(cam.pixelWidth, cam.pixelHeight, 0, 0);
+
+            using var cmb = new CommandBuffer { name = "SplatBrushSelect" };
+            SetAssetDataOnCS(cmb, KernelIndices.BrushSelect);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, matO2W);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, matW2O);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixVP, matProj * matView);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecScreenParams, screenPar);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, "_BrushCenter", (Vector4)new Vector2(brushCenter.x, brushCenter.y));
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, "_BrushRadius", brushRadius);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
+            DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelect, m_SplatCount);
             UpdateEditCountsAndBounds();
         }
 

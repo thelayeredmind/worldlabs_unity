@@ -105,6 +105,13 @@ namespace GaussianSplatting.Editor
             Event evt = Event.current;
             HandleKeyboardCommands(evt, gs);
             var evtType = evt.GetTypeForControl(id);
+            // Delegate all input to the brush when brush mode is active.
+            if (GaussianBrushSelectTool.BrushModeActive)
+            {
+                GaussianBrushSelectTool.HandleBrushGUI(gs, id, evt, evtType);
+                return;
+            }
+
             switch (evtType)
             {
                 case EventType.Layout:
