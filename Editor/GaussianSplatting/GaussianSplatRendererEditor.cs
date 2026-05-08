@@ -421,12 +421,31 @@ namespace GaussianSplatting.Editor
 
                 if (GaussianBrushSelectTool.BrushModeActive)
                 {
+                    // Screen / World mode toggle
+                    bool wasWorld = GaussianBrushSelectTool.WorldSpaceMode;
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label("Mode:", GUILayout.ExpandWidth(false));
+                    bool wantScreen = GUILayout.Toggle(!wasWorld, "Screen", EditorStyles.miniButtonLeft);
+                    bool wantWorld  = GUILayout.Toggle( wasWorld, "World",  EditorStyles.miniButtonRight);
+                    GUILayout.EndHorizontal();
+                    if (wantWorld  && !wasWorld) GaussianBrushSelectTool.WorldSpaceMode = true;
+                    if (wantScreen &&  wasWorld) GaussianBrushSelectTool.WorldSpaceMode = false;
+
                     EditorGUI.BeginChangeCheck();
-                    float newRadius = EditorGUILayout.Slider(
-                        new GUIContent("Brush Radius (px)", "Screen-space brush radius in pixels. Scroll wheel in scene view also resizes."),
-                        GaussianBrushSelectTool.BrushRadiusPx, 5f, 500f);
-                    if (EditorGUI.EndChangeCheck())
-                        GaussianBrushSelectTool.BrushRadiusPx = newRadius;
+                    if (GaussianBrushSelectTool.WorldSpaceMode)
+                    {
+                        float r = EditorGUILayout.Slider(
+                            new GUIContent("Brush Radius (m)", "World-space sphere radius in metres. Scroll wheel also resizes."),
+                            GaussianBrushSelectTool.BrushRadiusWorld, 0.01f, 50f);
+                        if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushRadiusWorld = r;
+                    }
+                    else
+                    {
+                        float r = EditorGUILayout.Slider(
+                            new GUIContent("Brush Radius (px)", "Screen-space brush radius in pixels. Scroll wheel also resizes."),
+                            GaussianBrushSelectTool.BrushRadiusPx, 5f, 500f);
+                        if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushRadiusPx = r;
+                    }
                 }
             }
 

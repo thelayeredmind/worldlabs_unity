@@ -436,6 +436,7 @@ namespace GaussianSplatting.Runtime
             CopySplats,
             DeleteSelectedWithParams,
             BrushSelect,
+            BrushSelectWorld,
         }
 
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
@@ -1117,6 +1118,53 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.Dispatch((int)KernelIndices.OrBuffers, (int)((dst.count+gsX-1)/gsX), 1, 1);
         }
 
+        // Returns the world-space position of the splat whose center is closest to the ray
+        // (minimum perpendicular distance), among non-deleted splats with positive t (in front of ray origin).
+        public bool EditFindNearestSplatToRay(Ray worldRay, out Vector3 worldHit)
+        {
+            worldHit = worldRay.origin + worldRay.direction * 5f;
+            if (m_GpuPosData == null) return false;
+
+            var posBytes = new byte[m_GpuPosData.count * m_GpuPosData.stride];
+            m_GpuPosData.GetData(posBytes);
+
+            uint[] delWords = null;
+            if (m_GpuEditDeleted != null)
+            {
+                delWords = new uint[m_GpuEditDeleted.count];
+                m_GpuEditDeleted.GetData(delWords);
+            }
+
+            Matrix4x4 o2w = transform.localToWorldMatrix;
+            int stride = m_GpuPosData.stride;
+            float bestPerp2 = float.MaxValue;
+            bool found = false;
+            Vector3 rd = worldRay.direction;
+
+            for (int i = 0; i < m_SplatCount; i++)
+            {
+                if (delWords != null && (delWords[i >> 5] & (1u << (i & 31))) != 0) continue;
+
+                float x = System.BitConverter.ToSingle(posBytes, i * stride + 0);
+                float y = System.BitConverter.ToSingle(posBytes, i * stride + 4);
+                float z = System.BitConverter.ToSingle(posBytes, i * stride + 8);
+                Vector3 wpos = o2w.MultiplyPoint3x4(new Vector3(x, y, z));
+
+                Vector3 toPoint = wpos - worldRay.origin;
+                float t = Vector3.Dot(toPoint, rd);
+                if (t <= 0) continue; // only splats in front of camera
+
+                Vector3 perp = toPoint - rd * t;
+                float d2 = perp.sqrMagnitude;
+                if (d2 >= bestPerp2) continue;
+
+                bestPerp2 = d2;
+                worldHit  = wpos;
+                found     = true;
+            }
+            return found;
+        }
+
         static float SortableUintToFloat(uint v)
         {
             uint mask = ((v >> 31) - 1) | 0x80000000u;
@@ -1285,6 +1333,26 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeFloatParam(m_CSSplatUtilities, "_BrushRadius", brushRadius);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
             DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelect, m_SplatCount);
+            UpdateEditCountsAndBounds();
+        }
+
+        // worldCenter: sphere center in world space. worldRadius: metres.
+        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, bool subtract)
+        {
+            if (!EnsureEditingBuffers()) return;
+
+            var tr = transform;
+            Matrix4x4 matO2W = tr.localToWorldMatrix;
+            Matrix4x4 matW2O = tr.worldToLocalMatrix;
+
+            using var cmb = new CommandBuffer { name = "SplatBrushSelectWorld" };
+            SetAssetDataOnCS(cmb, KernelIndices.BrushSelectWorld);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, matO2W);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, matW2O);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, "_BrushCenterWorld", worldCenter);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, "_BrushRadiusWorld", worldRadius);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
+            DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelectWorld, m_SplatCount);
             UpdateEditCountsAndBounds();
         }
 

@@ -18,6 +18,7 @@
 #pragma kernel CSCopySplats
 #pragma kernel CSDeleteSelectedWithParams
 #pragma kernel CSBrushSelect
+#pragma kernel CSBrushSelectWorld
 
 // DeviceRadixSort
 #pragma multi_compile __ KEY_UINT KEY_INT KEY_FLOAT
@@ -880,12 +881,17 @@ void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
     }
 }
 
-// Brush selection: adds or removes splats whose screen-space projection falls within a circle.
-// _BrushCenter:   brush center in screen pixels (same space as _VecScreenParams.xy)
+// Screen-space brush: selects splats whose projection falls within a screen-pixel circle.
+// _BrushCenter:   brush center in screen pixels
 // _BrushRadius:   brush radius in screen pixels
-// _SelectionMode: 1 = add, 0 = subtract
+// World-space brush: selects splats within a 3D sphere.
+// _BrushCenterWorld: sphere center in world space
+// _BrushRadiusWorld: sphere radius in world space
+// _SelectionMode: 1 = add, 0 = subtract (shared by both kernels)
 float2 _BrushCenter;
 float _BrushRadius;
+float3 _BrushCenterWorld;
+float _BrushRadiusWorld;
 
 [numthreads(GROUP_SIZE,1,1)]
 void CSBrushSelect (uint3 id : SV_DispatchThreadID)
@@ -907,6 +913,30 @@ void CSBrushSelect (uint3 id : SV_DispatchThreadID)
     float2 pixelPos = (clipPos.xy / clipPos.w * float2(0.5, -0.5) + 0.5) * _VecScreenParams.xy;
     float2 delta = pixelPos - _BrushCenter;
     if (dot(delta, delta) > _BrushRadius * _BrushRadius)
+        return;
+
+    uint wordIdx = idx / 32;
+    uint bitIdx = idx & 31;
+    if (_SelectionMode)
+        _SplatSelectedBits.InterlockedOr(wordIdx * 4, 1u << bitIdx);
+    else
+        _SplatSelectedBits.InterlockedAnd(wordIdx * 4, ~(1u << bitIdx));
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSBrushSelectWorld (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    float3 pos = LoadSplatPos(idx);
+    if (IsSplatCut(pos))
+        return;
+
+    float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
+    float3 delta = worldPos - _BrushCenterWorld;
+    if (dot(delta, delta) > _BrushRadiusWorld * _BrushRadiusWorld)
         return;
 
     uint wordIdx = idx / 32;
