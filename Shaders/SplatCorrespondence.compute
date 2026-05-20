@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+// Nearest-neighbor correspondence search for GaussianMorphMapBuilder.
+// One thread per splat in L — finds the closest splat in R by weighted pos+color distance.
+// Duplicate resolution (one-to-one constraint) is handled on CPU after readback.
+
+#pragma kernel FindBestMatch
+
+StructuredBuffer<float4> _SplatsL;   // xyz=position (normalised), w=unused
+StructuredBuffer<float4> _ColorsL;   // rgba color
+StructuredBuffer<float4> _SplatsR;
+StructuredBuffer<float4> _ColorsR;
+
+RWStructuredBuffer<int>   _BestMatchIndex;  // output: per L splat, best R index
+RWStructuredBuffer<float> _BestMatchDist;   // output: per L splat, best distance
+
+int   _CountL;
+int   _CountR;
+float _PosWeight;
+float _ColWeight;
+
+[numthreads(64, 1, 1)]
+void FindBestMatch(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if ((int)i >= _CountL) return;
+
+    float3 pl = _SplatsL[i].xyz;
+    float4 cl = _ColorsL[i];
+
+    float bestDist = 1e30f;
+    int   bestJ    = 0;
+
+    for (int j = 0; j < _CountR; j++)
+    {
+        float3 pr = _SplatsR[j].xyz;
+        float4 cr = _ColorsR[j];
+
+        float3 dp = pl - pr;
+        float4 dc = cl - cr;
+        float dist = _PosWeight * dot(dp, dp) + _ColWeight * dot(dc, dc);
+
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            bestJ    = j;
+        }
+    }
+
+    _BestMatchIndex[i] = bestJ;
+    _BestMatchDist[i]  = bestDist;
+}

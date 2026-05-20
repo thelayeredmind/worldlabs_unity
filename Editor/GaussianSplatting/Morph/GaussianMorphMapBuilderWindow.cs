@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 using GaussianSplatting.Runtime;
 using UnityEditor;
 using UnityEngine;
@@ -8,29 +11,75 @@ namespace GaussianSplatting.Editor
 {
     /// <summary>
     /// Editor window front-end for <see cref="GaussianMorphMapBuilder"/>.
+    /// Decoding runs on a background Task to keep the editor responsive.
+    /// GPU dispatch (compute shader) is marshalled back to the main thread via EditorApplication.update.
     /// </summary>
     public class GaussianMorphMapBuilderWindow : EditorWindow
     {
-        const string kMenuPath       = "Tools/Gaussian Splats/Build Morph Map";
+        const string kMenuPath         = "Tools/Gaussian Splats/Build Morph Map";
         const string kPrefOutputFolder = "GaussianSplatting.MorphMapBuilder.OutputFolder";
+        const string kShaderPath       = "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatCorrespondence.compute";
 
         [SerializeField] GaussianSplatAsset m_AssetLeft;
         [SerializeField] GaussianSplatAsset m_AssetRight;
         [SerializeField] string m_OutputFolder = "Assets/GaussianAssets";
-        [SerializeField] float m_ColorWeight   = 0.5f;
+        [SerializeField] float  m_ColorWeight  = 0.5f;
 
         string m_Status;
+        float  m_Progress;
         bool   m_Building;
+
+        CancellationTokenSource  m_Cts;
+        Task                     m_BuildTask;
+
+        // Shared state for background-thread → main-thread GPU dispatch
+        volatile bool        m_GpuDispatchPending;
+        Vector3[]            m_GpuPosL, m_GpuPosR;
+        Vector4[]            m_GpuColL, m_GpuColR;
+        float                m_GpuPosWeight, m_GpuColWeight;
+        int[]                m_GpuResult;
+        Exception            m_GpuException;
+        ManualResetEventSlim m_GpuDone;
 
         [MenuItem(kMenuPath)]
         public static void Open()
         {
-            var w = GetWindowWithRect<GaussianMorphMapBuilderWindow>(new Rect(50, 50, 380, 240), false, "Morph Map Builder", true);
-            w.minSize = new Vector2(340, 220);
+            var w = GetWindowWithRect<GaussianMorphMapBuilderWindow>(new Rect(50, 50, 400, 260), false, "Morph Map Builder", true);
+            w.minSize = new Vector2(360, 240);
             w.Show();
         }
 
         void Awake() => m_OutputFolder = EditorPrefs.GetString(kPrefOutputFolder, "Assets/GaussianAssets");
+
+        void OnEnable()  => EditorApplication.update += OnEditorUpdate;
+        void OnDisable() => EditorApplication.update -= OnEditorUpdate;
+
+        void OnEditorUpdate()
+        {
+            if (!m_Building) return;
+
+            // Service GPU dispatch requests from the background task
+            if (m_GpuDispatchPending)
+            {
+                m_GpuDispatchPending = false;
+                try   { m_GpuResult = DispatchCorrespondenceShader(m_GpuPosL, m_GpuColL, m_GpuPosR, m_GpuColR, m_GpuPosWeight, m_GpuColWeight); }
+                catch (Exception e) { m_GpuException = e; }
+                finally { m_GpuDone.Set(); }
+            }
+
+            bool cancelled = EditorUtility.DisplayCancelableProgressBar("Building Morph Map", m_Status, m_Progress);
+            if (cancelled) m_Cts?.Cancel();
+
+            Repaint();
+
+            if (m_BuildTask != null && m_BuildTask.IsCompleted)
+            {
+                EditorUtility.ClearProgressBar();
+                m_Building  = false;
+                m_BuildTask = null;
+                Repaint();
+            }
+        }
 
         void OnGUI()
         {
@@ -63,7 +112,7 @@ namespace GaussianSplatting.Editor
             using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
             {
                 if (GUILayout.Button("Build Morph Map"))
-                    Build();
+                    StartBuild();
             }
 
             if (!string.IsNullOrEmpty(m_Status))
@@ -73,48 +122,174 @@ namespace GaussianSplatting.Editor
             }
         }
 
-        void Build()
+        void StartBuild()
         {
+            m_Cts      = new CancellationTokenSource();
+            m_GpuDone  = new ManualResetEventSlim(false);
             m_Building = true;
-            m_Status   = "Building…";
-            Repaint();
+            m_Progress = 0f;
 
+            // TextAsset.GetData is main-thread only — decode here before handing off
+            m_Status = "Decoding splat data…";
+            Vector3[] posL, posR;
+            Vector4[] colL, colR;
             try
             {
-                var result = GaussianMorphMapBuilder.Build(
-                    m_AssetLeft, m_AssetRight, m_ColorWeight,
-                    t =>
-                    {
-                        EditorUtility.DisplayProgressBar("Building Morph Map", $"{(int)(t * 100)}%", t);
-                        return true;
-                    });
-
-                SaveAsset(result);
-                m_Status = $"Done — {result.indicesLeft.Length} matched, {result.unmatchedLeft.Length} unmatched left, {result.unmatchedRight.Length} unmatched right.";
+                posL = GaussianMorphMapBuilder.DecodeSplatPositions(m_AssetLeft);
+                posR = GaussianMorphMapBuilder.DecodeSplatPositions(m_AssetRight);
+                colL = GaussianMorphMapBuilder.DecodeSplatColors(m_AssetLeft);
+                colR = GaussianMorphMapBuilder.DecodeSplatColors(m_AssetRight);
             }
-            catch (System.Exception e)
+            catch (Exception e)
             {
-                m_Status = $"Error: {e.Message}";
-                Debug.LogException(e);
-            }
-            finally
-            {
+                m_Status   = $"Decode error: {e.Message}";
                 m_Building = false;
-                EditorUtility.ClearProgressBar();
-                Repaint();
+                Debug.LogException(e);
+                return;
+            }
+
+            var assetLeft   = m_AssetLeft;
+            var assetRight  = m_AssetRight;
+            float colorWeight = m_ColorWeight;
+            var ct = m_Cts.Token;
+
+            var dispatcher = new MainThreadDispatcher(this);
+            var prog = new Progress<float>(t => { m_Progress = t; m_Status = $"{(int)(t * 100)}%…"; });
+
+            m_BuildTask = Task.Run(() =>
+            {
+                try
+                {
+                    var result = GaussianMorphMapBuilder.Build(posL, posR, colL, colR, dispatcher, colorWeight, prog, ct);
+                    m_Status = $"Done — {result.indicesLeft.Length} matched, {result.unmatchedLeft.Length} + {result.unmatchedRight.Length} unmatched.";
+                    EditorApplication.delayCall += () => SaveAsset(result, assetLeft, assetRight);
+                }
+                catch (OperationCanceledException)
+                {
+                    m_Status = "Cancelled.";
+                }
+                catch (Exception e)
+                {
+                    m_Status = $"Error: {e.Message}";
+                    Debug.LogException(e);
+                }
+            }, ct);
+        }
+
+        // ── GPU dispatcher ────────────────────────────────────────────────────
+
+        class MainThreadDispatcher : GaussianMorphMapBuilder.ICorrespondenceDispatcher
+        {
+            readonly GaussianMorphMapBuilderWindow m_Window;
+            public MainThreadDispatcher(GaussianMorphMapBuilderWindow w) => m_Window = w;
+
+            public int[] FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight)
+            {
+                var w = m_Window;
+                w.m_GpuPosL      = posL;
+                w.m_GpuColL      = colL;
+                w.m_GpuPosR      = posR;
+                w.m_GpuColR      = colR;
+                w.m_GpuPosWeight = posWeight;
+                w.m_GpuColWeight = colWeight;
+                w.m_GpuException = null;
+                w.m_GpuDone.Reset();
+                w.m_GpuDispatchPending = true;  // signal main thread
+
+                w.m_GpuDone.Wait();             // block background thread until serviced
+
+                if (w.m_GpuException != null)
+                    throw new Exception("GPU dispatch failed", w.m_GpuException);
+
+                return w.m_GpuResult;
             }
         }
 
-        void SaveAsset(GaussianMorphMapBuilder.Result result)
+        static int[] DispatchCorrespondenceShader(
+            Vector3[] posL, Vector4[] colL,
+            Vector3[] posR, Vector4[] colR,
+            float posWeight, float colWeight)
+        {
+            var shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(kShaderPath);
+            if (shader == null)
+                throw new Exception($"SplatCorrespondence.compute not found at {kShaderPath}");
+
+            int nL = posL.Length;
+            int nR = posR.Length;
+
+            // Normalise positions into [0,1] across both clouds
+            GetBounds(posL, posR, out var bMin, out var bMax);
+            float scale = Mathf.Max(Mathf.Max(bMax.x - bMin.x, bMax.y - bMin.y), bMax.z - bMin.z);
+            scale = Mathf.Max(scale, 1e-6f);
+
+            var splatsLData = new Vector4[nL];
+            var splatsRData = new Vector4[nR];
+            for (int i = 0; i < nL; i++)
+                splatsLData[i] = new Vector4((posL[i].x - bMin.x) / scale, (posL[i].y - bMin.y) / scale, (posL[i].z - bMin.z) / scale, 0);
+            for (int j = 0; j < nR; j++)
+                splatsRData[j] = new Vector4((posR[j].x - bMin.x) / scale, (posR[j].y - bMin.y) / scale, (posR[j].z - bMin.z) / scale, 0);
+
+            var bufSplatsL = new ComputeBuffer(nL, 16);
+            var bufSplatsR = new ComputeBuffer(nR, 16);
+            var bufColsL   = new ComputeBuffer(nL, 16);
+            var bufColsR   = new ComputeBuffer(nR, 16);
+            var bufMatch   = new ComputeBuffer(nL, 4);
+            var bufDist    = new ComputeBuffer(nL, 4);
+
+            try
+            {
+                bufSplatsL.SetData(splatsLData);
+                bufSplatsR.SetData(splatsRData);
+                bufColsL.SetData(colL);
+                bufColsR.SetData(colR);
+
+                int kernel = shader.FindKernel("FindBestMatch");
+                shader.SetBuffer(kernel, "_SplatsL",        bufSplatsL);
+                shader.SetBuffer(kernel, "_ColorsL",        bufColsL);
+                shader.SetBuffer(kernel, "_SplatsR",        bufSplatsR);
+                shader.SetBuffer(kernel, "_ColorsR",        bufColsR);
+                shader.SetBuffer(kernel, "_BestMatchIndex", bufMatch);
+                shader.SetBuffer(kernel, "_BestMatchDist",  bufDist);
+                shader.SetInt  ("_CountL",    nL);
+                shader.SetInt  ("_CountR",    nR);
+                shader.SetFloat("_PosWeight", posWeight);
+                shader.SetFloat("_ColWeight", colWeight);
+
+                shader.Dispatch(kernel, (nL + 63) / 64, 1, 1);
+
+                var matchData = new int[nL];
+                bufMatch.GetData(matchData);
+                return matchData;
+            }
+            finally
+            {
+                bufSplatsL.Dispose(); bufSplatsR.Dispose();
+                bufColsL.Dispose();   bufColsR.Dispose();
+                bufMatch.Dispose();   bufDist.Dispose();
+            }
+        }
+
+        static void GetBounds(Vector3[] a, Vector3[] b, out Vector3 min, out Vector3 max)
+        {
+            min = new Vector3(float.MaxValue,  float.MaxValue,  float.MaxValue);
+            max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+            foreach (var p in a) { min = Vector3.Min(min, p); max = Vector3.Max(max, p); }
+            foreach (var p in b) { min = Vector3.Min(min, p); max = Vector3.Max(max, p); }
+        }
+
+        // ── Asset save ────────────────────────────────────────────────────────
+
+        void SaveAsset(GaussianMorphMapBuilder.Result result, GaussianSplatAsset left, GaussianSplatAsset right)
         {
             if (!AssetDatabase.IsValidFolder(m_OutputFolder))
                 System.IO.Directory.CreateDirectory(m_OutputFolder);
 
-            string path = $"{m_OutputFolder}/{m_AssetLeft.name}_{m_AssetRight.name}_MorphMap.asset";
+            string path = $"{m_OutputFolder}/{left.name}_{right.name}_MorphMap.asset";
 
             var map = CreateInstance<GaussianMorphMap>();
-            map.splatCountLeft  = m_AssetLeft.splatCount;
-            map.splatCountRight = m_AssetRight.splatCount;
+            map.splatCountLeft  = left.splatCount;
+            map.splatCountRight = right.splatCount;
             map.indicesLeft     = result.indicesLeft;
             map.indicesRight    = result.indicesRight;
             map.unmatchedLeft   = result.unmatchedLeft;

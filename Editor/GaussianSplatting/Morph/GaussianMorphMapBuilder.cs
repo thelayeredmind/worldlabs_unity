@@ -2,16 +2,21 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using GaussianSplatting.Runtime;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
+using UnityEditor;
 using UnityEngine;
 
 namespace GaussianSplatting.Editor
 {
     /// <summary>
-    /// Pure correspondence algorithm. No editor dependencies — callable from a window, build processor, or test.
+    /// Builds a <see cref="GaussianMorphMap"/> from two <see cref="GaussianSplatAsset"/>s.
+    /// Correspondence search runs on the GPU (compute shader). Duplicate resolution runs on CPU after readback.
+    /// Designed to be called from a background Task; GPU dispatch must happen on the main thread via the
+    /// provided <see cref="ICorrespondenceDispatcher"/>.
     /// </summary>
     public static class GaussianMorphMapBuilder
     {
@@ -24,27 +29,97 @@ namespace GaussianSplatting.Editor
         }
 
         /// <summary>
-        /// Build correspondence between two assets.
-        /// <param name="progress">Optional callback(0..1). Return false to cancel.</param>
+        /// Abstracts the GPU dispatch so the builder stays testable without a real GPU.
+        /// The window provides <see cref="ComputeShaderDispatcher"/>.
         /// </summary>
-        public static Result Build(GaussianSplatAsset assetLeft, GaussianSplatAsset assetRight,
-            float colorWeight = 0.5f, Func<float, bool> progress = null)
+        public interface ICorrespondenceDispatcher
         {
-            var posL = DecodeSplatPositions(assetLeft);
-            var posR = DecodeSplatPositions(assetRight);
-            var colL = DecodeSplatColors(assetLeft);
-            var colR = DecodeSplatColors(assetRight);
+            /// <summary>
+            /// Upload positions and colors for both sides, dispatch the search, return best-match indices per L splat.
+            /// Must be called on the main thread.
+            /// </summary>
+            int[] FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight);
+        }
 
-            CorrespondOneToOne(posL, posR, colL, colR, colorWeight, progress,
+        // ── Public entry point ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Build from pre-decoded arrays. Decoding must happen on the main thread before calling this.
+        /// This overload is safe to call from a background thread.
+        /// </summary>
+        public static Result Build(
+            Vector3[] posL, Vector3[] posR,
+            Vector4[] colL, Vector4[] colR,
+            ICorrespondenceDispatcher dispatcher,
+            float colorWeight = 0.5f,
+            IProgress<float> progress = null,
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress?.Report(0.1f);
+
+            float posWeight = 1f - colorWeight;
+            int[] bestMatch = dispatcher.FindBestMatches(posL, colL, posR, colR, posWeight, colorWeight);
+            ct.ThrowIfCancellationRequested();
+            progress?.Report(0.85f);
+
+            ResolveOneToOne(bestMatch, posL.Length, posR.Length,
                 out var mL, out var mR, out var uL, out var uR);
+            progress?.Report(1f);
 
             return new Result
             {
-                indicesLeft   = mL,
-                indicesRight  = mR,
+                indicesLeft    = mL,
+                indicesRight   = mR,
                 unmatchedLeft  = uL,
                 unmatchedRight = uR,
             };
+        }
+
+        // ── Duplicate resolution ──────────────────────────────────────────────
+
+        /// <summary>
+        /// GPU allows multiple L splats to claim the same R splat. Resolve greedily:
+        /// keep the L splat with the smallest index (stable), mark the rest unmatched.
+        /// O(N) — trivially fast after GPU readback.
+        /// </summary>
+        static void ResolveOneToOne(int[] bestMatch, int nL, int nR,
+            out int[] matchedL, out int[] matchedR,
+            out int[] unmatchedL, out int[] unmatchedR)
+        {
+            // claimedBy[j] = first L that claimed R splat j (-1 = unclaimed)
+            int[] claimedBy = new int[nR];
+            for (int j = 0; j < nR; j++) claimedBy[j] = -1;
+
+            var mL = new List<int>(nL);
+            var mR = new List<int>(nL);
+            var uL = new List<int>();
+
+            for (int i = 0; i < nL; i++)
+            {
+                int j = bestMatch[i];
+                if (claimedBy[j] == -1)
+                {
+                    claimedBy[j] = i;
+                    mL.Add(i);
+                    mR.Add(j);
+                }
+                else
+                {
+                    uL.Add(i);
+                }
+            }
+
+            var claimedR = new HashSet<int>(mR);
+            var uR = new List<int>();
+            for (int j = 0; j < nR; j++)
+                if (!claimedR.Contains(j)) uR.Add(j);
+
+            matchedL   = mL.ToArray();
+            matchedR   = mR.ToArray();
+            unmatchedL = uL.ToArray();
+            unmatchedR = uR.ToArray();
         }
 
         // ── Decoding ──────────────────────────────────────────────────────────
@@ -62,14 +137,12 @@ namespace GaussianSplatting.Editor
             for (int i = 0; i < n; i++)
             {
                 float3 raw = DecodeRawPos(posBytes, i, fmt);
-
                 if (chunkBytes.IsCreated && chunkBytes.Length > 0)
                 {
                     int chunkIdx = i / GaussianSplatAsset.kChunkSize;
                     ReadChunkPosBounds(chunkBytes, chunkIdx, out var posMin, out var posMax);
                     raw = math.lerp(posMin, posMax, raw);
                 }
-
                 result[i] = new Vector3(raw.x, raw.y, raw.z);
             }
 
@@ -95,20 +168,14 @@ namespace GaussianSplatting.Editor
                 result[i] = fmt switch
                 {
                     GaussianSplatAsset.ColorFormat.Float32x4 => new Vector4(
-                        ReadFloat(colBytes, i * 16),
-                        ReadFloat(colBytes, i * 16 + 4),
-                        ReadFloat(colBytes, i * 16 + 8),
-                        ReadFloat(colBytes, i * 16 + 12)),
+                        ReadFloat(colBytes, i * 16),     ReadFloat(colBytes, i * 16 + 4),
+                        ReadFloat(colBytes, i * 16 + 8), ReadFloat(colBytes, i * 16 + 12)),
                     GaussianSplatAsset.ColorFormat.Float16x4 => new Vector4(
-                        HalfToFloat(ReadUShort(colBytes, i * 8)),
-                        HalfToFloat(ReadUShort(colBytes, i * 8 + 2)),
-                        HalfToFloat(ReadUShort(colBytes, i * 8 + 4)),
-                        HalfToFloat(ReadUShort(colBytes, i * 8 + 6))),
+                        HalfToFloat(ReadUShort(colBytes, i * 8)),     HalfToFloat(ReadUShort(colBytes, i * 8 + 2)),
+                        HalfToFloat(ReadUShort(colBytes, i * 8 + 4)), HalfToFloat(ReadUShort(colBytes, i * 8 + 6))),
                     GaussianSplatAsset.ColorFormat.Norm8x4 => new Vector4(
-                        colBytes[i * 4]     / 255f,
-                        colBytes[i * 4 + 1] / 255f,
-                        colBytes[i * 4 + 2] / 255f,
-                        colBytes[i * 4 + 3] / 255f),
+                        colBytes[i * 4] / 255f, colBytes[i * 4 + 1] / 255f,
+                        colBytes[i * 4 + 2] / 255f, colBytes[i * 4 + 3] / 255f),
                     _ => Vector4.zero
                 };
             }
@@ -116,80 +183,7 @@ namespace GaussianSplatting.Editor
             return result;
         }
 
-        // ── Correspondence ────────────────────────────────────────────────────
-
-        static void CorrespondOneToOne(
-            Vector3[] posL, Vector3[] posR,
-            Vector4[] colL, Vector4[] colR,
-            float colorWeight,
-            Func<float, bool> progress,
-            out int[] matchedL, out int[] matchedR,
-            out int[] unmatchedL, out int[] unmatchedR)
-        {
-            int nL = posL.Length;
-            int nR = posR.Length;
-
-            GetBounds(posL, out var minL, out var maxL);
-            GetBounds(posR, out var minR, out var maxR);
-            float scaleL   = math.cmax(maxL - minL);
-            float scaleR   = math.cmax(maxR - minR);
-            float posScale = 1f / math.max(math.max(scaleL, scaleR), 1e-6f);
-            float pw       = 1f - colorWeight;
-            float cw       = colorWeight;
-
-            bool[] usedR = new bool[nR];
-            var mL = new List<int>(math.min(nL, nR));
-            var mR = new List<int>(math.min(nL, nR));
-
-            for (int i = 0; i < nL; i++)
-            {
-                if (i % 1000 == 0 && progress != null)
-                {
-                    if (!progress(i / (float)nL))
-                        break;
-                }
-
-                float3 pl = new float3(posL[i].x, posL[i].y, posL[i].z) * posScale;
-                float4 cl = new float4(colL[i].x, colL[i].y, colL[i].z, colL[i].w);
-
-                float bestDist = float.MaxValue;
-                int   bestJ    = -1;
-
-                for (int j = 0; j < nR; j++)
-                {
-                    if (usedR[j]) continue;
-                    float3 pr = new float3(posR[j].x, posR[j].y, posR[j].z) * posScale;
-                    float4 cr = new float4(colR[j].x, colR[j].y, colR[j].z, colR[j].w);
-
-                    float dist = pw * math.lengthsq(pl - pr) + cw * math.lengthsq(cl - cr);
-                    if (dist < bestDist) { bestDist = dist; bestJ = j; }
-                }
-
-                if (bestJ >= 0)
-                {
-                    usedR[bestJ] = true;
-                    mL.Add(i);
-                    mR.Add(bestJ);
-                }
-            }
-
-            matchedL = mL.ToArray();
-            matchedR = mR.ToArray();
-
-            var matchedSetL = new HashSet<int>(mL);
-            var uL = new List<int>();
-            for (int i = 0; i < nL; i++)
-                if (!matchedSetL.Contains(i)) uL.Add(i);
-            unmatchedL = uL.ToArray();
-
-            var usedSetR = new HashSet<int>(mR);
-            var uR = new List<int>();
-            for (int j = 0; j < nR; j++)
-                if (!usedSetR.Contains(j)) uR.Add(j);
-            unmatchedR = uR.ToArray();
-        }
-
-        // ── Helpers ───────────────────────────────────────────────────────────
+        // ── Low-level helpers ─────────────────────────────────────────────────
 
         static float3 DecodeRawPos(NativeArray<byte> bytes, int idx, int fmt)
         {
@@ -223,27 +217,15 @@ namespace GaussianSplatting.Editor
         static void ReadChunkPosBounds(NativeArray<byte> chunkBytes, int chunkIdx, out float3 posMin, out float3 posMax)
         {
             // ChunkInfo layout: 0=col(16B), 16=posX.xy,posY.xy,posZ.xy(24B), 40=scl(12B), 52=sh(12B)
-            int chunkBase = chunkIdx * UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>();
-            posMin = new float3(ReadFloat(chunkBytes, chunkBase + 16), ReadFloat(chunkBytes, chunkBase + 24), ReadFloat(chunkBytes, chunkBase + 32));
-            posMax = new float3(ReadFloat(chunkBytes, chunkBase + 20), ReadFloat(chunkBytes, chunkBase + 28), ReadFloat(chunkBytes, chunkBase + 36));
+            int b = chunkIdx * UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>();
+            posMin = new float3(ReadFloat(chunkBytes, b + 16), ReadFloat(chunkBytes, b + 24), ReadFloat(chunkBytes, b + 32));
+            posMax = new float3(ReadFloat(chunkBytes, b + 20), ReadFloat(chunkBytes, b + 28), ReadFloat(chunkBytes, b + 36));
         }
 
-        static void GetBounds(Vector3[] pts, out float3 min, out float3 max)
-        {
-            min = new float3(float.MaxValue,  float.MaxValue,  float.MaxValue);
-            max = new float3(float.MinValue, float.MinValue, float.MinValue);
-            foreach (var p in pts)
-            {
-                var f = new float3(p.x, p.y, p.z);
-                min = math.min(min, f);
-                max = math.max(max, f);
-            }
-        }
-
-        static unsafe float ReadFloat(NativeArray<byte> bytes, int offset)
+        static float ReadFloat(NativeArray<byte> bytes, int offset)
         {
             uint v = ReadUInt(bytes, offset);
-            return *(float*)&v;
+            return BitConverter.ToSingle(BitConverter.GetBytes(v), 0);
         }
 
         static uint ReadUInt(NativeArray<byte> bytes, int offset)
@@ -261,13 +243,13 @@ namespace GaussianSplatting.Editor
 
         static float HalfToFloat(ushort h)
         {
-            uint sign     = (uint)(h >> 15) << 31;
-            uint exponent = (uint)((h >> 10) & 0x1F);
-            uint mantissa = (uint)(h & 0x3FF);
-            uint f = exponent == 0  ? sign | (mantissa << 13)
-                   : exponent == 31 ? sign | 0x7F800000u | (mantissa << 13)
-                                    : sign | ((exponent + 112) << 23) | (mantissa << 13);
-            return *(float*)&f;
+            uint sign = (uint)(h >> 15) << 31;
+            uint exp  = (uint)((h >> 10) & 0x1F);
+            uint mant = (uint)(h & 0x3FF);
+            uint f = exp == 0  ? sign | (mant << 13)
+                   : exp == 31 ? sign | 0x7F800000u | (mant << 13)
+                                : sign | ((exp + 112) << 23) | (mant << 13);
+            return BitConverter.ToSingle(BitConverter.GetBytes(f), 0);
         }
     }
 }
