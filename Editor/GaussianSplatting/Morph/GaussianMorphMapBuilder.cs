@@ -7,7 +7,6 @@ using GaussianSplatting.Runtime;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
-using UnityEditor;
 using UnityEngine;
 
 namespace GaussianSplatting.Editor
@@ -22,10 +21,9 @@ namespace GaussianSplatting.Editor
     {
         public struct Result
         {
-            public int[] indicesLeft;
-            public int[] indicesRight;
-            public int[] unmatchedLeft;
-            public int[] unmatchedRight;
+            public int2[] matchedPairs;
+            public int[]  unmatchedLeft;
+            public int[]  unmatchedRight;
         }
 
         /// <summary>
@@ -65,13 +63,12 @@ namespace GaussianSplatting.Editor
             progress?.Report(0.85f);
 
             ResolveOneToOne(bestMatch, posL.Length, posR.Length,
-                out var mL, out var mR, out var uL, out var uR);
+                out var pairs, out var uL, out var uR);
             progress?.Report(1f);
 
             return new Result
             {
-                indicesLeft    = mL,
-                indicesRight   = mR,
+                matchedPairs   = pairs,
                 unmatchedLeft  = uL,
                 unmatchedRight = uR,
             };
@@ -85,16 +82,15 @@ namespace GaussianSplatting.Editor
         /// O(N) — trivially fast after GPU readback.
         /// </summary>
         static void ResolveOneToOne(int[] bestMatch, int nL, int nR,
-            out int[] matchedL, out int[] matchedR,
-            out int[] unmatchedL, out int[] unmatchedR)
+            out int2[] matchedPairs,
+            out int[]  unmatchedLeft, out int[] unmatchedRight)
         {
             // claimedBy[j] = first L that claimed R splat j (-1 = unclaimed)
             int[] claimedBy = new int[nR];
             for (int j = 0; j < nR; j++) claimedBy[j] = -1;
 
-            var mL = new List<int>(nL);
-            var mR = new List<int>(nL);
-            var uL = new List<int>();
+            var pairs = new List<int2>(nL);
+            var uL    = new List<int>();
 
             for (int i = 0; i < nL; i++)
             {
@@ -102,8 +98,7 @@ namespace GaussianSplatting.Editor
                 if (claimedBy[j] == -1)
                 {
                     claimedBy[j] = i;
-                    mL.Add(i);
-                    mR.Add(j);
+                    pairs.Add(new int2(i, j));
                 }
                 else
                 {
@@ -111,15 +106,16 @@ namespace GaussianSplatting.Editor
                 }
             }
 
-            var claimedR = new HashSet<int>(mR);
+            var claimedR = new HashSet<int>();
+            foreach (var p in pairs) claimedR.Add(p.y);
+
             var uR = new List<int>();
             for (int j = 0; j < nR; j++)
                 if (!claimedR.Contains(j)) uR.Add(j);
 
-            matchedL   = mL.ToArray();
-            matchedR   = mR.ToArray();
-            unmatchedL = uL.ToArray();
-            unmatchedR = uR.ToArray();
+            matchedPairs   = pairs.ToArray();
+            unmatchedLeft  = uL.ToArray();
+            unmatchedRight = uR.ToArray();
         }
 
         // ── Decoding ──────────────────────────────────────────────────────────

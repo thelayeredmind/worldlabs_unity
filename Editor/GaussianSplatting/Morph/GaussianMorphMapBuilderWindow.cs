@@ -161,7 +161,7 @@ namespace GaussianSplatting.Editor
                 try
                 {
                     var result = GaussianMorphMapBuilder.Build(posL, posR, colL, colR, dispatcher, colorWeight, prog, ct);
-                    m_Status = $"Done — {result.indicesLeft.Length} matched, {result.unmatchedLeft.Length} + {result.unmatchedRight.Length} unmatched.";
+                    m_Status = $"Done — {result.matchedPairs.Length} matched, {result.unmatchedLeft.Length} + {result.unmatchedRight.Length} unmatched.";
                     EditorApplication.delayCall += () => SaveAsset(result, assetLeft, assetRight);
                 }
                 catch (OperationCanceledException)
@@ -290,8 +290,7 @@ namespace GaussianSplatting.Editor
             var map = CreateInstance<GaussianMorphMap>();
             map.splatCountLeft  = left.splatCount;
             map.splatCountRight = right.splatCount;
-            map.indicesLeft     = result.indicesLeft;
-            map.indicesRight    = result.indicesRight;
+            map.matchedPairs    = result.matchedPairs;
             map.unmatchedLeft   = result.unmatchedLeft;
             map.unmatchedRight  = result.unmatchedRight;
 
