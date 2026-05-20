@@ -48,8 +48,13 @@ namespace GaussianSplatting.Runtime
         [Range(0f, 2f)]
         public float intensity = 1f;
 
-        [Tooltip("Override effect time. When negative, uses Time.time automatically.")]
-        public float timeOverride = -1f;
+        [Header("Playback")]
+        [Tooltip("Loop the effect. When off, time stops at duration and the effect freezes at its end state.")]
+        public bool loop = true;
+
+        [Tooltip("Duration in seconds before the effect loops or stops. Only used for one-shot animated effects.")]
+        [Min(0.1f)]
+        public float duration = 5f;
 
         [Header("Wind / Wave")]
         public Vector3 windDir = Vector3.right;
@@ -67,14 +72,14 @@ namespace GaussianSplatting.Runtime
         public float blendScale = 1f;
 
         [Header("Light Wave")]
-        [Range(0f, 2f)]
-        public float lightWaveAmplitude = 0.3f;
-
-        [Range(0f, 10f)]
-        public float lightWaveFrequency = 1f;
+        [Range(0f, 0.5f)]
+        public float lightWaveAmplitude = 0.1f;
 
         [Range(0f, 5f)]
-        public float lightWaveSpeed = 1f;
+        public float lightWaveFrequency = 0.5f;
+
+        [Range(0f, 2f)]
+        public float lightWaveSpeed = 0.5f;
 
         [Header("Glitter / Dissolve")]
         [Range(0f, 1f)]
@@ -85,6 +90,14 @@ namespace GaussianSplatting.Runtime
 
         [Range(0.1f, 5f)]
         public float burnDuration = 2f;
+
+        // -----------------------------------------------------------------
+        // Playback state — not serialized, resets on domain reload (intentional)
+
+        [System.NonSerialized] public bool isPlaying = true;
+
+        // Read-only from outside; controlled via Play/Pause/Restart
+        public float effectTime => m_EffectTime;
 
         // -----------------------------------------------------------------
         // Internal
@@ -107,9 +120,23 @@ namespace GaussianSplatting.Runtime
 
         float m_EffectTime;
 
+        public void Restart()
+        {
+            m_EffectTime = 0f;
+            isPlaying = true;
+        }
+
+        public void Play()  => isPlaying = true;
+        public void Pause() => isPlaying = false;
+
+        // Drive time externally (Timeline, scripted animation).
+        // Disables internal advance for this frame — caller owns the clock.
+        public void SetTime(float t) => m_EffectTime = t;
+
         void OnEnable()
         {
             m_EffectTime = 0f;
+            isPlaying = true;
 #if UNITY_EDITOR
             if (!Application.isPlaying)
                 EditorApplication.update += EditorTick;
@@ -132,8 +159,19 @@ namespace GaussianSplatting.Runtime
 
         void Update()
         {
-            if (timeOverride < 0f)
-                m_EffectTime += Time.deltaTime;
+            if (!isPlaying) return;
+
+            m_EffectTime += Time.deltaTime;
+
+            if (!loop && m_EffectTime >= duration)
+            {
+                m_EffectTime = duration;
+                isPlaying = false;
+            }
+            else if (loop && m_EffectTime >= duration)
+            {
+                m_EffectTime -= duration;
+            }
         }
 
         /// <summary>
@@ -142,7 +180,7 @@ namespace GaussianSplatting.Runtime
         /// </summary>
         internal void SetEffectParams(CommandBuffer cmb, ComputeShader cs)
         {
-            float t = timeOverride >= 0f ? timeOverride : m_EffectTime;
+            float t = m_EffectTime;
 
             cmb.SetComputeIntParam   (cs, s_EffectType,         (int)effectType);
             cmb.SetComputeFloatParam (cs, s_EffectTime,         t);

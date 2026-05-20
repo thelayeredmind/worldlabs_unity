@@ -11,7 +11,8 @@ namespace GaussianSplatting.Editor
     {
         SerializedProperty m_EffectType;
         SerializedProperty m_Intensity;
-        SerializedProperty m_TimeOverride;
+        SerializedProperty m_Loop;
+        SerializedProperty m_Duration;
         SerializedProperty m_WindDir;
         SerializedProperty m_WaveAmplitude;
         SerializedProperty m_WaveFrequency;
@@ -28,7 +29,8 @@ namespace GaussianSplatting.Editor
         {
             m_EffectType         = serializedObject.FindProperty("effectType");
             m_Intensity          = serializedObject.FindProperty("intensity");
-            m_TimeOverride       = serializedObject.FindProperty("timeOverride");
+            m_Loop               = serializedObject.FindProperty("loop");
+            m_Duration           = serializedObject.FindProperty("duration");
             m_WindDir            = serializedObject.FindProperty("windDir");
             m_WaveAmplitude      = serializedObject.FindProperty("waveAmplitude");
             m_WaveFrequency      = serializedObject.FindProperty("waveFrequency");
@@ -48,6 +50,7 @@ namespace GaussianSplatting.Editor
 
             EditorGUILayout.PropertyField(m_EffectType);
 
+            var layer = (GaussianSplatEffectLayer)target;
             var effect = (GaussianSplatEffectLayer.EffectType)m_EffectType.enumValueIndex;
 
             if (effect == GaussianSplatEffectLayer.EffectType.None)
@@ -57,27 +60,24 @@ namespace GaussianSplatting.Editor
                 return;
             }
 
-            EditorGUILayout.PropertyField(m_TimeOverride,
-                new GUIContent("Time Override", "Negative = auto-advance. Set >= 0 to scrub manually."));
+            EditorGUILayout.Space(4);
 
-            bool needsIntensity      = NeedsIntensity(effect);
-            bool needsWind           = effect == GaussianSplatEffectLayer.EffectType.Wind;
-            bool needsWave           = effect == GaussianSplatEffectLayer.EffectType.PerlinWave;
-            bool needsLightWave      = NeedsLightWave(effect);
-            bool needsGlitter        = NeedsGlitter(effect);
-            bool needsDissolve       = effect == GaussianSplatEffectLayer.EffectType.FlyingDissolve;
-            bool needsBurn           = effect == GaussianSplatEffectLayer.EffectType.GlowDissolve;
+            // --- Playback controls ---
+            DrawPlaybackControls(layer, effect);
 
-            if (needsIntensity)
+            EditorGUILayout.Space(4);
+
+            // --- Effect parameters ---
+            if (NeedsIntensity(effect))
                 EditorGUILayout.PropertyField(m_Intensity);
 
-            if (needsWind)
+            if (effect == GaussianSplatEffectLayer.EffectType.Wind)
             {
                 EditorGUILayout.LabelField("Wind", EditorStyles.boldLabel);
                 EditorGUILayout.PropertyField(m_WindDir, new GUIContent("Direction"));
             }
 
-            if (needsWave)
+            if (effect == GaussianSplatEffectLayer.EffectType.PerlinWave)
             {
                 EditorGUILayout.LabelField("Wave", EditorStyles.boldLabel);
                 EditorGUILayout.PropertyField(m_WaveAmplitude,  new GUIContent("Amplitude"));
@@ -86,7 +86,7 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.PropertyField(m_BlendScale,     new GUIContent("Blend Scale"));
             }
 
-            if (needsLightWave)
+            if (NeedsLightWave(effect))
             {
                 EditorGUILayout.LabelField("Light Wave", EditorStyles.boldLabel);
                 EditorGUILayout.PropertyField(m_LightWaveAmplitude,  new GUIContent("Amplitude"));
@@ -94,25 +94,85 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.PropertyField(m_LightWaveSpeed,      new GUIContent("Speed"));
             }
 
-            if (needsGlitter)
+            if (NeedsGlitter(effect))
             {
                 EditorGUILayout.LabelField("Glitter", EditorStyles.boldLabel);
                 EditorGUILayout.PropertyField(m_GlitterDensity, new GUIContent("Density"));
             }
 
-            if (needsDissolve)
+            if (effect == GaussianSplatEffectLayer.EffectType.FlyingDissolve)
             {
                 EditorGUILayout.LabelField("Dissolve", EditorStyles.boldLabel);
                 EditorGUILayout.PropertyField(m_DissolveDriftSpeed, new GUIContent("Drift Speed"));
             }
 
-            if (needsBurn)
+            if (effect == GaussianSplatEffectLayer.EffectType.GlowDissolve)
             {
                 EditorGUILayout.LabelField("Burn", EditorStyles.boldLabel);
                 EditorGUILayout.PropertyField(m_BurnDuration, new GUIContent("Duration"));
             }
 
             serializedObject.ApplyModifiedProperties();
+        }
+
+        void DrawPlaybackControls(GaussianSplatEffectLayer layer, GaussianSplatEffectLayer.EffectType effect)
+        {
+            bool isAnimated = IsAnimated(effect);
+
+            EditorGUILayout.LabelField("Playback", EditorStyles.boldLabel);
+
+            if (isAnimated)
+            {
+                EditorGUILayout.PropertyField(m_Loop,     new GUIContent("Loop"));
+                EditorGUILayout.PropertyField(m_Duration, new GUIContent("Duration (s)"));
+            }
+
+            // Time scrub — read-only display with a manual reset
+            using (new EditorGUI.DisabledScope(true))
+                EditorGUILayout.FloatField("Time", layer.effectTime);
+
+            EditorGUILayout.BeginHorizontal();
+
+            if (isAnimated)
+            {
+                bool playing = layer.isPlaying;
+                string playPauseLabel = playing ? "❙❙ Pause" : "▶ Play";
+                if (GUILayout.Button(playPauseLabel))
+                {
+                    if (playing) layer.Pause();
+                    else         layer.Play();
+                }
+            }
+
+            if (GUILayout.Button("↺ Restart"))
+                layer.Restart();
+
+            EditorGUILayout.EndHorizontal();
+
+            // Continuously repaint while playing so the time field updates
+            if (layer.isPlaying)
+                Repaint();
+        }
+
+        // Effects whose time input meaningfully drives an animation arc
+        // (as opposed to continuous oscillations that look the same at any time offset)
+        static bool IsAnimated(GaussianSplatEffectLayer.EffectType e)
+        {
+            switch (e)
+            {
+                case GaussianSplatEffectLayer.EffectType.Flare:
+                case GaussianSplatEffectLayer.EffectType.Disintegrate:
+                case GaussianSplatEffectLayer.EffectType.MagicReveal:
+                case GaussianSplatEffectLayer.EffectType.Spread:
+                case GaussianSplatEffectLayer.EffectType.Unroll:
+                case GaussianSplatEffectLayer.EffectType.Twister:
+                case GaussianSplatEffectLayer.EffectType.Rain:
+                case GaussianSplatEffectLayer.EffectType.FlyingDissolve:
+                case GaussianSplatEffectLayer.EffectType.GlowDissolve:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         static bool NeedsIntensity(GaussianSplatEffectLayer.EffectType e)
