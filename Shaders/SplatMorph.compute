@@ -39,6 +39,8 @@ uint _MorphCount;
 uint _SplatFormatA;  // pos=bits[7:0] scale=bits[15:8]
 uint _SplatFormatB;
 uint _OutWidth;      // output color texture width
+float3 _OutBoundsMin;
+float3 _OutBoundsMax;
 
 // ── Format constants (match GaussianSplatAsset.VectorFormat) ─────────────────
 #define FMT_32F 0
@@ -184,12 +186,10 @@ void MorphSplats(uint3 id : SV_DispatchThreadID)
     float3 worldPosB = Dechunk(normPosB, _ChunksB, _ChunkCountB, idxB);
     float3 worldPos  = lerp(worldPosA, worldPosB, t);
 
-    // Output pos is chunk-less flat world-space Norm11 — re-normalise into [0,1]
-    // We don't have output chunk bounds, so we output raw world-space encoded in Norm11.
-    // The renderer must be told chunks=0 so it doesn't try to dechunk the output.
-    // This means the output pos range is unbounded — clamp to visible range as a first pass.
-    // TODO: compute output chunk bounds from both assets' bounds at activation time.
-    _OutPos.Store(i * 4, EncodeNorm11(saturate(worldPos * 0.5 + 0.5)));
+    // Normalize world pos into output chunk bounds [0,1] — renderer dechunks with the single output chunk.
+    float3 range = max(_OutBoundsMax - _OutBoundsMin, 1e-6);
+    float3 normOut = saturate((worldPos - _OutBoundsMin) / range);
+    _OutPos.Store(i * 4, EncodeNorm11(normOut));
 
     // ── Other (rotation + scale) ──────────────────────────────────────────────
     uint rotA   = _OtherA.Load(idxA * OtherStride(scaleFmtA));

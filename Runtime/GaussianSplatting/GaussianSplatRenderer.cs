@@ -324,6 +324,7 @@ namespace GaussianSplatting.Runtime
         Texture m_GpuColorData;
         internal GraphicsBuffer m_GpuChunks;
         internal bool m_GpuChunksValid;
+        bool m_GpuChunksExternallyOwned; // when true, do not dispose m_GpuChunks
         internal GraphicsBuffer m_GpuView;
         internal GraphicsBuffer m_GpuIndexBuffer;
         internal GraphicsBuffer m_GpuVisibleIndices;
@@ -523,13 +524,17 @@ namespace GaussianSplatting.Runtime
                 m_SplatCount  = splatCount;
 
                 DisposeBuffer(ref m_GpuView);
-                DisposeBuffer(ref m_GpuSortDistances);
-                DisposeBuffer(ref m_GpuSortKeys);
                 m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize) { name = "GaussianView" };
-                if (m_CSSplatUtilities != null && m_Sorter != null) InitSortBuffers(m_SplatCount);
+                if (m_CSSplatUtilities != null && m_Sorter != null)
+                {
+                    DisposeBuffer(ref m_GpuSortDistances);
+                    DisposeBuffer(ref m_GpuSortKeys);
+                    InitSortBuffers(m_SplatCount);
+                }
 
-                // Use caller-provided chunk buffer (may be a real one from the source asset)
-                DisposeBuffer(ref m_GpuChunks);
+                // Use caller-provided chunk buffer — never dispose it, the caller owns it.
+                if (!m_GpuChunksExternallyOwned) DisposeBuffer(ref m_GpuChunks);
+                m_GpuChunksExternallyOwned = chunks != null;
                 if (chunks != null)
                 {
                     m_GpuChunks      = chunks;
@@ -1012,7 +1017,9 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuLayerData);
             DisposeBuffer(ref m_GpuOtherData);
             DisposeBuffer(ref m_GpuSHData);
-            DisposeBuffer(ref m_GpuChunks);
+            if (!m_GpuChunksExternallyOwned) DisposeBuffer(ref m_GpuChunks);
+            else m_GpuChunks = null;
+            m_GpuChunksExternallyOwned = false;
 
             DisposeBuffer(ref m_GpuView);
             DisposeBuffer(ref m_GpuIndexBuffer);
@@ -1152,7 +1159,7 @@ namespace GaussianSplatting.Runtime
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortDistances, m_GpuSortDistances);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortKeys, m_GpuSortKeys);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatChunks, m_GpuChunks);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatPos, m_GpuPosData);
+            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatPos, HasExternalBuffers ? m_ExternalPos : m_GpuPosData);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatLayer, m_GpuLayerData);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)GetSplatPosFormatInt());
             cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);

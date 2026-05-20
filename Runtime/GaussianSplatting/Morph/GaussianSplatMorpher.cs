@@ -84,6 +84,11 @@ namespace GaussianSplatting.Runtime
         uint m_OutTexWidth;
         int  m_KernelMorphSplats;
 
+        // Combined world-space bounds covering both assets — output chunk
+        GraphicsBuffer m_BufOutChunk;
+        Vector3 m_WorldBoundsMin;
+        Vector3 m_WorldBoundsMax;
+
         // ── Unity messages ────────────────────────────────────────────────────
 
         void OnEnable()
@@ -102,15 +107,16 @@ namespace GaussianSplatting.Runtime
             BuildIndexBuffer();
             AllocateOutputBuffers();
 
+#if UNITY_EDITOR
+            if (m_MorphShader == null)
+                m_MorphShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>(
+                    "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatMorph.compute");
+#endif
             if (m_MorphShader != null)
                 m_KernelMorphSplats = m_MorphShader.FindKernel("MorphSplats");
 
-            CopySourceToOutput(m_BufPosA, m_BufOtherA, m_BufSHA);
-
-            m_Renderer.SetExternalBuffers(
-                m_BufOutPos, m_BufOutOther, m_BufOutSH, m_TexOutColor,
-                m_BufChunksA, m_BufChunksA != null,
-                m_AssetLeft.splatCount, m_SplatFormat);
+            ComputeOutputBoundsAndChunk();
+            BindBuffersForT();
         }
 
         void OnDisable()
@@ -138,7 +144,7 @@ namespace GaussianSplatting.Runtime
                 }
             }
 
-            // TODO: dispatch morph kernel
+            BindBuffersForT();
         }
 
         // ── GPU helpers ───────────────────────────────────────────────────────
@@ -192,6 +198,35 @@ namespace GaussianSplatting.Runtime
             return buf;
         }
 
+        void BindBuffersForT()
+        {
+            if (m_T <= 0f)
+            {
+                // Pure A — bind source buffers directly, no kernel needed
+                m_Renderer.SetExternalBuffers(
+                    m_BufPosA, m_BufOtherA, m_BufSHA, m_TexColorA,
+                    m_BufChunksA, m_BufChunksA != null,
+                    m_AssetLeft.splatCount, m_SplatFormat);
+            }
+            else if (m_T >= 1f)
+            {
+                // Pure B — bind source buffers directly
+                m_Renderer.SetExternalBuffers(
+                    m_BufPosB, m_BufOtherB, m_BufSHB, m_TexColorB,
+                    m_BufChunksB, m_BufChunksB != null,
+                    m_AssetRight.splatCount, m_SplatFormatB);
+            }
+            else
+            {
+                // Blend — dispatch kernel, bind output buffers with combined chunk
+                DispatchMorph();
+                m_Renderer.SetExternalBuffers(
+                    m_BufOutPos, m_BufOutOther, m_BufOutSH, m_TexOutColor,
+                    m_BufOutChunk, m_BufOutChunk != null,
+                    m_MatchedCount, m_SplatFormat);
+            }
+        }
+
         void DispatchMorph()
         {
             if (m_MorphShader == null || m_BufOutPos == null) return;
@@ -216,6 +251,8 @@ namespace GaussianSplatting.Runtime
 
             m_MorphShader.SetInt(  "_ChunkCountA",   m_BufChunksA != null ? m_AssetLeft.splatCount  / GaussianSplatAsset.kChunkSize : 0);
             m_MorphShader.SetInt(  "_ChunkCountB",   m_BufChunksB != null ? m_AssetRight.splatCount / GaussianSplatAsset.kChunkSize : 0);
+            m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
+            m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
             m_MorphShader.SetFloat("_T",             m_T);
             m_MorphShader.SetInt(  "_MorphCount",    m_MatchedCount);
             m_MorphShader.SetInt(  "_SplatFormatA",  (int)m_SplatFormat);
@@ -224,6 +261,57 @@ namespace GaussianSplatting.Runtime
 
             int groups = (m_MatchedCount + 63) / 64;
             m_MorphShader.Dispatch(k, groups, 1, 1);
+        }
+
+        void ComputeOutputBoundsAndChunk()
+        {
+            m_WorldBoundsMin = new Vector3(float.MaxValue,  float.MaxValue,  float.MaxValue);
+            m_WorldBoundsMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+
+            AccumulateAssetBounds(m_AssetLeft);
+            AccumulateAssetBounds(m_AssetRight);
+
+            // Write one ChunkInfo (64 bytes) per kChunkSize splats, all with the same global bounds.
+            // This way every chunkIdx maps to a valid entry — the renderer can dechunk all splats.
+            int chunkCount = (m_AssetLeft.splatCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
+            var allChunkBytes = new byte[chunkCount * 64];
+            for (int c = 0; c < chunkCount; c++)
+            {
+                int b = c * 64;
+                WriteFloat(allChunkBytes, b + 16, m_WorldBoundsMin.x); WriteFloat(allChunkBytes, b + 20, m_WorldBoundsMax.x);
+                WriteFloat(allChunkBytes, b + 24, m_WorldBoundsMin.y); WriteFloat(allChunkBytes, b + 28, m_WorldBoundsMax.y);
+                WriteFloat(allChunkBytes, b + 32, m_WorldBoundsMin.z); WriteFloat(allChunkBytes, b + 36, m_WorldBoundsMax.z);
+            }
+
+            m_BufOutChunk = new GraphicsBuffer(GraphicsBuffer.Target.Raw, allChunkBytes.Length / 4, 4) { name = "MorphOutChunk" };
+            m_BufOutChunk.SetData(allChunkBytes);
+        }
+
+        void AccumulateAssetBounds(GaussianSplatAsset asset)
+        {
+            var layer = asset.LayerData[0];
+            if (layer.m_ChunkData == null) return;
+            var chunkBytes = layer.m_ChunkData.GetData<byte>();
+            int chunkCount = chunkBytes.Length / 64;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int b = i * 64;
+                m_WorldBoundsMin.x = Mathf.Min(m_WorldBoundsMin.x, ReadFloat(chunkBytes, b + 16));
+                m_WorldBoundsMax.x = Mathf.Max(m_WorldBoundsMax.x, ReadFloat(chunkBytes, b + 20));
+                m_WorldBoundsMin.y = Mathf.Min(m_WorldBoundsMin.y, ReadFloat(chunkBytes, b + 24));
+                m_WorldBoundsMax.y = Mathf.Max(m_WorldBoundsMax.y, ReadFloat(chunkBytes, b + 28));
+                m_WorldBoundsMin.z = Mathf.Min(m_WorldBoundsMin.z, ReadFloat(chunkBytes, b + 32));
+                m_WorldBoundsMax.z = Mathf.Max(m_WorldBoundsMax.z, ReadFloat(chunkBytes, b + 36));
+            }
+        }
+
+        static float ReadFloat(Unity.Collections.NativeArray<byte> b, int offset) =>
+            System.BitConverter.ToSingle(new[] { b[offset], b[offset+1], b[offset+2], b[offset+3] }, 0);
+
+        static void WriteFloat(byte[] b, int offset, float v)
+        {
+            var bytes = System.BitConverter.GetBytes(v);
+            b[offset] = bytes[0]; b[offset+1] = bytes[1]; b[offset+2] = bytes[2]; b[offset+3] = bytes[3];
         }
 
         void CopySourceToOutput(GraphicsBuffer pos, GraphicsBuffer other, GraphicsBuffer sh)
@@ -276,7 +364,7 @@ namespace GaussianSplatting.Runtime
             m_BufSHA?.Dispose();    m_BufSHB?.Dispose();
             m_BufChunksB?.Dispose(); // A was handed to the renderer, it owns disposal
             m_BufIndices?.Dispose();
-            m_BufOutPos?.Dispose(); m_BufOutOther?.Dispose(); m_BufOutSH?.Dispose();
+            m_BufOutPos?.Dispose(); m_BufOutOther?.Dispose(); m_BufOutSH?.Dispose(); m_BufOutChunk?.Dispose();
 
             if (m_TexColorA != null) UnityEngine.Object.DestroyImmediate(m_TexColorA);
             if (m_TexColorB != null) UnityEngine.Object.DestroyImmediate(m_TexColorB);
