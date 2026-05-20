@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: MIT
+// SplatMorph.compute — lerps matched splat pairs between two GaussianSplatAssets.
+// Output is always in Left asset's format (Norm11 pos, Norm6 scale, Norm8x4 color).
+// One thread per matched pair. B-side indices are sorted ascending for sequential reads on Adreno.
+
+#pragma kernel MorphSplats
+
+#include "GaussianSplatting.hlsl"
+
+// ── Index buffer ──────────────────────────────────────────────────────────────
+// int2 per pair: x = index into A, y = index into B (sorted ascending by y)
+StructuredBuffer<int2> _MorphPairs;
+
+// ── Source buffers ────────────────────────────────────────────────────────────
+ByteAddressBuffer _PosA;
+ByteAddressBuffer _PosB;
+ByteAddressBuffer _OtherA;
+ByteAddressBuffer _OtherB;
+ByteAddressBuffer _SHA;
+ByteAddressBuffer _SHB;
+Texture2D<float4> _ColorA;
+Texture2D<float4> _ColorB;
+
+// Chunk bounds for dechunking pos
+ByteAddressBuffer _ChunksA;
+ByteAddressBuffer _ChunksB;
+uint _ChunkCountA;
+uint _ChunkCountB;
+
+// ── Output buffers ────────────────────────────────────────────────────────────
+RWByteAddressBuffer _OutPos;
+RWByteAddressBuffer _OutOther;
+RWByteAddressBuffer _OutSH;
+RWTexture2D<float4> _OutColor;
+
+// ── Params ────────────────────────────────────────────────────────────────────
+float _T;
+uint _MorphCount;
+uint _SplatFormatA;  // pos=bits[7:0] scale=bits[15:8]
+uint _SplatFormatB;
+uint _OutWidth;      // output color texture width
+
+// ── Format constants (match GaussianSplatAsset.VectorFormat) ─────────────────
+#define FMT_32F 0
+#define FMT_16  1
+#define FMT_11  2
+#define FMT_6   3
+
+// ── Decode helpers ────────────────────────────────────────────────────────────
+
+float3 DecodeNorm11(uint enc)
+{
+    return float3(
+        (enc & 2047u)         / 2047.0,
+        ((enc >> 11) & 1023u) / 1023.0,
+        ((enc >> 21) & 2047u) / 2047.0);
+}
+
+uint EncodeNorm11(float3 v)
+{
+    v = saturate(v);
+    return (uint)(v.x * 2047.0 + 0.5)
+         | ((uint)(v.y * 1023.0 + 0.5) << 11)
+         | ((uint)(v.z * 2047.0 + 0.5) << 21);
+}
+
+float3 DecodeNorm6(uint enc)
+{
+    return float3(
+        (enc & 31u)          / 31.0,
+        ((enc >> 5) & 63u)   / 63.0,
+        ((enc >> 11) & 31u)  / 31.0);
+}
+
+uint EncodeNorm6(float3 v)
+{
+    v = saturate(v);
+    return (uint)(v.x * 31.0 + 0.5)
+         | ((uint)(v.y * 63.0 + 0.5) << 5)
+         | ((uint)(v.z * 31.0 + 0.5) << 11);
+}
+
+// Decode a vector from a ByteAddressBuffer given byte offset and format
+float3 DecodeVec(ByteAddressBuffer buf, uint byteOffset, uint fmt)
+{
+    if (fmt == FMT_11)
+        return DecodeNorm11(buf.Load(byteOffset));
+    if (fmt == FMT_6)
+        return DecodeNorm6(buf.Load(byteOffset) & 0xFFFF);
+    if (fmt == FMT_16)
+    {
+        uint2 raw = buf.Load2(byteOffset);
+        return float3((raw.x & 0xFFFF) / 65535.0,
+                      (raw.x >> 16)    / 65535.0,
+                      (raw.y & 0xFFFF) / 65535.0);
+    }
+    // FMT_32F
+    return asfloat(buf.Load3(byteOffset));
+}
+
+uint PosStride(uint fmt)
+{
+    if (fmt == FMT_11) return 4;
+    if (fmt == FMT_6)  return 2;
+    if (fmt == FMT_16) return 6;
+    return 12; // FMT_32F
+}
+
+// Dechunk a normalised pos using chunk bounds (kChunkSize = 256)
+float3 Dechunk(float3 normPos, ByteAddressBuffer chunks, uint chunkCount, uint splatIdx)
+{
+    uint chunkIdx = splatIdx / 256u;
+    if (chunkIdx >= chunkCount) return normPos;
+    // ChunkInfo layout: col(16B) | posX.xy(8B) | posY.xy(8B) | posZ.xy(8B) | ...
+    uint base = chunkIdx * 64; // sizeof(ChunkInfo) = 64 bytes
+    float posXMin = asfloat(chunks.Load(base + 16));
+    float posXMax = asfloat(chunks.Load(base + 20));
+    float posYMin = asfloat(chunks.Load(base + 24));
+    float posYMax = asfloat(chunks.Load(base + 28));
+    float posZMin = asfloat(chunks.Load(base + 32));
+    float posZMax = asfloat(chunks.Load(base + 36));
+    return float3(
+        lerp(posXMin, posXMax, normPos.x),
+        lerp(posYMin, posYMax, normPos.y),
+        lerp(posZMin, posZMax, normPos.z));
+}
+
+// Decode rotation (10.10.10.2 packed uint) → float4 quaternion
+float4 DecodeRot(uint enc)
+{
+    return float4(
+        ((enc >>  0) & 1023u) / 1023.0 * 2.0 - 1.0,
+        ((enc >> 10) & 1023u) / 1023.0 * 2.0 - 1.0,
+        ((enc >> 20) & 1023u) / 1023.0 * 2.0 - 1.0,
+        ((enc >> 30) & 3u)    /    3.0 * 2.0 - 1.0);
+}
+
+uint EncodeRot(float4 q)
+{
+    q = saturate(q * 0.5 + 0.5);
+    return (uint)(q.x * 1023.0 + 0.5)
+         | ((uint)(q.y * 1023.0 + 0.5) << 10)
+         | ((uint)(q.z * 1023.0 + 0.5) << 20)
+         | ((uint)(q.w *    3.0 + 0.5) << 30);
+}
+
+uint OtherStride(uint fmt)
+{
+    if (fmt == FMT_11) return 4 + 4; // rot(4) + scale_norm11(4)
+    if (fmt == FMT_6)  return 4 + 2; // rot(4) + scale_norm6(2)
+    if (fmt == FMT_16) return 4 + 6;
+    return 4 + 12; // FMT_32F
+}
+
+uint2 SplatToTexCoord(uint idx, uint texWidth)
+{
+    // Simple row-major — matches CreateColorTextureForMorph which uses CalcTextureSize
+    return uint2(idx % texWidth, idx / texWidth);
+}
+
+// ── Main kernel ───────────────────────────────────────────────────────────────
+
+[numthreads(64, 1, 1)]
+void MorphSplats(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _MorphCount) return;
+
+    int2 pair  = _MorphPairs[i];
+    uint idxA  = (uint)pair.x;
+    uint idxB  = (uint)pair.y;
+    float t    = _T;
+
+    uint posFmtA  = _SplatFormatA & 0xFF;
+    uint scaleFmtA = (_SplatFormatA >> 8) & 0xFF;
+    uint posFmtB  = _SplatFormatB & 0xFF;
+    uint scaleFmtB = (_SplatFormatB >> 8) & 0xFF;
+
+    // ── Position ─────────────────────────────────────────────────────────────
+    float3 normPosA = DecodeVec(_PosA, idxA * PosStride(posFmtA), posFmtA);
+    float3 normPosB = DecodeVec(_PosB, idxB * PosStride(posFmtB), posFmtB);
+
+    float3 worldPosA = Dechunk(normPosA, _ChunksA, _ChunkCountA, idxA);
+    float3 worldPosB = Dechunk(normPosB, _ChunksB, _ChunkCountB, idxB);
+    float3 worldPos  = lerp(worldPosA, worldPosB, t);
+
+    // Output pos is chunk-less flat world-space Norm11 — re-normalise into [0,1]
+    // We don't have output chunk bounds, so we output raw world-space encoded in Norm11.
+    // The renderer must be told chunks=0 so it doesn't try to dechunk the output.
+    // This means the output pos range is unbounded — clamp to visible range as a first pass.
+    // TODO: compute output chunk bounds from both assets' bounds at activation time.
+    _OutPos.Store(i * 4, EncodeNorm11(saturate(worldPos * 0.5 + 0.5)));
+
+    // ── Other (rotation + scale) ──────────────────────────────────────────────
+    uint rotA   = _OtherA.Load(idxA * OtherStride(scaleFmtA));
+    uint rotB   = _OtherB.Load(idxB * OtherStride(scaleFmtB));
+    float4 qA   = DecodeRot(rotA);
+    float4 qB   = DecodeRot(rotB);
+    // Ensure shortest path slerp
+    if (dot(qA, qB) < 0) qB = -qB;
+    float4 qOut = normalize(lerp(qA, qB, t));
+
+    float3 scaleA = DecodeVec(_OtherA, idxA * OtherStride(scaleFmtA) + 4, scaleFmtA);
+    float3 scaleB = DecodeVec(_OtherB, idxB * OtherStride(scaleFmtB) + 4, scaleFmtB);
+    float3 scaleOut = lerp(scaleA, scaleB, t);
+
+    uint outOtherStride = OtherStride(scaleFmtA);
+    _OutOther.Store(i * outOtherStride,     EncodeRot(qOut));
+    _OutOther.Store(i * outOtherStride + 4, EncodeNorm6(scaleOut));
+
+    // ── Color (Norm8x4 — lerp in byte space) ─────────────────────────────────
+    uint2 coordA = SplatToTexCoord(idxA, _OutWidth);
+    uint2 coordB = SplatToTexCoord(idxB, _OutWidth);
+    uint2 coordOut = SplatToTexCoord(i, _OutWidth);
+    float4 colA  = _ColorA.Load(int3(coordA, 0));
+    float4 colB  = _ColorB.Load(int3(coordB, 0));
+    _OutColor[coordOut] = lerp(colA, colB, t);
+
+    // ── SH — passthrough A (clustered SH lerp deferred to morph/runtime) ─────
+    // TODO: proper SH lerp once formats are normalised across both assets.
+    // For now the output SH buffer is a copy of A (set at OnEnable via CopyBuffer).
+}

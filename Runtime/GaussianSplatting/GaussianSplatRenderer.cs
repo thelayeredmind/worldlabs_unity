@@ -449,6 +449,7 @@ namespace GaussianSplatting.Runtime
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
 
         public bool HasValidAsset =>
+            HasExternalBuffers ||
             HasValidRuntimeData ||
             (m_Asset != null &&
              m_Asset.splatCount > 0 &&
@@ -457,7 +458,7 @@ namespace GaussianSplatting.Runtime
              m_Asset.otherDataSize > 0 &&
              m_Asset.shDataSize > 0 &&
              m_Asset.colorDataSize > 0);
-        public bool HasValidRenderSetup => m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null;
+        public bool HasValidRenderSetup => HasExternalBuffers || (m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null);
 
         const int kGpuViewDataSize = 40;
 
@@ -484,7 +485,76 @@ namespace GaussianSplatting.Runtime
             if (m_MatSplats != null)
                 UpdateRessources();
         }
-        
+
+        // ── External buffer injection (morpher) ───────────────────────────────
+
+        // When non-null, the morpher owns these buffers; the renderer reads them directly.
+        // The renderer never allocates or disposes them.
+        GraphicsBuffer m_ExternalPos;
+        GraphicsBuffer m_ExternalOther;
+        GraphicsBuffer m_ExternalSH;
+        Texture        m_ExternalColor;
+        int            m_ExternalSplatCount;
+        uint           m_ExternalSplatFormat;
+
+        public bool HasExternalBuffers => m_ExternalPos != null;
+
+        /// <summary>
+        /// Bind morpher-owned GPU buffers as the active splat data source.
+        /// Clears m_Asset and m_RuntimeData — the renderer renders whatever the morpher writes.
+        /// Pass all nulls to release; caller must then reassign m_Asset to restore standalone mode.
+        /// </summary>
+        public void SetExternalBuffers(
+            GraphicsBuffer pos, GraphicsBuffer other, GraphicsBuffer sh, Texture color,
+            GraphicsBuffer chunks, bool chunksValid,
+            int splatCount, uint splatFormat)
+        {
+            m_ExternalPos         = pos;
+            m_ExternalOther       = other;
+            m_ExternalSH          = sh;
+            m_ExternalColor       = color;
+            m_ExternalSplatCount  = splatCount;
+            m_ExternalSplatFormat = splatFormat;
+
+            if (pos != null)
+            {
+                m_Asset       = null;
+                m_RuntimeData = null;
+                m_SplatCount  = splatCount;
+
+                DisposeBuffer(ref m_GpuView);
+                DisposeBuffer(ref m_GpuSortDistances);
+                DisposeBuffer(ref m_GpuSortKeys);
+                m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize) { name = "GaussianView" };
+                if (m_CSSplatUtilities != null && m_Sorter != null) InitSortBuffers(m_SplatCount);
+
+                // Use caller-provided chunk buffer (may be a real one from the source asset)
+                DisposeBuffer(ref m_GpuChunks);
+                if (chunks != null)
+                {
+                    m_GpuChunks      = chunks;
+                    m_GpuChunksValid = chunksValid;
+                }
+                else
+                {
+                    m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw,
+                        UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>() / 4, 4) { name = "GaussianChunkData_Morph" };
+                    m_GpuChunksValid = false;
+                }
+
+                // Dummy layer buffer
+                if (m_GpuLayerData == null)
+                    m_GpuLayerData = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 4) { name = "GaussianLayerData_Morph" };
+
+                // Index buffer for draw calls — must exist regardless of data source
+                if (m_GpuIndexBuffer == null)
+                {
+                    m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
+                    m_GpuIndexBuffer.SetData(new ushort[] { 0,1,2,1,3,2, 4,6,5,5,6,7, 0,2,4,4,2,6, 1,5,3,3,5,7, 0,4,1,1,4,5, 2,3,6,6,3,7 });
+                }
+            }
+        }
+
         static int SplatIndexToTextureIndex(uint idx)                                                                                                                                                                                  
         {
             uint2 xy = GaussianUtils.DecodeMorton2D_16x16(idx);
@@ -500,6 +570,9 @@ namespace GaussianSplatting.Runtime
             DisposeResourcesForAsset();
 
             if (!HasValidAsset)
+                return;
+
+            if (HasExternalBuffers)
                 return;
 
             if (HasValidRuntimeData)
@@ -641,15 +714,15 @@ namespace GaussianSplatting.Runtime
         // Returns the packed format integer consumed by shaders and compute shaders.
         uint GetSplatFormat()
         {
-            if (HasValidRuntimeData)
-                return (uint)m_RuntimeData.posFormat | ((uint)m_RuntimeData.scaleFormat << 8) | ((uint)m_RuntimeData.shFormat << 16);
+            if (HasExternalBuffers)  return m_ExternalSplatFormat;
+            if (HasValidRuntimeData) return (uint)m_RuntimeData.posFormat | ((uint)m_RuntimeData.scaleFormat << 8) | ((uint)m_RuntimeData.shFormat << 16);
             return (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
         }
 
         uint GetSplatPosFormatInt()
         {
-            if (HasValidRuntimeData)
-                return (uint)m_RuntimeData.posFormat;
+            if (HasExternalBuffers)  return m_ExternalSplatFormat & 0xFF;
+            if (HasValidRuntimeData) return (uint)m_RuntimeData.posFormat;
             return (uint)m_Asset.posFormat;
         }
 
@@ -853,14 +926,15 @@ namespace GaussianSplatting.Runtime
             
             ComputeShader cs = m_CSSplatUtilities;
             int kernelIndex = (int) kernel;
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatPos, m_GpuPosData);
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatPos,   HasExternalBuffers ? m_ExternalPos   : m_GpuPosData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatLayer, m_GpuLayerData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatChunks, m_GpuChunks);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatOther, m_GpuOtherData);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSH, m_GpuSHData);
-            cmb.SetComputeTextureParam(cs, kernelIndex, Props.SplatColor, m_GpuColorData);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSelectedBits, m_GpuEditSelected ?? m_GpuPosData);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatDeletedBits, m_GpuEditDeleted ?? m_GpuPosData);
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatOther, HasExternalBuffers ? m_ExternalOther : m_GpuOtherData);
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSH,    HasExternalBuffers ? m_ExternalSH    : m_GpuSHData);
+            cmb.SetComputeTextureParam(cs, kernelIndex, Props.SplatColor, HasExternalBuffers ? m_ExternalColor : m_GpuColorData);
+            var dummyBits = HasExternalBuffers ? m_ExternalPos : m_GpuPosData;
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSelectedBits, m_GpuEditSelected ?? dummyBits);
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatDeletedBits,  m_GpuEditDeleted  ?? dummyBits);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatViewData, m_GpuView);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.OrderBuffer, m_GpuSortKeys);
 
@@ -874,7 +948,10 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatCutouts, m_GpuEditCutouts);
         }
 
-        static Texture2D CreateColorTexture(NativeArray<byte> colorDataArr, GaussianSplatAsset.ColorFormat colorFormat, int splatCount)
+        public static Texture2D CreateColorTextureForMorph(Unity.Collections.NativeArray<byte> colorDataArr, GaussianSplatAsset.ColorFormat colorFormat, int splatCount)
+            => CreateColorTexture(colorDataArr, colorFormat, splatCount);
+
+        static Texture2D CreateColorTexture(Unity.Collections.NativeArray<byte> colorDataArr, GaussianSplatAsset.ColorFormat colorFormat, int splatCount)
         {
             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(splatCount);
             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(colorFormat);
@@ -899,17 +976,22 @@ namespace GaussianSplatting.Runtime
 
         internal void SetAssetDataOnMaterial(MaterialPropertyBlock mat)
         {
-            mat.SetBuffer(Props.SplatPos, m_GpuPosData);
+            var activePos   = HasExternalBuffers ? m_ExternalPos   : m_GpuPosData;
+            var activeOther = HasExternalBuffers ? m_ExternalOther : m_GpuOtherData;
+            var activeSH    = HasExternalBuffers ? m_ExternalSH    : m_GpuSHData;
+            var activeColor = HasExternalBuffers ? m_ExternalColor : m_GpuColorData;
+
+            mat.SetBuffer(Props.SplatPos,   activePos);
             mat.SetBuffer(Props.SplatLayer, m_GpuLayerData);
-            mat.SetBuffer(Props.SplatOther, m_GpuOtherData);
-            mat.SetBuffer(Props.SplatSH, m_GpuSHData);
-            mat.SetTexture(Props.SplatColor, m_GpuColorData);
-            mat.SetBuffer(Props.SplatSelectedBits, m_GpuEditSelected ?? m_GpuPosData);
-            mat.SetBuffer(Props.SplatDeletedBits, m_GpuEditDeleted ?? m_GpuPosData);
+            mat.SetBuffer(Props.SplatOther, activeOther);
+            mat.SetBuffer(Props.SplatSH,    activeSH);
+            mat.SetTexture(Props.SplatColor, activeColor);
+            mat.SetBuffer(Props.SplatSelectedBits, m_GpuEditSelected ?? activePos);
+            mat.SetBuffer(Props.SplatDeletedBits,  m_GpuEditDeleted  ?? activePos);
             mat.SetInt(Props.SplatBitsValid, m_GpuEditSelected != null && m_GpuEditDeleted != null ? 1 : 0);
-            mat.SetInteger(Props.SplatFormat, (int)GetSplatFormat());
-            mat.SetInteger(Props.SplatCount, m_SplatCount);
-            mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
+            mat.SetInteger(Props.SplatFormat,      (int)GetSplatFormat());
+            mat.SetInteger(Props.SplatCount,       HasExternalBuffers ? m_ExternalSplatCount : m_SplatCount);
+            mat.SetInteger(Props.SplatChunkCount,  m_GpuChunksValid ? m_GpuChunks.count : 0);
             mat.SetInteger(Props.OptimizeForQuest, m_OptimizeForQuest ? 1 : 0);
         }
 
@@ -921,6 +1003,9 @@ namespace GaussianSplatting.Runtime
 
         void DisposeResourcesForAsset()
         {
+            // All buffers are morpher-owned or already set up by SetExternalBuffers — leave them alone.
+            if (HasExternalBuffers) return;
+
             DestroyImmediate(m_GpuColorData);
 
             DisposeBuffer(ref m_GpuPosData);
@@ -1054,11 +1139,8 @@ namespace GaussianSplatting.Runtime
             if (cam.cameraType == CameraType.Preview)
                 return;
 
-            if (m_CSSplatUtilities == null || m_Sorter == null)
-            {
-                Debug.LogError("GaussianSplatRenderer: Compute shader or sorter is null in SortPoints. Cannot sort points.");
+            if (m_CSSplatUtilities == null || m_Sorter == null || m_GpuSortDistances == null || m_GpuSortKeys == null)
                 return;
-            }
 
             Matrix4x4 worldToCamMatrix = m_CenterEyeOnly ? m_centerCamMatrix : cam.worldToCameraMatrix;
             worldToCamMatrix.m20 *= -1;
@@ -1093,8 +1175,8 @@ namespace GaussianSplatting.Runtime
                 Initialize();
             }
             
-            // Skip asset-change detection when using runtime data (it never changes via m_Asset).
-            if (!HasValidRuntimeData)
+            // Skip asset-change detection when external buffers or runtime data own the splat data.
+            if (!HasExternalBuffers && !HasValidRuntimeData)
             {
                 var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
                 if (m_PrevAsset != m_Asset || m_PrevHash != curHash || m_centerEyeCamera == null)

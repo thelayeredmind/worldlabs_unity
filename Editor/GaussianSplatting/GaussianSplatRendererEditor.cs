@@ -154,9 +154,16 @@ namespace GaussianSplatting.Editor
             serializedObject.Update();
 
             GUILayout.Label("Data Asset", EditorStyles.boldLabel);
-            EditorGUILayout.PropertyField(m_PropAsset);
 
-            if (!gs.HasValidAsset)
+            var morpher = gs.GetComponent<GaussianSplatting.Runtime.GaussianSplatMorpher>();
+            bool morpherActive = morpher != null && morpher.isActiveAndEnabled;
+            if (morpherActive)
+                EditorGUILayout.HelpBox("Asset overridden by GaussianSplatMorpher.", MessageType.Info);
+
+            using (new EditorGUI.DisabledScope(morpherActive))
+                EditorGUILayout.PropertyField(m_PropAsset);
+
+            if (!morpherActive && !gs.HasValidAsset)
             {
                 var msg = gs.asset != null && gs.asset.formatVersion != GaussianSplatAsset.kCurrentVersion
                     ? "Gaussian Splat asset version is not compatible, please recreate the asset"
@@ -191,7 +198,9 @@ namespace GaussianSplatting.Editor
                 {
                     gs.m_LayerActivationState = new List<int2>();
                 }
-                
+
+                if (gs.asset == null) return;
+
                 for (int i = 0; i < gs.asset.layerInfo.Count; i++)
                 {
                     if (gs.asset.layerInfo.Count > gs.m_LayerActivationState.Count)
