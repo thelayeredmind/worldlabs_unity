@@ -347,4 +347,36 @@ inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout fl
     }
 }
 
+// Uniform block declared in the compute shader (both sort backends).
+// Listed here for documentation; the actual declarations live alongside
+// the other per-kernel uniforms in each .compute file.
+//
+// int   _EffectType;
+// float _EffectTime, _EffectIntensity;
+// float3 _EffectWindDir;
+// float _WaveAmplitude, _WaveFrequency, _WaveSpeed, _BlendScale;
+// float _LightWaveAmplitude, _LightWaveFrequency, _LightWaveSpeed;
+// float _GlitterDensity, _DissolveDriftSpeed, _BurnDuration;
+
+// Drop-in call site for CSCalcViewData. Modifies splat in-place; sets
+// effectColorOverride.a >= 0 when the effect has replaced the DC colour.
+// Usage:
+//   float4 effectColorOverride;
+//   GSPLAT_APPLY_EFFECT(splat, effectColorOverride);
+#define GSPLAT_APPLY_EFFECT(splat, colorOverride)                          \
+{                                                                           \
+    colorOverride = float4(0, 0, 0, -1);                                   \
+    if (_EffectType != 0)                                                   \
+    {                                                                       \
+        float4 _rgba = float4(splat.sh.col.rgb, splat.opacity);            \
+        ApplyGsplatEffect(splat.pos, splat.scale, _rgba,                   \
+            _EffectType, _EffectTime, _EffectIntensity, _EffectWindDir,    \
+            _WaveAmplitude, _WaveFrequency, _WaveSpeed, _BlendScale,       \
+            _LightWaveAmplitude, _LightWaveFrequency, _LightWaveSpeed,     \
+            _GlitterDensity, _DissolveDriftSpeed, _BurnDuration);          \
+        splat.opacity = _rgba.a;                                            \
+        colorOverride = float4(_rgba.rgb, 1.0f);                           \
+    }                                                                       \
+}
+
 #endif // WL_GSPLAT_EFFECTS_INCLUDED

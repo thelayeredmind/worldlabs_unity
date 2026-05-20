@@ -274,19 +274,8 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     SplatData splat = LoadSplatData(idx);
     SplatViewData view = (SplatViewData)0;
 
-    // Apply vertex-stage effects in object space before projection.
-    float4 effectColorOverride = float4(0, 0, 0, -1);
-    if (_EffectType != 0)
-    {
-        float4 splatRgba = float4(splat.sh.col.rgb, splat.opacity);
-        ApplyGsplatEffect(splat.pos, splat.scale, splatRgba,
-                          _EffectType, _EffectTime, _EffectIntensity, _EffectWindDir,
-                          _WaveAmplitude, _WaveFrequency, _WaveSpeed, _BlendScale,
-                          _LightWaveAmplitude, _LightWaveFrequency, _LightWaveSpeed,
-                          _GlitterDensity, _DissolveDriftSpeed, _BurnDuration);
-        splat.opacity = splatRgba.a;
-        effectColorOverride = float4(splatRgba.rgb, 1.0f);
-    }
+    float4 effectColorOverride;
+    GSPLAT_APPLY_EFFECT(splat, effectColorOverride);
 
     float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
     //float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
