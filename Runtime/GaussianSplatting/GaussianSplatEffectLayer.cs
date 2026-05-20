@@ -15,6 +15,7 @@ namespace GaussianSplatting.Runtime
     /// Effect parameters are injected into the CSCalcViewData compute dispatch each frame.
     /// Setting EffectType to None is zero-cost on the GPU (the shader early-exits).
     /// </summary>
+    [ExecuteAlways]
     [RequireComponent(typeof(GaussianSplatRenderer))]
     [AddComponentMenu("Gaussian Splatting/Gaussian Splat Effect Layer")]
     public class GaussianSplatEffectLayer : MonoBehaviour
@@ -105,17 +106,13 @@ namespace GaussianSplatting.Runtime
         static readonly int s_BurnDuration        = Shader.PropertyToID("_BurnDuration");
 
         float m_EffectTime;
-        float m_LastEditorTime;
 
         void OnEnable()
         {
             m_EffectTime = 0f;
 #if UNITY_EDITOR
             if (!Application.isPlaying)
-            {
-                m_LastEditorTime = (float)EditorApplication.timeSinceStartup;
                 EditorApplication.update += EditorTick;
-            }
 #endif
         }
 
@@ -128,16 +125,9 @@ namespace GaussianSplatting.Runtime
         }
 
 #if UNITY_EDITOR
-        void EditorTick()
-        {
-            if (timeOverride < 0f)
-            {
-                float now = (float)EditorApplication.timeSinceStartup;
-                m_EffectTime += now - m_LastEditorTime;
-                m_LastEditorTime = now;
-            }
-            EditorApplication.QueuePlayerLoopUpdate();
-        }
+        // Drives continuous editor repaint so time-based effects animate in edit mode.
+        // Update() is called by the queued player loop, which advances m_EffectTime.
+        void EditorTick() => EditorApplication.QueuePlayerLoopUpdate();
 #endif
 
         void Update()
