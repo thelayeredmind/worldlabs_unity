@@ -303,7 +303,8 @@ namespace GaussianSplatting.Runtime
         public ComputeShader m_CSSplatUtilities_deviceRadixSort;
         public ComputeShader m_CSSplatUtilities_fidelityFX;
         private ComputeShader m_CSSplatUtilities;
-        
+        GaussianSplatEffectLayer m_EffectLayer;
+
         // layer stuff
         public List<int2> m_LayerActivationState;
 
@@ -759,6 +760,7 @@ namespace GaussianSplatting.Runtime
 
         public void OnEnable()
         {
+            m_EffectLayer = GetComponent<GaussianSplatEffectLayer>();
             Initialize();
         }
         
@@ -996,6 +998,11 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.ContributionCullThreshold, m_ContributionCullThreshold);
+
+            if (m_EffectLayer != null && m_EffectLayer.enabled)
+                m_EffectLayer.SetEffectParams(cmb, m_CSSplatUtilities);
+            else
+                cmb.SetComputeIntParam(m_CSSplatUtilities, GaussianSplatEffectLayer.EffectTypeShaderProp, 0);
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);

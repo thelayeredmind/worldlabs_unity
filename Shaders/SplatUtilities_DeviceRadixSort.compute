@@ -39,6 +39,7 @@
 
 #include "Packages/com.worldlabs.gaussian-splatting/Shaders/DeviceRadixSort.hlsl"
 #include "Packages/com.worldlabs.gaussian-splatting/Shaders/GaussianSplatting.hlsl"
+#include "Packages/com.worldlabs.gaussian-splatting/Shaders/GsplatEffects.hlsl"
 #include "UnityCG.cginc"
 
 float4x4 _MatrixObjectToWorld;
@@ -90,6 +91,22 @@ void CSCalcDistances (uint3 id : SV_DispatchThreadID)
 }
 
 RWStructuredBuffer<SplatViewData> _SplatViewData;
+
+// GsplatEffects uniforms — set to zero/defaults when no effect layer is active
+int   _EffectType;
+float _EffectTime;
+float _EffectIntensity;
+float3 _EffectWindDir;
+float _WaveAmplitude;
+float _WaveFrequency;
+float _WaveSpeed;
+float _BlendScale;
+float _LightWaveAmplitude;
+float _LightWaveFrequency;
+float _LightWaveSpeed;
+float _GlitterDensity;
+float _DissolveDriftSpeed;
+float _BurnDuration;
 
 float _SplatScale;
 float _SplatOpacityScale;
@@ -256,7 +273,21 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
 
     SplatData splat = LoadSplatData(idx);
     SplatViewData view = (SplatViewData)0;
-    
+
+    // Apply vertex-stage effects in object space before projection.
+    float4 effectColorOverride = float4(0, 0, 0, -1);
+    if (_EffectType != 0)
+    {
+        float4 splatRgba = float4(splat.sh.col.rgb, splat.opacity);
+        ApplyGsplatEffect(splat.pos, splat.scale, splatRgba,
+                          _EffectType, _EffectTime, _EffectIntensity, _EffectWindDir,
+                          _WaveAmplitude, _WaveFrequency, _WaveSpeed, _BlendScale,
+                          _LightWaveAmplitude, _LightWaveFrequency, _LightWaveSpeed,
+                          _GlitterDensity, _DissolveDriftSpeed, _BurnDuration);
+        splat.opacity = splatRgba.a;
+        effectColorOverride = float4(splatRgba.rgb, 1.0f);
+    }
+
     float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
     //float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
     float4 centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
@@ -306,6 +337,8 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
 
         half4 col;
         col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
+        if (effectColorOverride.a >= 0)
+            col.rgb = (half3)effectColorOverride.rgb;
         col.a = min(splat.opacity * opacityScale, 65000);
         
         // Cull splats below threshold before rasterization (more efficient than fragment discard)
