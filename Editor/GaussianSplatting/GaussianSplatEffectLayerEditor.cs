@@ -16,17 +16,19 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_WindDir;
         SerializedProperty m_WaveAmplitude;
         SerializedProperty m_WaveFrequency;
-        SerializedProperty m_WaveSpeed;
         SerializedProperty m_BlendScale;
         SerializedProperty m_LightWaveAmplitude;
         SerializedProperty m_LightWaveFrequency;
         SerializedProperty m_LightWaveSpeed;
         SerializedProperty m_GlitterDensity;
-        SerializedProperty m_DissolveDriftSpeed;
         SerializedProperty m_BurnDuration;
+        SerializedProperty m_GlowColor;
 
         void OnEnable()
         {
+            // Notify the renderer that the layer list may have changed
+            var layer = (GaussianSplatEffectLayer)target;
+            layer.GetComponent<GaussianSplatting.Runtime.GaussianSplatRenderer>()?.RefreshEffectLayers();
             m_EffectType         = serializedObject.FindProperty("effectType");
             m_Intensity          = serializedObject.FindProperty("intensity");
             m_Loop               = serializedObject.FindProperty("loop");
@@ -34,14 +36,13 @@ namespace GaussianSplatting.Editor
             m_WindDir            = serializedObject.FindProperty("windDir");
             m_WaveAmplitude      = serializedObject.FindProperty("waveAmplitude");
             m_WaveFrequency      = serializedObject.FindProperty("waveFrequency");
-            m_WaveSpeed          = serializedObject.FindProperty("waveSpeed");
             m_BlendScale         = serializedObject.FindProperty("blendScale");
             m_LightWaveAmplitude = serializedObject.FindProperty("lightWaveAmplitude");
             m_LightWaveFrequency = serializedObject.FindProperty("lightWaveFrequency");
             m_LightWaveSpeed     = serializedObject.FindProperty("lightWaveSpeed");
             m_GlitterDensity     = serializedObject.FindProperty("glitterDensity");
-            m_DissolveDriftSpeed = serializedObject.FindProperty("dissolveDriftSpeed");
             m_BurnDuration       = serializedObject.FindProperty("burnDuration");
+            m_GlowColor          = serializedObject.FindProperty("glowColor");
         }
 
         public override void OnInspectorGUI()
@@ -80,18 +81,17 @@ namespace GaussianSplatting.Editor
             if (effect == GaussianSplatEffectLayer.EffectType.PerlinWave)
             {
                 EditorGUILayout.LabelField("Wave", EditorStyles.boldLabel);
-                EditorGUILayout.PropertyField(m_WaveAmplitude,  new GUIContent("Amplitude"));
-                EditorGUILayout.PropertyField(m_WaveFrequency,  new GUIContent("Frequency"));
-                EditorGUILayout.PropertyField(m_WaveSpeed,      new GUIContent("Speed"));
-                EditorGUILayout.PropertyField(m_BlendScale,     new GUIContent("Blend Scale"));
+                EditorGUILayout.PropertyField(m_WaveAmplitude, new GUIContent("Amplitude"));
+                EditorGUILayout.PropertyField(m_WaveFrequency, new GUIContent("Frequency"));
+                EditorGUILayout.PropertyField(m_BlendScale,    new GUIContent("Blend Scale"));
             }
 
-            if (NeedsLightWave(effect))
+            if (effect == GaussianSplatEffectLayer.EffectType.LightWave3D)
             {
                 EditorGUILayout.LabelField("Light Wave", EditorStyles.boldLabel);
-                EditorGUILayout.PropertyField(m_LightWaveAmplitude,  new GUIContent("Amplitude"));
-                EditorGUILayout.PropertyField(m_LightWaveFrequency,  new GUIContent("Frequency"));
-                EditorGUILayout.PropertyField(m_LightWaveSpeed,      new GUIContent("Speed"));
+                EditorGUILayout.PropertyField(m_LightWaveAmplitude, new GUIContent("Amplitude"));
+                EditorGUILayout.PropertyField(m_LightWaveFrequency, new GUIContent("Frequency"));
+                EditorGUILayout.PropertyField(m_LightWaveSpeed,     new GUIContent("Speed"));
             }
 
             if (NeedsGlitter(effect))
@@ -100,16 +100,11 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.PropertyField(m_GlitterDensity, new GUIContent("Density"));
             }
 
-            if (effect == GaussianSplatEffectLayer.EffectType.FlyingDissolve)
-            {
-                EditorGUILayout.LabelField("Dissolve", EditorStyles.boldLabel);
-                EditorGUILayout.PropertyField(m_DissolveDriftSpeed, new GUIContent("Drift Speed"));
-            }
-
             if (effect == GaussianSplatEffectLayer.EffectType.GlowDissolve)
             {
                 EditorGUILayout.LabelField("Burn", EditorStyles.boldLabel);
-                EditorGUILayout.PropertyField(m_BurnDuration, new GUIContent("Duration"));
+                EditorGUILayout.PropertyField(m_BurnDuration, new GUIContent("Burn fraction of cycle"));
+                EditorGUILayout.PropertyField(m_GlowColor,    new GUIContent("Color"));
             }
 
             serializedObject.ApplyModifiedProperties();
@@ -127,9 +122,13 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.PropertyField(m_Duration, new GUIContent("Duration (s)"));
             }
 
-            // Time scrub — read-only display with a manual reset
+            // Show both real elapsed time and the scaled shader time so it's easy to
+            // correlate what the shader receives with what you see on screen.
             using (new EditorGUI.DisabledScope(true))
-                EditorGUILayout.FloatField("Time", layer.effectTime);
+            {
+                EditorGUILayout.FloatField(new GUIContent("Time (s)", "Real elapsed seconds"), layer.effectTime);
+                EditorGUILayout.FloatField(new GUIContent("Shader t", "Value received by the effect shader"), layer.shaderTime);
+            }
 
             EditorGUILayout.BeginHorizontal();
 
@@ -195,16 +194,14 @@ namespace GaussianSplatting.Editor
             }
         }
 
+        // Effects that have an optional light wave accent (separate from LightWave3D which is the primary)
         static bool NeedsLightWave(GaussianSplatEffectLayer.EffectType e)
         {
             switch (e)
             {
-                case GaussianSplatEffectLayer.EffectType.LightWave3D:
                 case GaussianSplatEffectLayer.EffectType.PerlinWave:
                 case GaussianSplatEffectLayer.EffectType.Twister:
                 case GaussianSplatEffectLayer.EffectType.Rain:
-                case GaussianSplatEffectLayer.EffectType.GlitterGalaxy:
-                case GaussianSplatEffectLayer.EffectType.FlyingDissolve:
                     return true;
                 default:
                     return false;

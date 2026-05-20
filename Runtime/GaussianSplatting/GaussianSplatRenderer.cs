@@ -303,7 +303,13 @@ namespace GaussianSplatting.Runtime
         public ComputeShader m_CSSplatUtilities_deviceRadixSort;
         public ComputeShader m_CSSplatUtilities_fidelityFX;
         private ComputeShader m_CSSplatUtilities;
-        GaussianSplatEffectLayer m_EffectLayer;
+
+        // Effect layer stacking (Option A)
+        GaussianSplatEffectLayer[] m_EffectLayers = Array.Empty<GaussianSplatEffectLayer>();
+        ComputeBuffer m_EffectLayerBuffer;
+        GaussianSplatEffectLayer.ShaderParams[] m_EffectLayerData = Array.Empty<GaussianSplatEffectLayer.ShaderParams>();
+        static readonly int s_EffectLayers     = GaussianSplatEffectLayer.s_EffectLayers;
+        static readonly int s_EffectLayerCount = GaussianSplatEffectLayer.s_EffectLayerCount;
 
         // layer stuff
         public List<int2> m_LayerActivationState;
@@ -760,8 +766,13 @@ namespace GaussianSplatting.Runtime
 
         public void OnEnable()
         {
-            m_EffectLayer = GetComponent<GaussianSplatEffectLayer>();
+            RefreshEffectLayers();
             Initialize();
+        }
+
+        public void RefreshEffectLayers()
+        {
+            m_EffectLayers = GetComponents<GaussianSplatEffectLayer>();
         }
         
         public void EnsureMaterials()
@@ -945,6 +956,8 @@ namespace GaussianSplatting.Runtime
 
         public void OnDisable()
         {
+            m_EffectLayerBuffer?.Release();
+            m_EffectLayerBuffer = null;
             DeInitialize();
         }
 
@@ -999,13 +1012,41 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.ContributionCullThreshold, m_ContributionCullThreshold);
 
-            if (m_EffectLayer != null && m_EffectLayer.enabled)
-                m_EffectLayer.SetEffectParams(cmb, m_CSSplatUtilities);
-            else
-                cmb.SetComputeIntParam(m_CSSplatUtilities, GaussianSplatEffectLayer.EffectTypeShaderProp, 0);
+            UpdateEffectLayerBuffer(cmb);
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
+        }
+
+        void UpdateEffectLayerBuffer(CommandBuffer cmb)
+        {
+            // Collect active enabled layers
+            int count = 0;
+            foreach (var l in m_EffectLayers)
+                if (l != null && l.enabled && l.effectType != GaussianSplatEffectLayer.EffectType.None)
+                    count++;
+
+            // Grow the CPU array if needed (never shrink to avoid GC churn)
+            if (m_EffectLayerData.Length < Mathf.Max(count, 1))
+                m_EffectLayerData = new GaussianSplatEffectLayer.ShaderParams[Mathf.Max(count, 1)];
+
+            int i = 0;
+            foreach (var l in m_EffectLayers)
+                if (l != null && l.enabled && l.effectType != GaussianSplatEffectLayer.EffectType.None)
+                    m_EffectLayerData[i++] = l.FillShaderParams();
+
+            // Resize GPU buffer only when count changes
+            int bufSize = Mathf.Max(count, 1);
+            if (m_EffectLayerBuffer == null || m_EffectLayerBuffer.count != bufSize)
+            {
+                m_EffectLayerBuffer?.Release();
+                m_EffectLayerBuffer = new ComputeBuffer(bufSize,
+                    System.Runtime.InteropServices.Marshal.SizeOf<GaussianSplatEffectLayer.ShaderParams>());
+            }
+
+            m_EffectLayerBuffer.SetData(m_EffectLayerData, 0, 0, bufSize);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, s_EffectLayers, m_EffectLayerBuffer);
+            cmb.SetComputeIntParam   (m_CSSplatUtilities, s_EffectLayerCount, count);
         }
 
         internal void SortPoints(CommandBuffer cmd, Camera cam, Matrix4x4 matrix)

@@ -49,10 +49,10 @@ namespace GaussianSplatting.Runtime
         public float intensity = 1f;
 
         [Header("Playback")]
-        [Tooltip("Loop the effect. When off, time stops at duration and the effect freezes at its end state.")]
+        [Tooltip("Loop the effect. When off, playback stops at the end of duration.")]
         public bool loop = true;
 
-        [Tooltip("Duration in seconds before the effect loops or stops. Only used for one-shot animated effects.")]
+        [Tooltip("How many real seconds one full effect cycle takes. Longer = slower effect.")]
         [Min(0.1f)]
         public float duration = 5f;
 
@@ -65,31 +65,53 @@ namespace GaussianSplatting.Runtime
         [Range(0f, 10f)]
         public float waveFrequency = 1f;
 
-        [Range(0f, 5f)]
-        public float waveSpeed = 1f;
-
         [Range(0f, 2f)]
         public float blendScale = 1f;
 
-        [Header("Light Wave")]
+        [Header("Light Wave (LightWave3D only)")]
         [Range(0f, 0.5f)]
-        public float lightWaveAmplitude = 0.1f;
+        public float lightWaveAmplitude = 0.3f;
 
         [Range(0f, 5f)]
-        public float lightWaveFrequency = 0.5f;
+        public float lightWaveFrequency = 1f;
 
         [Range(0f, 2f)]
-        public float lightWaveSpeed = 0.5f;
+        public float lightWaveSpeed = 1f;
 
-        [Header("Glitter / Dissolve")]
+        [Header("Glitter")]
         [Range(0f, 1f)]
         public float glitterDensity = 0.3f;
 
-        [Range(0f, 2f)]
-        public float dissolveDriftSpeed = 0.3f;
+        [Header("Glow Dissolve")]
+        [Tooltip("Fraction [0–1] of the cycle duration that one burn takes.")]
+        [Range(0.05f, 1f)]
+        public float burnDuration = 0.3f;
 
-        [Range(0.1f, 5f)]
-        public float burnDuration = 2f;
+        [Tooltip("Emissive colour of the burn.")]
+        public Color glowColor = new Color(2f, 1f, 0.2f);
+
+        // Per-effect shader time at end of one full cycle, tuned to each effect's authored range.
+        // Continuous oscillation effects use a smaller window (they repeat naturally).
+        // One-shot arc effects use the range where their smoothstep/exp functions complete.
+        static readonly float[] k_EffectTimeScale = {
+            0f,  // None
+            8f,  // DeepMeditation   — fractal oscillation
+            8f,  // LightWave3D      — continuous sin
+            8f,  // Flare            — sin oscillation
+            8f,  // Disintegrate     — sin oscillation
+            16f, // Wind             — needs ~2.5 full sin cycles to feel like wind
+            8f,  // PerlinWave       — continuous noise travel
+            20f, // MagicReveal      — smoothstep arc, needs 0→20
+            8f,  // Spread           — t*t*0.4 arc
+            6f,  // Unroll           — exp(-t) decay arc
+            15f, // Twister          — t*t*0.1 buildup arc
+            12f, // Rain             — drop arc, slightly less than Twister
+            8f,  // Glitter          — continuous twinkling
+            8f,  // GlitterGalaxy    — continuous
+            8f,  // FlyingDissolve   — staggered drift
+            8f,  // GlowDissolve     — burn fraction of t
+            8f,  // RadialExpansion  — intensity-driven
+        };
 
         // -----------------------------------------------------------------
         // Playback state — not serialized, resets on domain reload (intentional)
@@ -98,25 +120,50 @@ namespace GaussianSplatting.Runtime
 
         // Read-only from outside; controlled via Play/Pause/Restart
         public float effectTime => m_EffectTime;
+        public float shaderTime
+        {
+            get
+            {
+                int idx = (int)effectType;
+                float scale = (idx >= 0 && idx < k_EffectTimeScale.Length) ? k_EffectTimeScale[idx] : 8f;
+                return (m_EffectTime / duration) * scale;
+            }
+        }
 
         // -----------------------------------------------------------------
-        // Internal
+        // GPU struct — must match SplatEffectParams in GsplatEffects.hlsl (5x float4 = 80 bytes)
+        // Layout: [effectType(int), effectTime, intensity, waveAmplitude]
+        //         [waveFrequency, blendScale, lightWaveAmplitude, lightWaveFrequency]
+        //         [lightWaveSpeed, glitterDensity, burnDuration, _pad0]
+        //         [windDir.xyz, _pad1]
+        //         [glowColor.xyz, _pad2]
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct ShaderParams
+        {
+            public int   effectType;
+            public float effectTime;
+            public float intensity;
+            public float waveAmplitude;
 
-        internal static readonly int EffectTypeShaderProp = Shader.PropertyToID("_EffectType");
-        static readonly int s_EffectType          = EffectTypeShaderProp;
-        static readonly int s_EffectTime          = Shader.PropertyToID("_EffectTime");
-        static readonly int s_EffectIntensity     = Shader.PropertyToID("_EffectIntensity");
-        static readonly int s_EffectWindDir       = Shader.PropertyToID("_EffectWindDir");
-        static readonly int s_WaveAmplitude       = Shader.PropertyToID("_WaveAmplitude");
-        static readonly int s_WaveFrequency       = Shader.PropertyToID("_WaveFrequency");
-        static readonly int s_WaveSpeed           = Shader.PropertyToID("_WaveSpeed");
-        static readonly int s_BlendScale          = Shader.PropertyToID("_BlendScale");
-        static readonly int s_LightWaveAmplitude  = Shader.PropertyToID("_LightWaveAmplitude");
-        static readonly int s_LightWaveFrequency  = Shader.PropertyToID("_LightWaveFrequency");
-        static readonly int s_LightWaveSpeed      = Shader.PropertyToID("_LightWaveSpeed");
-        static readonly int s_GlitterDensity      = Shader.PropertyToID("_GlitterDensity");
-        static readonly int s_DissolveDriftSpeed  = Shader.PropertyToID("_DissolveDriftSpeed");
-        static readonly int s_BurnDuration        = Shader.PropertyToID("_BurnDuration");
+            public float waveFrequency;
+            public float blendScale;
+            public float lightWaveAmplitude;
+            public float lightWaveFrequency;
+
+            public float lightWaveSpeed;
+            public float glitterDensity;
+            public float burnDuration;
+            public float _pad0;
+
+            public Vector3 windDir;
+            public float   _pad1;
+
+            public Vector3 glowColor;
+            public float   _pad2;
+        }
+
+        internal static readonly int s_EffectLayers     = Shader.PropertyToID("_EffectLayers");
+        internal static readonly int s_EffectLayerCount = Shader.PropertyToID("_EffectLayerCount");
 
         float m_EffectTime;
 
@@ -174,36 +221,25 @@ namespace GaussianSplatting.Runtime
             }
         }
 
-        /// <summary>
-        /// Called by GaussianSplatRenderer.CalcViewData to inject effect uniforms into the
-        /// compute command buffer before the CSCalcViewData dispatch.
-        /// </summary>
-        internal void SetEffectParams(CommandBuffer cmb, ComputeShader cs)
+        // Fill a ShaderParams struct for upload into the compute buffer.
+        internal ShaderParams FillShaderParams()
         {
-            float t = m_EffectTime;
-
-            cmb.SetComputeIntParam   (cs, s_EffectType,         (int)effectType);
-            cmb.SetComputeFloatParam (cs, s_EffectTime,         t);
-            cmb.SetComputeFloatParam (cs, s_EffectIntensity,    intensity);
-            cmb.SetComputeVectorParam(cs, s_EffectWindDir,      windDir);
-            cmb.SetComputeFloatParam (cs, s_WaveAmplitude,      waveAmplitude);
-            cmb.SetComputeFloatParam (cs, s_WaveFrequency,      waveFrequency);
-            cmb.SetComputeFloatParam (cs, s_WaveSpeed,          waveSpeed);
-            cmb.SetComputeFloatParam (cs, s_BlendScale,         blendScale);
-            cmb.SetComputeFloatParam (cs, s_LightWaveAmplitude, lightWaveAmplitude);
-            cmb.SetComputeFloatParam (cs, s_LightWaveFrequency, lightWaveFrequency);
-            cmb.SetComputeFloatParam (cs, s_LightWaveSpeed,     lightWaveSpeed);
-            cmb.SetComputeFloatParam (cs, s_GlitterDensity,     glitterDensity);
-            cmb.SetComputeFloatParam (cs, s_DissolveDriftSpeed, dissolveDriftSpeed);
-            cmb.SetComputeFloatParam (cs, s_BurnDuration,       burnDuration);
-        }
-
-        /// <summary>
-        /// Clears effect type to 0 on the compute shader so a disabled layer has no GPU cost.
-        /// </summary>
-        internal void ClearEffectParams(CommandBuffer cmb, ComputeShader cs)
-        {
-            cmb.SetComputeIntParam(cs, s_EffectType, 0);
+            return new ShaderParams
+            {
+                effectType        = (int)effectType,
+                effectTime        = shaderTime,
+                intensity         = intensity,
+                waveAmplitude     = waveAmplitude,
+                waveFrequency     = waveFrequency,
+                blendScale        = blendScale,
+                lightWaveAmplitude = lightWaveAmplitude,
+                lightWaveFrequency = lightWaveFrequency,
+                lightWaveSpeed    = lightWaveSpeed,
+                glitterDensity    = glitterDensity,
+                burnDuration      = burnDuration,
+                windDir           = windDir,
+                glowColor         = new Vector3(glowColor.r, glowColor.g, glowColor.b),
+            };
         }
     }
 }

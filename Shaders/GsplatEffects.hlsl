@@ -152,11 +152,15 @@ inline float4 flare_effect(float3 pos, float t) {
 // Applies one of 16 vertex-stage effects in object/local space.
 // center and scales are in object space. rgba is linear HDR color + opacity.
 // effectType 0 = no-op (zero-cost branch).
+// t is pre-scaled by the C# layer so duration directly controls the playback rate.
+// lightWaveIntensity: blend weight of the light wave accent layer (0 = off)
+// glowColor        : emissive colour for GlowDissolve burn
 inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout float4 rgba,
                               int effectType, float t, float intensity, float3 windDir,
-                              float waveAmplitude, float waveFrequency, float waveSpeed, float blendScale,
+                              float waveAmplitude, float waveFrequency, float blendScale,
                               float lightWaveAmplitude, float lightWaveFrequency, float lightWaveSpeed,
-                              float glitterDensity, float dissolveDriftSpeed, float burnDuration)
+                              float glitterDensity, float burnDuration,
+                              float3 glowColor)
 {
     if (effectType == 0)
         return;
@@ -166,12 +170,13 @@ inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout fl
     float4 splatColor  = rgba;
 
     if (effectType == 1) {
+        // t drives the fractal animation period — duration controls speed
         float4 e = fractal2_effect(localPos, splatScales, splatColor, t, intensity);
         rgba = lerp(splatColor, e, intensity);
-        float b = sin(t * 1.5f);
-        center.y += b * 0.02f * intensity;
+        center.y += sin(t * 1.5f) * 0.02f * intensity;
     }
     else if (effectType == 2) {
+        // LightWave3D: intensity is the primary blend weight
         float4 e = sin3D_light_effect(localPos, t, lightWaveAmplitude, lightWaveFrequency, lightWaveSpeed);
         rgba = lerp(splatColor, float4(splatColor.rgb * e.rgb, splatColor.a), intensity);
     }
@@ -187,13 +192,14 @@ inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout fl
         scales = lerp(float3(0.01f,0.01f,0.01f), scales, e.w);
     }
     else if (effectType == 5) {
-        center = windMotion(localPos, t, intensity, windDir);
+        // t drives the sway oscillation — duration controls the sway period
+        float3 dir = normalize(windDir);
+        float sway = sin(t + dot(localPos, dir) * 0.5f) * 0.1f;
+        center = localPos + dir * intensity * 0.5f + dir * sway * intensity;
         rgba.rgb = lerp(splatColor.rgb, splatColor.rgb + float3(0.02f,0.05f,0.08f) * intensity, 0.3f);
     }
     else if (effectType == 6) {
-        center = localPos + waveAmplitude * noise2_vec(localPos * waveFrequency + t * waveSpeed);
-        float4 e = sin3D_light_effect(localPos, t, lightWaveAmplitude, lightWaveFrequency, lightWaveSpeed);
-        rgba = lerp(splatColor, float4(splatColor.rgb * e.rgb, splatColor.a), intensity);
+        center = localPos + waveAmplitude * noise2_vec(localPos * waveFrequency + t);
         scales = (blendScale < 0.1f) ? float3(0.001f, 0.001f, 0.001f) : splatScales * blendScale;
     }
     else if (effectType == 7) {
@@ -220,31 +226,37 @@ inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout fl
         center = localPos;
     }
     else if (effectType == 9) {
+        // Unroll: starts wound up, unrolls over duration. t=0 → fully wound, t=6 → fully open.
+        // Offset center into visible range from t=0 by biasing the exp decay.
         float ang = (localPos.y * 50.0f - 20.0f) * exp(-t);
         localPos.xz = mul(localPos.xz, rot2(ang));
-        center = localPos * (1.0f - exp(-t) * 2.0f);
-        float ss = smoothstep(0.3f, 0.7f, t + localPos.y - 2.0f);
+        // Use (1 - exp(-t)) so at t=0 center=0 (splats at origin, visible) and expands outward
+        center = localPos * (1.0f - exp(-t));
+        float ss = smoothstep(0.0f, 1.0f, t * 0.3f + localPos.y * 0.5f);
         scales = lerp(float3(0.002f,0.002f,0.002f), splatScales, ss);
-        rgba = splatColor * ((t * 0.5f + localPos.y - 0.5f) >= 0.0f ? 1.0f : 0.0f);
+        rgba = splatColor;
     }
     else if (effectType == 10) {
-        float4 e = sin3D_light_effect(localPos, t, lightWaveAmplitude, lightWaveFrequency, lightWaveSpeed);
-        rgba = lerp(splatColor, float4(splatColor.rgb * e.rgb, splatColor.a), intensity);
+        // Twister: t drives the time arc, intensity scales the spatial displacement
         float4 tw = twister_effect(localPos, splatScales, t);
-        center = tw.xyz;
+        // lerp between original pos and twisted pos by intensity
+        center = lerp(localPos, tw.xyz, intensity);
         scales = lerp(float3(0.002f,0.002f,0.002f), splatScales, pow(tw.w, 12.0f));
-        float spin  = -t * 0.3f * (1.0f - tw.w);
-        float4 spinQ = float4(0.0f, sin(spin * 0.5f), 0.0f, cos(spin * 0.5f));
-        // quaternion output unused in this pipeline; rotation baked into center offset
     }
     else if (effectType == 11) {
-        float4 e = sin3D_light_effect(localPos, t, lightWaveAmplitude, lightWaveFrequency, lightWaveSpeed);
-        rgba = lerp(splatColor, float4(splatColor.rgb * e.rgb, splatColor.a), intensity);
-        float4 rn = rain_effect(localPos, splatScales, t);
-        center = rn.xyz;
-        scales = lerp(float3(0.005f,0.005f,0.005f), splatScales, pow(rn.w, 30.0f));
-        rgba.rgb = lerp(rgba.rgb, rgba.rgb * 0.85f + float3(0.05f,0.07f,0.10f), 0.25f * rn.w);
-        rgba.a  *= saturate(rn.w);
+        // Rain: offset t so splats start falling from t=0 rather than needing a warmup.
+        // Add a bias to s so most splats are already triggering at t=0.
+        float3 hv = hash2_3(localPos);
+        float tBiased = t + 4.0f; // shift into the active range of smoothstep
+        float s = pow(smoothstep(0.0f, 5.0f, tBiased * tBiased * 0.1f - length(localPos.xz) * 2.0f + 1.0f), 0.5f + hv.x);
+        float y = localPos.y;
+        localPos.y = min(-10.0f + s * 15.0f, localPos.y);
+        localPos.xz = lerp(localPos.xz * 0.3f, localPos.xz, s);
+        float vis = smoothstep(-10.0f, y, localPos.y);
+        center = localPos;
+        scales = lerp(float3(0.005f,0.005f,0.005f), splatScales, pow(vis, 30.0f));
+        rgba.rgb = lerp(splatColor.rgb, splatColor.rgb * 0.85f + float3(0.05f,0.07f,0.10f), 0.25f * vis);
+        rgba.a  *= saturate(vis);
     }
     else if (effectType == 12) {
         float3 hv = hash3(localPos);
@@ -276,44 +288,53 @@ inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout fl
             float lifetime   = 2.0f + hv.z * 3.0f;
             float age        = fmod(t + hv.y * lifetime, lifetime);
             float alpha      = (1.0f - age / lifetime) * lerp(1.0f, 0.6f, isLarge);
-            float4 e = sin3D_light_effect(localPos, t, lightWaveAmplitude, lightWaveFrequency, lightWaveSpeed);
-            rgba = lerp(splatColor, float4(splatColor.rgb * e.rgb, splatColor.a), intensity);
-            rgba.rgb = lerp(rgba.rgb, starColor * (1.0f + isLarge * 2.0f), glow);
+            // No light wave on GlitterGalaxy — colour is star-driven
+            rgba.rgb = lerp(splatColor.rgb, starColor * (1.0f + isLarge * 2.0f), glow);
             rgba.a   = alpha;
         }
     }
     else if (effectType == 14) {
-        float4 e = sin3D_light_effect(localPos, t, lightWaveAmplitude, lightWaveFrequency, lightWaveSpeed);
-        rgba = lerp(splatColor, float4(splatColor.rgb * e.rgb, splatColor.a), intensity);
-        float3 hv        = hash3(localPos);
-        float  startTime = hv.x * 100.0f;
-        float  shouldOsc = (t >= startTime) ? 1.0f : 0.0f;
-        float3 moveDir   = normalize(float3((hv.x - 0.5f) * 0.6f, -1.0f, (hv.z - 0.5f) * 0.6f));
-        float  randSpeed = frac(sin(dot(center, float3(12.0f,78.0f,45.0f))) * 43758.0f);
-        float  moveAmt   = t * dissolveDriftSpeed * randSpeed * shouldOsc;
-        center += moveDir * moveAmt;
-        float shrink = smoothstep(0.0f, 1.0f, saturate(moveAmt * 0.8f));
-        scales = lerp(splatScales, float3(0.003f,0.003f,0.003f), shrink);
-        if (hv.z < glitterDensity) {
+        // FlyingDissolve: stagger departure across first 60% of cycle (original used 0–100 range).
+        // FlyingDissolve: t drives all timing. dissolveDriftSpeed removed — duration is the sole control.
+        // Particles stagger departure in first 60% of t, drift ~1 unit over full duration.
+        float3 hv14      = hash3(localPos);
+        float  startT    = hv14.x * t * 0.6f;
+        float  active    = (t >= startT) ? 1.0f : 0.0f;
+        float3 moveDir   = normalize(float3((hv14.x - 0.5f) * 0.6f, -1.0f, (hv14.z - 0.5f) * 0.6f));
+        float  randVar   = frac(sin(dot(center, float3(12.0f,78.0f,45.0f))) * 43758.0f);
+        float  localT14  = max(0.0f, t - startT);
+        // Scale move so a particle drifts ~1 unit over the full t range regardless of duration
+        float  tMax      = 8.0f; // matches k_EffectTimeScale for FlyingDissolve
+        float  moveAmt   = (localT14 / tMax) * (0.5f + randVar * 0.5f);
+        center += moveDir * moveAmt * active;
+        float shrink = smoothstep(0.0f, 1.0f, moveAmt);
+        scales = lerp(splatScales, float3(0.003f,0.003f,0.003f), shrink * active);
+        if (hv14.z < glitterDensity) {
             float glow = 0.0f;
-            glow += sin(t * (5.0f + hv.x * 10.0f) + hv.x * 6.28318f) * 0.5f + 0.5f;
-            glow += sin(t * (3.0f + hv.y *  8.0f) + hv.y * 6.28318f) * 0.5f + 0.5f;
-            glow += sin(t * (2.0f + hv.z *  6.0f) + hv.z * 6.28318f) * 0.5f + 0.5f;
+            glow += sin(t * (5.0f + hv14.x * 10.0f) + hv14.x * 6.28318f) * 0.5f + 0.5f;
+            glow += sin(t * (3.0f + hv14.y *  8.0f) + hv14.y * 6.28318f) * 0.5f + 0.5f;
+            glow += sin(t * (2.0f + hv14.z *  6.0f) + hv14.z * 6.28318f) * 0.5f + 0.5f;
             glow = pow(glow / 3.0f, 2.0f);
-            rgba.rgb = lerp(rgba.rgb, float3(1.5f,1.8f,2.0f) * glow, shrink);
-            rgba.a  *= lerp(1.0f, 1.0f - smoothstep(0.7f, 1.0f, shrink), shouldOsc);
+            rgba.rgb = lerp(rgba.rgb, float3(1.5f,1.8f,2.0f) * glow, shrink * active);
+            rgba.a  *= lerp(1.0f, 1.0f - smoothstep(0.7f, 1.0f, shrink), active);
         } else {
-            rgba.a *= lerp(1.0f, 1.0f - saturate(moveAmt * 0.5f), shouldOsc);
+            rgba.a *= lerp(1.0f, 1.0f - moveAmt, active);
         }
     }
     else if (effectType == 15) {
-        float3 hv         = hash3(localPos);
-        float  localT     = t - hv.y * 0.8f;
-        float  shouldBurn = (localT >= 0.0f) ? 1.0f : 0.0f;
-        float  burnProg   = saturate(localT / burnDuration) * shouldBurn;
+        // GlowDissolve: burnDuration is a fraction [0,1] of the total cycle.
+        // Splat stagger offset also bounded to burnDuration fraction so no idle gap.
+        float3 hv15         = hash3(localPos);
+        float  burnFrac     = saturate(burnDuration); // [0,1] fraction of full t range
+        float  tMax15       = 8.0f;                   // k_EffectTimeScale for GlowDissolve
+        float  burnT        = burnFrac * tMax15;       // absolute shader time for one burn
+        float  startOffset  = hv15.y * burnT;
+        float  localT15     = t - startOffset;
+        float  shouldBurn   = (localT15 >= 0.0f) ? 1.0f : 0.0f;
+        float  burnProg     = saturate(localT15 / max(burnT, 0.001f)) * shouldBurn;
         if (shouldBurn > 0.5f) {
-            float  glowCurve = pow(sin(burnProg * 3.14159f), 4.0f);
-            rgba.rgb += float3(2.0f,1.0f,0.2f) * intensity * 2.0f * glowCurve;
+            float glowCurve = pow(sin(burnProg * 3.14159f), 4.0f);
+            rgba.rgb += glowColor * intensity * 2.0f * glowCurve;
             float shrink = smoothstep(0.5f, 1.0f, burnProg);
             scales = lerp(splatScales, float3(0.005f,0.005f,0.005f), shrink);
             rgba.a *= lerp(1.0f, 0.0f, smoothstep(0.6f, 1.0f, burnProg));
@@ -347,36 +368,57 @@ inline void ApplyGsplatEffect(inout float3 center, inout float3 scales, inout fl
     }
 }
 
-// Uniform block declared in the compute shader (both sort backends).
-// Listed here for documentation; the actual declarations live alongside
-// the other per-kernel uniforms in each .compute file.
-//
-// int   _EffectType;
-// float _EffectTime, _EffectIntensity;
-// float3 _EffectWindDir;
-// float _WaveAmplitude, _WaveFrequency, _WaveSpeed, _BlendScale;
-// float _LightWaveAmplitude, _LightWaveFrequency, _LightWaveSpeed;
-// float _GlitterDensity, _DissolveDriftSpeed, _BurnDuration;
+// Per-layer effect parameter struct. Must match GaussianSplatEffectLayer.ShaderParams (C#).
+// Laid out as 5x float4 = 80 bytes, 16-byte aligned.
+struct SplatEffectParams
+{
+    // float4 #0
+    int   effectType;
+    float effectTime;
+    float intensity;
+    float waveAmplitude;
+    // float4 #1
+    float waveFrequency;
+    float blendScale;
+    float lightWaveAmplitude;
+    float lightWaveFrequency;
+    // float4 #2
+    float lightWaveSpeed;
+    float glitterDensity;
+    float burnDuration;
+    float _pad0;
+    // float4 #3
+    float3 windDir;
+    float  _pad1;
+    // float4 #4
+    float3 glowColor;
+    float  _pad2;
+};
 
-// Drop-in call site for CSCalcViewData. Modifies splat in-place; sets
-// effectColorOverride.a >= 0 when the effect has replaced the DC colour.
-// Usage:
-//   float4 effectColorOverride;
-//   GSPLAT_APPLY_EFFECT(splat, effectColorOverride);
-#define GSPLAT_APPLY_EFFECT(splat, colorOverride)                          \
-{                                                                           \
-    colorOverride = float4(0, 0, 0, -1);                                   \
-    if (_EffectType != 0)                                                   \
-    {                                                                       \
-        float4 _rgba = float4(splat.sh.col.rgb, splat.opacity);            \
-        ApplyGsplatEffect(splat.pos, splat.scale, _rgba,                   \
-            _EffectType, _EffectTime, _EffectIntensity, _EffectWindDir,    \
-            _WaveAmplitude, _WaveFrequency, _WaveSpeed, _BlendScale,       \
-            _LightWaveAmplitude, _LightWaveFrequency, _LightWaveSpeed,     \
-            _GlitterDensity, _DissolveDriftSpeed, _BurnDuration);          \
-        splat.opacity = _rgba.a;                                            \
-        colorOverride = float4(_rgba.rgb, 1.0f);                           \
-    }                                                                       \
+// Each compute shader declares alongside its other per-kernel uniforms:
+//   StructuredBuffer<SplatEffectParams> _EffectLayers;
+//   uint _EffectLayerCount;
+
+// Apply all active effect layers to a splat in sequence (Option A stacking).
+// colorOverride.a >= 0 after the call means at least one layer replaced the DC colour.
+#define GSPLAT_APPLY_EFFECTS(splat, colorOverride)                                         \
+{                                                                                           \
+    colorOverride = float4(0, 0, 0, -1);                                                   \
+    for (uint _li = 0; _li < _EffectLayerCount; ++_li)                                    \
+    {                                                                                       \
+        SplatEffectParams _p = _EffectLayers[_li];                                         \
+        if (_p.effectType == 0) continue;                                                  \
+        float4 _rgba = (colorOverride.a >= 0)                                              \
+            ? float4(colorOverride.rgb, splat.opacity)                                     \
+            : float4(splat.sh.col.rgb, splat.opacity);                                     \
+        ApplyGsplatEffect(splat.pos, splat.scale, _rgba,                                   \
+            _p.effectType, _p.effectTime, _p.intensity, _p.windDir,                        \
+            _p.waveAmplitude, _p.waveFrequency, _p.blendScale,                             \
+            _p.lightWaveAmplitude, _p.lightWaveFrequency, _p.lightWaveSpeed,               \
+            _p.glitterDensity, _p.burnDuration, _p.glowColor);                             \
+        splat.opacity = _rgba.a;                                                            \
+        colorOverride = float4(_rgba.rgb, 1.0f);                                           \
+    }                                                                                       \
 }
 
 #endif // WL_GSPLAT_EFFECTS_INCLUDED

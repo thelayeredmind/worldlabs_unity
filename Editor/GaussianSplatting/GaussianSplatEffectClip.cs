@@ -37,15 +37,15 @@ namespace GaussianSplatting.Timeline
             double clipDuration = playable.GetDuration();
             if (clipDuration <= 0) return;
 
-            // Map clip local time proportionally to the layer's configured duration.
-            // Stretching the clip in Timeline stretches the effect arc accordingly.
+            // Drive m_EffectTime in [0, duration] — SetEffectParams scales to shader space.
+            // Clip length in Timeline controls playback speed: longer clip = slower effect.
             float effectTime = (float)(playable.GetTime() / clipDuration) * m_Layer.duration;
             m_Layer.SetTime(effectTime);
         }
 
         public override void OnBehaviourPause(Playable playable, FrameData info)
         {
-            // Freeze at end-of-clip so one-shot effects don't snap back on clip exit.
+            // Freeze at end-of-clip so one-shot effects hold their final state.
             if (m_Layer != null)
                 m_Layer.SetTime(m_Layer.duration);
         }
