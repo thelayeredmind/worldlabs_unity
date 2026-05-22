@@ -4,6 +4,8 @@
 // One thread per matched pair. B-side indices are sorted ascending for sequential reads on Adreno.
 
 #pragma kernel MorphSplats
+#pragma kernel CopyUnmatchedA
+#pragma kernel CopyUnmatchedB
 
 #include "GaussianSplatting.hlsl"
 
@@ -38,7 +40,13 @@ float _T;
 uint _MorphCount;
 uint _SplatFormatA;  // pos=bits[7:0] scale=bits[15:8]
 uint _SplatFormatB;
-uint _OutWidth;      // output color texture width
+uint _OutWidth;      // output color texture width (sized to totalMorphCount)
+uint _OutWidthB;     // B source texture width (may differ from _OutWidth)
+
+// Unmatched-copy params (CopyUnmatchedA / CopyUnmatchedB)
+StructuredBuffer<int> _UnmatchedIndices;
+uint _UnmatchedCount;
+uint _OutOffset;     // first output index for this unmatched block
 float3 _OutBoundsMin;
 float3 _OutBoundsMax;
 
@@ -209,9 +217,9 @@ void MorphSplats(uint3 id : SV_DispatchThreadID)
     _OutOther.Store(i * outOtherStride + 4, EncodeNorm6(scaleOut));
 
     // ── Color (Norm8x4 — lerp in byte space) ─────────────────────────────────
-    uint2 coordA = SplatToTexCoord(idxA, _OutWidth);
-    uint2 coordB = SplatToTexCoord(idxB, _OutWidth);
-    uint2 coordOut = SplatToTexCoord(i, _OutWidth);
+    uint2 coordA   = SplatToTexCoord(idxA, _OutWidth);   // A tex sized same as output
+    uint2 coordB   = SplatToTexCoord(idxB, _OutWidthB);  // B tex may have a different width
+    uint2 coordOut = SplatToTexCoord(i,    _OutWidth);
     float4 colA  = _ColorA.Load(int3(coordA, 0));
     float4 colB  = _ColorB.Load(int3(coordB, 0));
     _OutColor[coordOut] = lerp(colA, colB, t);
@@ -219,4 +227,78 @@ void MorphSplats(uint3 id : SV_DispatchThreadID)
     // ── SH — passthrough A (clustered SH lerp deferred to morph/runtime) ─────
     // TODO: proper SH lerp once formats are normalised across both assets.
     // For now the output SH buffer is a copy of A (set at OnEnable via CopyBuffer).
+}
+
+// ── CopyUnmatchedA ────────────────────────────────────────────────────────────
+// Copies unmatched Left splats to output at [_OutOffset + i], scaling opacity by (1 - _T).
+// At t=0 these splats are fully visible; at t=1 they are gone.
+[numthreads(64, 1, 1)]
+void CopyUnmatchedA(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _UnmatchedCount) return;
+
+    uint srcIdx = (uint)_UnmatchedIndices[i];
+    uint dstIdx = _OutOffset + i;
+
+    uint posFmtA   = _SplatFormatA & 0xFF;
+    uint scaleFmtA = (_SplatFormatA >> 8) & 0xFF;
+
+    // ── Position — dechunk and re-normalise into output bounds ───────────────
+    float3 normPos  = DecodeVec(_PosA, srcIdx * PosStride(posFmtA), posFmtA);
+    float3 worldPos = Dechunk(normPos, _ChunksA, _ChunkCountA, srcIdx);
+    float3 range    = max(_OutBoundsMax - _OutBoundsMin, 1e-6);
+    float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
+    _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
+
+    // ── Other (rotation + scale) — pass through unchanged ───────────────────
+    uint outOtherStride = OtherStride(scaleFmtA);
+    uint rotEnc   = _OtherA.Load(srcIdx * OtherStride(scaleFmtA));
+    float3 scale  = DecodeVec(_OtherA, srcIdx * OtherStride(scaleFmtA) + 4, scaleFmtA);
+    _OutOther.Store(dstIdx * outOtherStride,     rotEnc);
+    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(scale));
+
+    // ── Color — scale opacity channel by (1 - t) ────────────────────────────
+    uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidth);
+    uint2 coordDst = SplatToTexCoord(dstIdx, _OutWidth);
+    float4 col = _ColorA.Load(int3(coordSrc, 0));
+    col.a *= (1.0 - _T);
+    _OutColor[coordDst] = col;
+}
+
+// ── CopyUnmatchedB ────────────────────────────────────────────────────────────
+// Copies unmatched Right splats to output at [_OutOffset + i], scaling opacity by _T.
+// At t=0 these splats are invisible; at t=1 they are fully visible.
+[numthreads(64, 1, 1)]
+void CopyUnmatchedB(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _UnmatchedCount) return;
+
+    uint srcIdx = (uint)_UnmatchedIndices[i];
+    uint dstIdx = _OutOffset + i;
+
+    uint posFmtB   = _SplatFormatB & 0xFF;
+    uint scaleFmtB = (_SplatFormatB >> 8) & 0xFF;
+
+    // ── Position ─────────────────────────────────────────────────────────────
+    float3 normPos  = DecodeVec(_PosB, srcIdx * PosStride(posFmtB), posFmtB);
+    float3 worldPos = Dechunk(normPos, _ChunksB, _ChunkCountB, srcIdx);
+    float3 range    = max(_OutBoundsMax - _OutBoundsMin, 1e-6);
+    float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
+    _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
+
+    // ── Other ────────────────────────────────────────────────────────────────
+    uint outOtherStride = OtherStride(scaleFmtB);
+    uint rotEnc  = _OtherB.Load(srcIdx * OtherStride(scaleFmtB));
+    float3 scale = DecodeVec(_OtherB, srcIdx * OtherStride(scaleFmtB) + 4, scaleFmtB);
+    _OutOther.Store(dstIdx * outOtherStride,     rotEnc);
+    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(scale));
+
+    // ── Color — scale opacity channel by t ───────────────────────────────────
+    uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidthB);
+    uint2 coordDst = SplatToTexCoord(dstIdx, _OutWidth);
+    float4 col = _ColorB.Load(int3(coordSrc, 0));
+    col.a *= _T;
+    _OutColor[coordDst] = col;
 }

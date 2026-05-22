@@ -3,6 +3,7 @@
 using System;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace GaussianSplatting.Runtime
 {
@@ -79,10 +80,18 @@ namespace GaussianSplatting.Runtime
         RenderTexture  m_TexOutColor;
 
         int  m_MatchedCount;
+        int  m_TotalMorphCount; // matchedCount + unmatchedLeft + unmatchedRight
+        int  m_UnmatchedLeftCount;
+        int  m_UnmatchedRightCount;
+        GraphicsBuffer m_BufUnmatchedLeft;  // int[] — indices into AssetLeft
+        GraphicsBuffer m_BufUnmatchedRight; // int[] — indices into AssetRight
         uint m_SplatFormat;
         uint m_SplatFormatB;
         uint m_OutTexWidth;
+        uint m_OutTexWidthB;   // B asset tex width — may differ when splat counts differ
         int  m_KernelMorphSplats;
+        int  m_KernelCopyUnmatchedA;
+        int  m_KernelCopyUnmatchedB;
 
         // Combined world-space bounds covering both assets — output chunk
         GraphicsBuffer m_BufOutChunk;
@@ -102,10 +111,16 @@ namespace GaussianSplatting.Runtime
 
             m_Renderer      = GetComponent<GaussianSplatRenderer>();
             m_CapturedAsset = m_Renderer.m_Asset;
+            Debug.Log($"[Morpher] OnEnable — left={m_AssetLeft.name}({m_AssetLeft.splatCount}) right={m_AssetRight.name}({m_AssetRight.splatCount})");
 
             UploadSourceBuffers();
+            Debug.Log($"[Morpher] UploadSourceBuffers — posA={m_BufPosA?.count} posB={m_BufPosB?.count} chunksA={m_BufChunksA?.count} chunksB={m_BufChunksB?.count}");
+
             BuildIndexBuffer();
+            Debug.Log($"[Morpher] BuildIndexBuffer — matched={m_MatchedCount} unmatchedL={m_UnmatchedLeftCount} unmatchedR={m_UnmatchedRightCount} total={m_TotalMorphCount}");
+
             AllocateOutputBuffers();
+            Debug.Log($"[Morpher] AllocateOutputBuffers — outPos={m_BufOutPos?.count} outOther={m_BufOutOther?.count} outTex={m_TexOutColor?.width}x{m_TexOutColor?.height} outWidth={m_OutTexWidth}");
 
 #if UNITY_EDITOR
             if (m_MorphShader == null)
@@ -113,10 +128,18 @@ namespace GaussianSplatting.Runtime
                     "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatMorph.compute");
 #endif
             if (m_MorphShader != null)
-                m_KernelMorphSplats = m_MorphShader.FindKernel("MorphSplats");
+            {
+                m_KernelMorphSplats    = m_MorphShader.FindKernel("MorphSplats");
+                m_KernelCopyUnmatchedA = m_MorphShader.HasKernel("CopyUnmatchedA") ? m_MorphShader.FindKernel("CopyUnmatchedA") : -1;
+                m_KernelCopyUnmatchedB = m_MorphShader.HasKernel("CopyUnmatchedB") ? m_MorphShader.FindKernel("CopyUnmatchedB") : -1;
+            }
+            Debug.Log($"[Morpher] Kernels — morphSplats={m_KernelMorphSplats} copyUnmatchedA={m_KernelCopyUnmatchedA} copyUnmatchedB={m_KernelCopyUnmatchedB}");
 
             ComputeOutputBoundsAndChunk();
+            Debug.Log($"[Morpher] OutputBounds — min={m_WorldBoundsMin} max={m_WorldBoundsMax} chunkBuf={m_BufOutChunk?.count}");
+
             BindBuffersForT();
+            Debug.Log($"[Morpher] OnEnable done — t={m_T:F2} renderer.splatCount={m_Renderer?.splatCount} renderer.hasExt={m_Renderer?.HasExternalBuffers}");
         }
 
         void OnDisable()
@@ -219,11 +242,13 @@ namespace GaussianSplatting.Runtime
             else
             {
                 // Blend — dispatch kernel, bind output buffers with combined chunk
+                if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] blend t={m_T:F2} matched={m_MatchedCount} total={m_TotalMorphCount} outPos={m_BufOutPos != null} outChunk={m_BufOutChunk != null} shader={m_MorphShader != null}");
                 DispatchMorph();
+                if (Time.frameCount % 60 == 0) RequestPosReadback();
                 m_Renderer.SetExternalBuffers(
                     m_BufOutPos, m_BufOutOther, m_BufOutSH, m_TexOutColor,
                     m_BufOutChunk, m_BufOutChunk != null,
-                    m_MatchedCount, m_SplatFormat);
+                    m_TotalMorphCount, m_SplatFormat);
             }
         }
 
@@ -249,8 +274,12 @@ namespace GaussianSplatting.Runtime
             if (m_BufChunksA != null) m_MorphShader.SetBuffer(k, "_ChunksA", m_BufChunksA);
             if (m_BufChunksB != null) m_MorphShader.SetBuffer(k, "_ChunksB", m_BufChunksB);
 
-            m_MorphShader.SetInt(  "_ChunkCountA",   m_BufChunksA != null ? m_AssetLeft.splatCount  / GaussianSplatAsset.kChunkSize : 0);
-            m_MorphShader.SetInt(  "_ChunkCountB",   m_BufChunksB != null ? m_AssetRight.splatCount / GaussianSplatAsset.kChunkSize : 0);
+            // Ceiling division — integer truncation drops the last partial chunk, leaving tail splats undechunked.
+            int chunkCountA = m_BufChunksA != null ? (m_AssetLeft.splatCount  + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize : 0;
+            int chunkCountB = m_BufChunksB != null ? (m_AssetRight.splatCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize : 0;
+
+            m_MorphShader.SetInt(  "_ChunkCountA",   chunkCountA);
+            m_MorphShader.SetInt(  "_ChunkCountB",   chunkCountB);
             m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
             m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
             m_MorphShader.SetFloat("_T",             m_T);
@@ -258,9 +287,65 @@ namespace GaussianSplatting.Runtime
             m_MorphShader.SetInt(  "_SplatFormatA",  (int)m_SplatFormat);
             m_MorphShader.SetInt(  "_SplatFormatB",  (int)m_SplatFormatB);
             m_MorphShader.SetInt(  "_OutWidth",      (int)m_OutTexWidth);
+            m_MorphShader.SetInt(  "_OutWidthB",     (int)m_OutTexWidthB);
 
+            // Pass 1: matched pairs
             int groups = (m_MatchedCount + 63) / 64;
+            if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] Dispatch MorphSplats — groups={groups} chunkA={chunkCountA} chunkB={chunkCountB} outWidth={m_OutTexWidth} outWidthB={m_OutTexWidthB}");
             m_MorphShader.Dispatch(k, groups, 1, 1);
+
+            // Pass 2: unmatched A — copy with opacity × (1−t), output at [matchedCount..]
+            if (m_UnmatchedLeftCount > 0 && m_BufUnmatchedLeft != null && m_KernelCopyUnmatchedA >= 0)
+            {
+                int kA = m_KernelCopyUnmatchedA;
+                m_MorphShader.SetBuffer(kA, "_UnmatchedIndices", m_BufUnmatchedLeft);
+                m_MorphShader.SetBuffer(kA, "_PosA",    m_BufPosA);
+                m_MorphShader.SetBuffer(kA, "_OtherA",  m_BufOtherA);
+                m_MorphShader.SetBuffer(kA, "_SHA",     m_BufSHA);
+                m_MorphShader.SetTexture(kA,"_ColorA",  m_TexColorA);
+                m_MorphShader.SetBuffer(kA, "_OutPos",   m_BufOutPos);
+                m_MorphShader.SetBuffer(kA, "_OutOther", m_BufOutOther);
+                m_MorphShader.SetBuffer(kA, "_OutSH",    m_BufOutSH);
+                m_MorphShader.SetTexture(kA,"_OutColor", m_TexOutColor);
+                if (m_BufChunksA != null) m_MorphShader.SetBuffer(kA, "_ChunksA", m_BufChunksA);
+                m_MorphShader.SetInt("_ChunkCountA",  chunkCountA);
+                m_MorphShader.SetInt("_UnmatchedCount",  m_UnmatchedLeftCount);
+                m_MorphShader.SetInt("_OutOffset",       m_MatchedCount);
+                m_MorphShader.SetFloat("_T",             m_T);
+                m_MorphShader.SetInt("_SplatFormatA",    (int)m_SplatFormat);
+                m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
+                m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
+                m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                int groupsA = (m_UnmatchedLeftCount + 63) / 64;
+                m_MorphShader.Dispatch(kA, groupsA, 1, 1);
+            }
+
+            // Pass 3: unmatched B — copy with opacity × t, output at [matchedCount + unmatchedLeft..]
+            if (m_UnmatchedRightCount > 0 && m_BufUnmatchedRight != null && m_KernelCopyUnmatchedB >= 0)
+            {
+                int kB = m_KernelCopyUnmatchedB;
+                m_MorphShader.SetBuffer(kB, "_UnmatchedIndices", m_BufUnmatchedRight);
+                m_MorphShader.SetBuffer(kB, "_PosB",    m_BufPosB);
+                m_MorphShader.SetBuffer(kB, "_OtherB",  m_BufOtherB);
+                m_MorphShader.SetBuffer(kB, "_SHB",     m_BufSHB);
+                m_MorphShader.SetTexture(kB,"_ColorB",  m_TexColorB);
+                m_MorphShader.SetBuffer(kB, "_OutPos",   m_BufOutPos);
+                m_MorphShader.SetBuffer(kB, "_OutOther", m_BufOutOther);
+                m_MorphShader.SetBuffer(kB, "_OutSH",    m_BufOutSH);
+                m_MorphShader.SetTexture(kB,"_OutColor", m_TexOutColor);
+                if (m_BufChunksB != null) m_MorphShader.SetBuffer(kB, "_ChunksB", m_BufChunksB);
+                m_MorphShader.SetInt("_ChunkCountB",     chunkCountB);
+                m_MorphShader.SetInt("_UnmatchedCount",  m_UnmatchedRightCount);
+                m_MorphShader.SetInt("_OutOffset",       m_MatchedCount + m_UnmatchedLeftCount);
+                m_MorphShader.SetFloat("_T",             m_T);
+                m_MorphShader.SetInt("_SplatFormatB",    (int)m_SplatFormatB);
+                m_MorphShader.SetInt("_OutWidthB",       (int)m_OutTexWidthB);
+                m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
+                m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
+                m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                int groupsB = (m_UnmatchedRightCount + 63) / 64;
+                m_MorphShader.Dispatch(kB, groupsB, 1, 1);
+            }
         }
 
         void ComputeOutputBoundsAndChunk()
@@ -273,7 +358,7 @@ namespace GaussianSplatting.Runtime
 
             // Write one ChunkInfo (64 bytes) per kChunkSize splats, all with the same global bounds.
             // This way every chunkIdx maps to a valid entry — the renderer can dechunk all splats.
-            int chunkCount = (m_AssetLeft.splatCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
+            int chunkCount = (m_TotalMorphCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
             var allChunkBytes = new byte[chunkCount * 64];
             for (int c = 0; c < chunkCount; c++)
             {
@@ -334,27 +419,70 @@ namespace GaussianSplatting.Runtime
             m_BufIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_MatchedCount, 8)
                 { name = "MorphIndices" };
             m_BufIndices.SetData(sorted);
+
+            // Unmatched index buffers
+            var uL = m_MorphMap.unmatchedLeft;
+            var uR = m_MorphMap.unmatchedRight;
+            m_UnmatchedLeftCount  = uL?.Length ?? 0;
+            m_UnmatchedRightCount = uR?.Length ?? 0;
+            m_TotalMorphCount     = m_MatchedCount + m_UnmatchedLeftCount + m_UnmatchedRightCount;
+
+            if (m_UnmatchedLeftCount > 0)
+            {
+                m_BufUnmatchedLeft = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedLeftCount, 4)
+                    { name = "MorphUnmatchedLeft" };
+                m_BufUnmatchedLeft.SetData(uL);
+            }
+            if (m_UnmatchedRightCount > 0)
+            {
+                m_BufUnmatchedRight = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedRightCount, 4)
+                    { name = "MorphUnmatchedRight" };
+                m_BufUnmatchedRight.SetData(uR);
+            }
         }
 
         void AllocateOutputBuffers()
         {
-            var layer    = m_AssetLeft.LayerData[0];
-            int posLen   = (layer.m_PosData.GetData<byte>().Length   + 3) & ~3;
-            int otherLen = (layer.m_OtherData.GetData<byte>().Length  + 3) & ~3;
-            int shLen    = layer.m_SHData != null
-                ? (layer.m_SHData.GetData<byte>().Length + 3) & ~3 : 4;
+            // Output buffers are sized to the full morph splat count, not just matched pairs.
+            // Layout: [0..matchedCount-1] matched | [matchedCount..+uL-1] unmatched A | [..+uR-1] unmatched B
+            var layerA = m_AssetLeft.LayerData[0];
+            int nA = m_AssetLeft.splatCount;
+            // Per-splat strides derived from actual buffer byte lengths
+            int posStride   = layerA.m_PosData.GetData<byte>().Length   / nA;
+            int otherStride = layerA.m_OtherData.GetData<byte>().Length  / nA;
+            int shStride    = layerA.m_SHData != null ? layerA.m_SHData.GetData<byte>().Length / nA : 0;
+
+            int posLen   = (m_TotalMorphCount * posStride   + 3) & ~3;
+            int otherLen = (m_TotalMorphCount * otherStride + 3) & ~3;
+            int shLen    = shStride > 0 ? (m_TotalMorphCount * shStride + 3) & ~3 : 4;
 
             var outTarget = GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopyDestination;
             m_BufOutPos   = new GraphicsBuffer(outTarget, posLen   / 4, 4) { name = "MorphOutPos" };
             m_BufOutOther = new GraphicsBuffer(outTarget, otherLen / 4, 4) { name = "MorphOutOther" };
             m_BufOutSH    = new GraphicsBuffer(outTarget, shLen    / 4, 4) { name = "MorphOutSH" };
 
-            var (tw, th) = GaussianSplatAsset.CalcTextureSize(m_AssetLeft.splatCount);
-            m_OutTexWidth = (uint)tw;
-            var fmt       = GaussianSplatAsset.ColorFormatToGraphics(m_AssetLeft.colorFormat);
-            m_TexOutColor = new RenderTexture(tw, th, fmt, UnityEngine.Experimental.Rendering.GraphicsFormat.None)
+            var (tw,  th)  = GaussianSplatAsset.CalcTextureSize(m_TotalMorphCount);
+            var (twB, _)   = GaussianSplatAsset.CalcTextureSize(m_AssetRight.splatCount);
+            m_OutTexWidth  = (uint)tw;
+            m_OutTexWidthB = (uint)twB;
+            var fmt        = GaussianSplatAsset.ColorFormatToGraphics(m_AssetLeft.colorFormat);
+            m_TexOutColor  = new RenderTexture(tw, th, fmt, UnityEngine.Experimental.Rendering.GraphicsFormat.None)
                 { name = "MorphOutColor", enableRandomWrite = true };
             m_TexOutColor.Create();
+        }
+
+        void RequestPosReadback()
+        {
+            AsyncGPUReadback.Request(m_BufOutPos, 48, 0, req =>
+            {
+                if (req.hasError) { Debug.Log("[Morpher] readback error"); return; }
+                var data = req.GetData<uint>();
+                uint enc = data[0];
+                float x = (enc & 2047u) / 2047f;
+                float y = ((enc >> 11) & 1023u) / 1023f;
+                float z = ((enc >> 21) & 2047u) / 2047f;
+                Debug.Log($"[Morpher] outPos[0] enc={enc} norm=({x:F3},{y:F3},{z:F3}) | outPos[1] enc={data[1]} | outPos[2] enc={data[2]}");
+            });
         }
 
         void ReleaseGpuResources()
@@ -362,8 +490,9 @@ namespace GaussianSplatting.Runtime
             m_BufPosA?.Dispose();   m_BufPosB?.Dispose();
             m_BufOtherA?.Dispose(); m_BufOtherB?.Dispose();
             m_BufSHA?.Dispose();    m_BufSHB?.Dispose();
-            m_BufChunksB?.Dispose(); // A was handed to the renderer, it owns disposal
+            m_BufChunksB?.Dispose();
             m_BufIndices?.Dispose();
+            m_BufUnmatchedLeft?.Dispose();  m_BufUnmatchedRight?.Dispose();
             m_BufOutPos?.Dispose(); m_BufOutOther?.Dispose(); m_BufOutSH?.Dispose(); m_BufOutChunk?.Dispose();
 
             if (m_TexColorA != null) UnityEngine.Object.DestroyImmediate(m_TexColorA);
@@ -371,7 +500,8 @@ namespace GaussianSplatting.Runtime
             if (m_TexOutColor != null) m_TexOutColor.Release();
 
             m_BufPosA = m_BufPosB = m_BufOtherA = m_BufOtherB = m_BufSHA = m_BufSHB = null;
-            m_BufIndices = m_BufOutPos = m_BufOutOther = m_BufOutSH = null;
+            m_BufIndices = m_BufUnmatchedLeft = m_BufUnmatchedRight = null;
+            m_BufOutPos = m_BufOutOther = m_BufOutSH = null;
             m_TexColorA = m_TexColorB = null;
             m_TexOutColor = null;
         }
