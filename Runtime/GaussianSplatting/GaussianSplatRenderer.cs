@@ -523,28 +523,36 @@ namespace GaussianSplatting.Runtime
                 m_RuntimeData = null;
                 m_SplatCount  = splatCount;
 
-                DisposeBuffer(ref m_GpuView);
-                m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize) { name = "GaussianView" };
-                if (m_CSSplatUtilities != null && m_Sorter != null)
+                // Only reallocate view + sort buffers when count changes — caller may call every frame.
+                if (m_GpuView == null || m_GpuView.count != m_SplatCount)
                 {
-                    DisposeBuffer(ref m_GpuSortDistances);
-                    DisposeBuffer(ref m_GpuSortKeys);
-                    InitSortBuffers(m_SplatCount);
+                    DisposeBuffer(ref m_GpuView);
+                    m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize) { name = "GaussianView" };
+                    if (m_CSSplatUtilities != null && m_Sorter != null)
+                    {
+                        DisposeBuffer(ref m_GpuSortDistances);
+                        DisposeBuffer(ref m_GpuSortKeys);
+                        InitSortBuffers(m_SplatCount);
+                    }
                 }
 
                 // Use caller-provided chunk buffer — never dispose it, the caller owns it.
-                if (!m_GpuChunksExternallyOwned) DisposeBuffer(ref m_GpuChunks);
-                m_GpuChunksExternallyOwned = chunks != null;
-                if (chunks != null)
+                // Only swap when the buffer reference actually changes.
+                if (m_GpuChunks != chunks)
                 {
-                    m_GpuChunks      = chunks;
-                    m_GpuChunksValid = chunksValid;
-                }
-                else
-                {
-                    m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw,
-                        UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>() / 4, 4) { name = "GaussianChunkData_Morph" };
-                    m_GpuChunksValid = false;
+                    if (!m_GpuChunksExternallyOwned) DisposeBuffer(ref m_GpuChunks);
+                    m_GpuChunksExternallyOwned = chunks != null;
+                    if (chunks != null)
+                    {
+                        m_GpuChunks      = chunks;
+                        m_GpuChunksValid = chunksValid;
+                    }
+                    else
+                    {
+                        m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw,
+                            UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>() / 4, 4) { name = "GaussianChunkData_Morph" };
+                        m_GpuChunksValid = false;
+                    }
                 }
 
                 // Dummy layer buffer
