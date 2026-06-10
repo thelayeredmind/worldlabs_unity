@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using GaussianSplatting.Runtime;
 using Unity.Collections;
@@ -43,6 +44,14 @@ namespace GaussianSplatting.Editor
         // ── Public entry point ────────────────────────────────────────────────
 
         /// <summary>
+        /// Maximum number of greedy nearest-neighbor rounds. Each round re-matches only the
+        /// splats left unmatched by the previous round (restricted to the remaining R candidates),
+        /// which resolves the "many L splats claim the same R splat" collisions that a single
+        /// greedy pass leaves unmatched. Stops early once a round produces no new matches.
+        /// </summary>
+        const int kMaxMatchRounds = 8;
+
+        /// <summary>
         /// Build from pre-decoded arrays. Decoding must happen on the main thread before calling this.
         /// This overload is safe to call from a background thread.
         /// </summary>
@@ -55,22 +64,62 @@ namespace GaussianSplatting.Editor
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
-            progress?.Report(0.1f);
+            progress?.Report(0.05f);
 
             float posWeight = 1f - colorWeight;
-            int[] bestMatch = dispatcher.FindBestMatches(posL, colL, posR, colR, posWeight, colorWeight);
-            ct.ThrowIfCancellationRequested();
-            progress?.Report(0.85f);
 
-            ResolveOneToOne(bestMatch, posL.Length, posR.Length,
-                out var pairs, out var uL, out var uR);
+            var pairs = new List<int2>();
+            int[] remainingL = Enumerable.Range(0, posL.Length).ToArray();
+            int[] remainingR = Enumerable.Range(0, posR.Length).ToArray();
+
+            for (int round = 0; round < kMaxMatchRounds; round++)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (remainingL.Length == 0 || remainingR.Length == 0)
+                    break;
+
+                var subPosL = new Vector3[remainingL.Length];
+                var subColL = new Vector4[remainingL.Length];
+                for (int i = 0; i < remainingL.Length; i++)
+                {
+                    subPosL[i] = posL[remainingL[i]];
+                    subColL[i] = colL[remainingL[i]];
+                }
+
+                var subPosR = new Vector3[remainingR.Length];
+                var subColR = new Vector4[remainingR.Length];
+                for (int j = 0; j < remainingR.Length; j++)
+                {
+                    subPosR[j] = posR[remainingR[j]];
+                    subColR[j] = colR[remainingR[j]];
+                }
+
+                int[] bestMatch = dispatcher.FindBestMatches(subPosL, subColL, subPosR, subColR, posWeight, colorWeight);
+                ct.ThrowIfCancellationRequested();
+
+                ResolveOneToOne(bestMatch, subPosL.Length, subPosR.Length,
+                    out var roundPairs, out var roundUL, out var roundUR);
+
+                if (roundPairs.Length == 0)
+                    break; // no progress — remaining splats have no viable partner
+
+                // Map subset-local indices back to original L/R indices
+                foreach (var p in roundPairs)
+                    pairs.Add(new int2(remainingL[p.x], remainingR[p.y]));
+
+                remainingL = roundUL.Select(i => remainingL[i]).ToArray();
+                remainingR = roundUR.Select(j => remainingR[j]).ToArray();
+
+                progress?.Report(0.05f + 0.8f * (round + 1) / kMaxMatchRounds);
+            }
+
             progress?.Report(1f);
 
             return new Result
             {
-                matchedPairs   = pairs,
-                unmatchedLeft  = uL,
-                unmatchedRight = uR,
+                matchedPairs   = pairs.ToArray(),
+                unmatchedLeft  = remainingL,
+                unmatchedRight = remainingR,
             };
         }
 
