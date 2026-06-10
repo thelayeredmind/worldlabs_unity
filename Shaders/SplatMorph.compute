@@ -164,8 +164,12 @@ uint OtherStride(uint fmt)
 
 uint2 SplatToTexCoord(uint idx, uint texWidth)
 {
-    // Simple row-major — matches CreateColorTextureForMorph which uses CalcTextureSize
-    return uint2(idx % texWidth, idx / texWidth);
+    // Color textures use the renderer's Morton 16x16 swizzle (see SplatIndexToPixelIndex
+    // in GaussianSplatting.hlsl) — must match or reads/writes land on the wrong texel.
+    uint2 xy = DecodeMorton2D_16x16(idx);
+    uint width = texWidth / 16;
+    uint blockIdx = idx >> 8;
+    return uint2((blockIdx % width) * 16 + xy.x, (blockIdx / width) * 16 + xy.y);
 }
 
 // ── Main kernel ───────────────────────────────────────────────────────────────

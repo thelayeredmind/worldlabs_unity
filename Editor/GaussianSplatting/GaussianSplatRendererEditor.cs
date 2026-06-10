@@ -188,18 +188,16 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.PropertyField(m_PropContributionCullThreshold);
             EditorGUILayout.PropertyField(m_PropAlphaDiscardThreshold);
 
-            if (gs.HasValidAsset)
+            if (gs.HasValidAsset && gs.asset != null)
             {
                 EditorGUILayout.Space();
                 GUILayout.Label("Layer Options", EditorStyles.boldLabel);
-                
+
                 // Initialize layer activation state list if null
                 if (gs.m_LayerActivationState == null)
                 {
                     gs.m_LayerActivationState = new List<int2>();
                 }
-
-                if (gs.asset == null) return;
 
                 for (int i = 0; i < gs.asset.layerInfo.Count; i++)
                 {
@@ -274,6 +272,8 @@ namespace GaussianSplatting.Editor
         void EditCameras(GaussianSplatRenderer gs)
         {
             var asset = gs.asset;
+            if (asset == null)
+                return;
             var cameras = asset.cameras;
             if (cameras != null && cameras.Length != 0)
             {
@@ -376,6 +376,11 @@ namespace GaussianSplatting.Editor
 
         void EditGUI(GaussianSplatRenderer gs)
         {
+            // Editing tools operate on gs.asset directly — not applicable when a morpher
+            // is driving external buffers (gs.asset is null in that case).
+            if (gs.asset == null)
+                return;
+
             ++s_EditStatsUpdateCounter;
 
             DrawSeparator();
