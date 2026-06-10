@@ -56,6 +56,14 @@ namespace GaussianSplatting.Runtime
         {
             (m_AssetLeft, m_AssetRight) = (m_AssetRight, m_AssetLeft);
             m_T = 1f - m_T;
+
+            // GPU buffers, index/unmatched buffers, formats and bounds were derived from the
+            // pre-swap Left/Right assignment — tear down and rebuild from the new assignment.
+            if (m_Renderer != null)
+            {
+                ReleaseGpuResources();
+                Setup();
+            }
         }
 
         // ── GPU resources ─────────────────────────────────────────────────────
@@ -111,7 +119,19 @@ namespace GaussianSplatting.Runtime
 
             m_Renderer      = GetComponent<GaussianSplatRenderer>();
             m_CapturedAsset = m_Renderer.m_Asset;
-            Debug.Log($"[Morpher] OnEnable — left={m_AssetLeft.name}({m_AssetLeft.splatCount}) right={m_AssetRight.name}({m_AssetRight.splatCount})");
+
+            Setup();
+        }
+
+        /// <summary>
+        /// Uploads both assets, builds the correspondence/unmatched index buffers, allocates
+        /// output buffers and binds for the current <see cref="m_T"/>. Called from OnEnable
+        /// and again from SwapAssets after ReleaseGpuResources, since every GPU resource here
+        /// is derived from the current Left/Right assignment.
+        /// </summary>
+        void Setup()
+        {
+            Debug.Log($"[Morpher] Setup — left={m_AssetLeft.name}({m_AssetLeft.splatCount}) right={m_AssetRight.name}({m_AssetRight.splatCount})");
 
             UploadSourceBuffers();
             Debug.Log($"[Morpher] UploadSourceBuffers — posA={m_BufPosA?.count} posB={m_BufPosB?.count} chunksA={m_BufChunksA?.count} chunksB={m_BufChunksB?.count}");
@@ -139,7 +159,7 @@ namespace GaussianSplatting.Runtime
             Debug.Log($"[Morpher] OutputBounds — min={m_WorldBoundsMin} max={m_WorldBoundsMax} chunkBuf={m_BufOutChunk?.count}");
 
             BindBuffersForT();
-            Debug.Log($"[Morpher] OnEnable done — t={m_T:F2} renderer.splatCount={m_Renderer?.splatCount} renderer.hasExt={m_Renderer?.HasExternalBuffers}");
+            Debug.Log($"[Morpher] Setup done — t={m_T:F2} renderer.splatCount={m_Renderer?.splatCount} renderer.hasExt={m_Renderer?.HasExternalBuffers}");
         }
 
         void OnDisable()
@@ -407,22 +427,46 @@ namespace GaussianSplatting.Runtime
             Graphics.CopyTexture(m_TexColorA, m_TexOutColor);
         }
 
+        /// <summary>
+        /// True if the current Left/Right assignment is swapped relative to the orientation
+        /// the MorphMap was built with (matchedPairs.x/unmatchedLeft index AssetRight, and
+        /// matchedPairs.y/unmatchedRight index AssetLeft).
+        /// </summary>
+        bool MapIsSwapped()
+        {
+            if (m_AssetLeft.splatCount == m_MorphMap.splatCountLeft &&
+                m_AssetRight.splatCount == m_MorphMap.splatCountRight)
+                return false;
+            if (m_AssetLeft.splatCount == m_MorphMap.splatCountRight &&
+                m_AssetRight.splatCount == m_MorphMap.splatCountLeft)
+                return true;
+
+            Debug.LogWarning($"GaussianSplatMorpher: MorphMap splat counts ({m_MorphMap.splatCountLeft}/{m_MorphMap.splatCountRight}) " +
+                $"don't match AssetLeft/AssetRight ({m_AssetLeft.splatCount}/{m_AssetRight.splatCount}).", this);
+            return false;
+        }
+
         void BuildIndexBuffer()
         {
+            bool swapped = MapIsSwapped();
             var pairs = m_MorphMap.matchedPairs;
             m_MatchedCount = pairs.Length;
 
-            // Sort a local copy by dst index (y) ascending — sequential B reads on Adreno
-            var sorted = (int2[])pairs.Clone();
+            // Sort a local copy by dst index (y) ascending — sequential B reads on Adreno.
+            // If the map was built with the opposite Left/Right orientation, flip x/y so
+            // x always indexes the current AssetLeft and y the current AssetRight.
+            var sorted = new int2[pairs.Length];
+            for (int i = 0; i < pairs.Length; i++)
+                sorted[i] = swapped ? new int2(pairs[i].y, pairs[i].x) : pairs[i];
             Array.Sort(sorted, (a, b) => a.y.CompareTo(b.y));
 
             m_BufIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_MatchedCount, 8)
                 { name = "MorphIndices" };
             m_BufIndices.SetData(sorted);
 
-            // Unmatched index buffers
-            var uL = m_MorphMap.unmatchedLeft;
-            var uR = m_MorphMap.unmatchedRight;
+            // Unmatched index buffers — flip left/right if the map orientation is swapped
+            var uL = swapped ? m_MorphMap.unmatchedRight : m_MorphMap.unmatchedLeft;
+            var uR = swapped ? m_MorphMap.unmatchedLeft  : m_MorphMap.unmatchedRight;
             m_UnmatchedLeftCount  = uL?.Length ?? 0;
             m_UnmatchedRightCount = uR?.Length ?? 0;
             m_TotalMorphCount     = m_MatchedCount + m_UnmatchedLeftCount + m_UnmatchedRightCount;
