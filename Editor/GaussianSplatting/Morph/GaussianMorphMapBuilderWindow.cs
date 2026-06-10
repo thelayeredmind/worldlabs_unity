@@ -37,7 +37,8 @@ namespace GaussianSplatting.Editor
         Vector3[]            m_GpuPosL, m_GpuPosR;
         Vector4[]            m_GpuColL, m_GpuColR;
         float                m_GpuPosWeight, m_GpuColWeight;
-        int[]                m_GpuResult;
+        int[]                m_GpuResultIndex;
+        float[]              m_GpuResultDist;
         Exception            m_GpuException;
         ManualResetEventSlim m_GpuDone;
 
@@ -62,7 +63,7 @@ namespace GaussianSplatting.Editor
             if (m_GpuDispatchPending)
             {
                 m_GpuDispatchPending = false;
-                try   { m_GpuResult = DispatchCorrespondenceShader(m_GpuPosL, m_GpuColL, m_GpuPosR, m_GpuColR, m_GpuPosWeight, m_GpuColWeight); }
+                try   { DispatchCorrespondenceShader(m_GpuPosL, m_GpuColL, m_GpuPosR, m_GpuColR, m_GpuPosWeight, m_GpuColWeight, out m_GpuResultIndex, out m_GpuResultDist); }
                 catch (Exception e) { m_GpuException = e; }
                 finally { m_GpuDone.Set(); }
             }
@@ -183,8 +184,8 @@ namespace GaussianSplatting.Editor
             readonly GaussianMorphMapBuilderWindow m_Window;
             public MainThreadDispatcher(GaussianMorphMapBuilderWindow w) => m_Window = w;
 
-            public int[] FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
-                float posWeight, float colWeight)
+            public void FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist)
             {
                 var w = m_Window;
                 w.m_GpuPosL      = posL;
@@ -202,14 +203,16 @@ namespace GaussianSplatting.Editor
                 if (w.m_GpuException != null)
                     throw new Exception("GPU dispatch failed", w.m_GpuException);
 
-                return w.m_GpuResult;
+                bestIndex = w.m_GpuResultIndex;
+                bestDist  = w.m_GpuResultDist;
             }
         }
 
-        static int[] DispatchCorrespondenceShader(
+        static void DispatchCorrespondenceShader(
             Vector3[] posL, Vector4[] colL,
             Vector3[] posR, Vector4[] colR,
-            float posWeight, float colWeight)
+            float posWeight, float colWeight,
+            out int[] bestIndex, out float[] bestDist)
         {
             var shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(kShaderPath);
             if (shader == null)
@@ -258,9 +261,10 @@ namespace GaussianSplatting.Editor
 
                 shader.Dispatch(kernel, (nL + 63) / 64, 1, 1);
 
-                var matchData = new int[nL];
-                bufMatch.GetData(matchData);
-                return matchData;
+                bestIndex = new int[nL];
+                bestDist  = new float[nL];
+                bufMatch.GetData(bestIndex);
+                bufDist.GetData(bestDist);
             }
             finally
             {

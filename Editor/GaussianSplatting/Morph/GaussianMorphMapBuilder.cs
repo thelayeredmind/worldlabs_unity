@@ -34,11 +34,11 @@ namespace GaussianSplatting.Editor
         public interface ICorrespondenceDispatcher
         {
             /// <summary>
-            /// Upload positions and colors for both sides, dispatch the search, return best-match indices per L splat.
-            /// Must be called on the main thread.
+            /// Upload positions and colors for both sides, dispatch the search, return best-match indices
+            /// and distances per L splat. Must be called on the main thread.
             /// </summary>
-            int[] FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
-                float posWeight, float colWeight);
+            void FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist);
         }
 
         // ── Public entry point ────────────────────────────────────────────────
@@ -94,10 +94,11 @@ namespace GaussianSplatting.Editor
                     subColR[j] = colR[remainingR[j]];
                 }
 
-                int[] bestMatch = dispatcher.FindBestMatches(subPosL, subColL, subPosR, subColR, posWeight, colorWeight);
+                dispatcher.FindBestMatches(subPosL, subColL, subPosR, subColR, posWeight, colorWeight,
+                    out int[] bestMatch, out float[] bestDist);
                 ct.ThrowIfCancellationRequested();
 
-                ResolveOneToOne(bestMatch, subPosL.Length, subPosR.Length,
+                ResolveOneToOne(bestMatch, bestDist, subPosL.Length, subPosR.Length,
                     out var roundPairs, out var roundUL, out var roundUR);
 
                 if (roundPairs.Length == 0)
@@ -126,28 +127,34 @@ namespace GaussianSplatting.Editor
         // ── Duplicate resolution ──────────────────────────────────────────────
 
         /// <summary>
-        /// GPU allows multiple L splats to claim the same R splat. Resolve greedily:
-        /// keep the L splat with the smallest index (stable), mark the rest unmatched.
-        /// O(N) — trivially fast after GPU readback.
+        /// GPU allows multiple L splats to claim the same R splat. Resolve by distance
+        /// priority: the closest pair wins each contested R splat (approximates the
+        /// reference's sequential "claim nearest available, then remove" matching,
+        /// where the truly-best pairs are assigned first). Losers fall through to the
+        /// next iterative re-matching round. O(N) — trivially fast after GPU readback.
         /// </summary>
-        static void ResolveOneToOne(int[] bestMatch, int nL, int nR,
+        static void ResolveOneToOne(int[] bestMatch, float[] bestDist, int nL, int nR,
             out int2[] matchedPairs,
             out int[]  unmatchedLeft, out int[] unmatchedRight)
         {
-            // claimedBy[j] = first L that claimed R splat j (-1 = unclaimed)
+            // claimedBy[j] = L that currently holds R splat j (-1 = unclaimed)
             int[] claimedBy = new int[nR];
             for (int j = 0; j < nR; j++) claimedBy[j] = -1;
 
-            var pairs = new List<int2>(nL);
-            var uL    = new List<int>();
+            var uL = new List<int>();
 
             for (int i = 0; i < nL; i++)
             {
                 int j = bestMatch[i];
-                if (claimedBy[j] == -1)
+                int incumbent = claimedBy[j];
+                if (incumbent == -1)
                 {
                     claimedBy[j] = i;
-                    pairs.Add(new int2(i, j));
+                }
+                else if (bestDist[i] < bestDist[incumbent])
+                {
+                    claimedBy[j] = i;
+                    uL.Add(incumbent);
                 }
                 else
                 {
@@ -155,12 +162,15 @@ namespace GaussianSplatting.Editor
                 }
             }
 
-            var claimedR = new HashSet<int>();
-            foreach (var p in pairs) claimedR.Add(p.y);
-
-            var uR = new List<int>();
+            var pairs = new List<int2>(nL);
+            var uR    = new List<int>();
             for (int j = 0; j < nR; j++)
-                if (!claimedR.Contains(j)) uR.Add(j);
+            {
+                if (claimedBy[j] != -1)
+                    pairs.Add(new int2(claimedBy[j], j));
+                else
+                    uR.Add(j);
+            }
 
             matchedPairs   = pairs.ToArray();
             unmatchedLeft  = uL.ToArray();
