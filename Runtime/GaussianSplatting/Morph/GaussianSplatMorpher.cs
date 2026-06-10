@@ -358,6 +358,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetInt("_UnmatchedCount",  m_UnmatchedRightCount);
                 m_MorphShader.SetInt("_OutOffset",       m_MatchedCount + m_UnmatchedLeftCount);
                 m_MorphShader.SetFloat("_T",             m_T);
+                m_MorphShader.SetInt("_SplatFormatA",    (int)m_SplatFormat);
                 m_MorphShader.SetInt("_SplatFormatB",    (int)m_SplatFormatB);
                 m_MorphShader.SetInt("_OutWidthB",       (int)m_OutTexWidthB);
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
@@ -378,14 +379,28 @@ namespace GaussianSplatting.Runtime
 
             // Write one ChunkInfo (64 bytes) per kChunkSize splats, all with the same global bounds.
             // This way every chunkIdx maps to a valid entry — the renderer can dechunk all splats.
+            // _SplatChunkCount > 0 makes LoadSplatData() run its dechunk path for every output splat
+            // (col = lerp(colMin,colMax,col); col.a = InvSquareCentered01(col.a); scale = lerp(sclMin,sclMax,scale)^8),
+            // so colMin/colMax and sclMin/sclMax must be identity (0,1) for the morph shader's already-final
+            // RGB and scale values to survive — only position is meant to be chunk-relative here.
+            // Packed half2(min=0,max=1) = 0x3C000000 (f32tof16(1.0)=0x3C00 in the high 16 bits).
+            const uint kIdentityMinMax = 0x3C000000u;
+
             int chunkCount = (m_TotalMorphCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
             var allChunkBytes = new byte[chunkCount * 64];
             for (int c = 0; c < chunkCount; c++)
             {
                 int b = c * 64;
+                WriteUInt(allChunkBytes, b + 0,  kIdentityMinMax); // colR
+                WriteUInt(allChunkBytes, b + 4,  kIdentityMinMax); // colG
+                WriteUInt(allChunkBytes, b + 8,  kIdentityMinMax); // colB
+                WriteUInt(allChunkBytes, b + 12, kIdentityMinMax); // colA
                 WriteFloat(allChunkBytes, b + 16, m_WorldBoundsMin.x); WriteFloat(allChunkBytes, b + 20, m_WorldBoundsMax.x);
                 WriteFloat(allChunkBytes, b + 24, m_WorldBoundsMin.y); WriteFloat(allChunkBytes, b + 28, m_WorldBoundsMax.y);
                 WriteFloat(allChunkBytes, b + 32, m_WorldBoundsMin.z); WriteFloat(allChunkBytes, b + 36, m_WorldBoundsMax.z);
+                WriteUInt(allChunkBytes, b + 40, kIdentityMinMax); // sclX
+                WriteUInt(allChunkBytes, b + 44, kIdentityMinMax); // sclY
+                WriteUInt(allChunkBytes, b + 48, kIdentityMinMax); // sclZ
             }
 
             m_BufOutChunk = new GraphicsBuffer(GraphicsBuffer.Target.Raw, allChunkBytes.Length / 4, 4) { name = "MorphOutChunk" };
@@ -414,6 +429,12 @@ namespace GaussianSplatting.Runtime
             System.BitConverter.ToSingle(new[] { b[offset], b[offset+1], b[offset+2], b[offset+3] }, 0);
 
         static void WriteFloat(byte[] b, int offset, float v)
+        {
+            var bytes = System.BitConverter.GetBytes(v);
+            b[offset] = bytes[0]; b[offset+1] = bytes[1]; b[offset+2] = bytes[2]; b[offset+3] = bytes[3];
+        }
+
+        static void WriteUInt(byte[] b, int offset, uint v)
         {
             var bytes = System.BitConverter.GetBytes(v);
             b[offset] = bytes[0]; b[offset+1] = bytes[1]; b[offset+2] = bytes[2]; b[offset+3] = bytes[3];
@@ -534,7 +555,7 @@ namespace GaussianSplatting.Runtime
             m_BufPosA?.Dispose();   m_BufPosB?.Dispose();
             m_BufOtherA?.Dispose(); m_BufOtherB?.Dispose();
             m_BufSHA?.Dispose();    m_BufSHB?.Dispose();
-            m_BufChunksB?.Dispose();
+            m_BufChunksA?.Dispose(); m_BufChunksB?.Dispose();
             m_BufIndices?.Dispose();
             m_BufUnmatchedLeft?.Dispose();  m_BufUnmatchedRight?.Dispose();
             m_BufOutPos?.Dispose(); m_BufOutOther?.Dispose(); m_BufOutSH?.Dispose(); m_BufOutChunk?.Dispose();
@@ -544,6 +565,7 @@ namespace GaussianSplatting.Runtime
             if (m_TexOutColor != null) m_TexOutColor.Release();
 
             m_BufPosA = m_BufPosB = m_BufOtherA = m_BufOtherB = m_BufSHA = m_BufSHB = null;
+            m_BufChunksA = m_BufChunksB = null;
             m_BufIndices = m_BufUnmatchedLeft = m_BufUnmatchedRight = null;
             m_BufOutPos = m_BufOutOther = m_BufOutSH = null;
             m_TexColorA = m_TexColorB = null;

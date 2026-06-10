@@ -56,6 +56,43 @@ float3 _OutBoundsMax;
 #define FMT_11  2
 #define FMT_6   3
 
+// ── Output chunk pre-encode helpers ──────────────────────────────────────────
+// The renderer's LoadSplatData() always runs its dechunk path for morph output
+// (_SplatChunkCount > 0): col = lerp(colMin,colMax,col); col.a = InvSquareCentered01(col.a);
+// scale = lerp(sclMin,sclMax,scale); scale = scale^8.
+// The morpher sets colMin/colMax = (0,1) and sclMin/sclMax = (0,1) (identity lerp), so RGB
+// passes through unchanged, but alpha and scale need the matching forward transform here so
+// the renderer's InvSquareCentered01 / ^8 recover the real values.
+float SquareCentered01(float x)
+{
+    x -= 0.5;
+    x = x * x * sign(x);
+    return x * 2.0 + 0.5;
+}
+
+float3 EncodeChunkScale(float3 scale)
+{
+    return pow(max(scale, 0.0), 1.0 / 8.0);
+}
+
+// Decode a chunk-relative normalised scale to final scale, matching the renderer's
+// LoadSplatData dechunk path: scale = lerp(sclMin,sclMax,scale); scale = scale^8.
+// ChunkInfo layout: sclX/sclY/sclZ at bytes 40/44/48, each a packed half2(min,max).
+float3 DecodeChunkScale(float3 normScale, ByteAddressBuffer chunks, uint chunkCount, uint splatIdx)
+{
+    uint chunkIdx = splatIdx / 256u;
+    if (chunkIdx >= chunkCount) return normScale;
+    uint base = chunkIdx * 64;
+    uint2 sX = chunks.Load(base + 40) >> uint2(0, 16) & 0xFFFF;
+    uint2 sY = chunks.Load(base + 44) >> uint2(0, 16) & 0xFFFF;
+    uint2 sZ = chunks.Load(base + 48) >> uint2(0, 16) & 0xFFFF;
+    float3 sclMin = float3(f16tof32(sX.x), f16tof32(sY.x), f16tof32(sZ.x));
+    float3 sclMax = float3(f16tof32(sX.y), f16tof32(sY.y), f16tof32(sZ.y));
+    float3 scale = lerp(sclMin, sclMax, normScale);
+    scale = scale * scale; scale = scale * scale; scale = scale * scale;
+    return scale;
+}
+
 // ── Decode helpers ────────────────────────────────────────────────────────────
 
 float3 DecodeNorm11(uint enc)
@@ -135,6 +172,34 @@ float3 Dechunk(float3 normPos, ByteAddressBuffer chunks, uint chunkCount, uint s
         lerp(posZMin, posZMax, normPos.z));
 }
 
+// Decode a chunk-relative color texel to final RGBA, matching the renderer's
+// LoadSplatData dechunk path: col = lerp(colMin,colMax,col); col.a = InvSquareCentered01(col.a).
+// ChunkInfo layout: colR/colG/colB/colA at bytes 0/4/8/12, each a packed half2(min,max).
+float4 DecodeChunkColor(float4 raw, ByteAddressBuffer chunks, uint chunkCount, uint splatIdx)
+{
+    uint chunkIdx = splatIdx / 256u;
+    if (chunkIdx >= chunkCount) return raw;
+    uint base = chunkIdx * 64;
+    uint2 cR = chunks.Load(base + 0)  >> uint2(0, 16) & 0xFFFF;
+    uint2 cG = chunks.Load(base + 4)  >> uint2(0, 16) & 0xFFFF;
+    uint2 cB = chunks.Load(base + 8)  >> uint2(0, 16) & 0xFFFF;
+    uint2 cA = chunks.Load(base + 12) >> uint2(0, 16) & 0xFFFF;
+    float4 colMin = float4(f16tof32(cR.x), f16tof32(cG.x), f16tof32(cB.x), f16tof32(cA.x));
+    float4 colMax = float4(f16tof32(cR.y), f16tof32(cG.y), f16tof32(cB.y), f16tof32(cA.y));
+    float4 col = lerp(colMin, colMax, raw);
+    col.a = InvSquareCentered01(col.a);
+    return col;
+}
+
+// Pack a final RGBA into the morph output's color texture, whose chunk uses identity
+// (0,1) colMin/colMax — RGB passes through unchanged, alpha is forward-encoded so the
+// renderer's InvSquareCentered01 recovers it.
+float4 EncodeOutputColor(float4 col)
+{
+    col.a = SquareCentered01(col.a);
+    return col;
+}
+
 // Decode rotation (10.10.10.2 packed uint) → float4 quaternion
 float4 DecodeRot(uint enc)
 {
@@ -212,21 +277,23 @@ void MorphSplats(uint3 id : SV_DispatchThreadID)
     if (dot(qA, qB) < 0) qB = -qB;
     float4 qOut = normalize(lerp(qA, qB, t));
 
-    float3 scaleA = DecodeVec(_OtherA, idxA * OtherStride(scaleFmtA) + 4, scaleFmtA);
-    float3 scaleB = DecodeVec(_OtherB, idxB * OtherStride(scaleFmtB) + 4, scaleFmtB);
+    float3 scaleNormA = DecodeVec(_OtherA, idxA * OtherStride(scaleFmtA) + 4, scaleFmtA);
+    float3 scaleNormB = DecodeVec(_OtherB, idxB * OtherStride(scaleFmtB) + 4, scaleFmtB);
+    float3 scaleA = DecodeChunkScale(scaleNormA, _ChunksA, _ChunkCountA, idxA);
+    float3 scaleB = DecodeChunkScale(scaleNormB, _ChunksB, _ChunkCountB, idxB);
     float3 scaleOut = lerp(scaleA, scaleB, t);
 
     uint outOtherStride = OtherStride(scaleFmtA);
     _OutOther.Store(i * outOtherStride,     EncodeRot(qOut));
-    _OutOther.Store(i * outOtherStride + 4, EncodeNorm6(scaleOut));
+    _OutOther.Store(i * outOtherStride + 4, EncodeNorm6(EncodeChunkScale(scaleOut)));
 
-    // ── Color (Norm8x4 — lerp in byte space) ─────────────────────────────────
+    // ── Color ──────────────────────────────────────────────────────────────
     uint2 coordA   = SplatToTexCoord(idxA, _OutWidth);   // A tex sized same as output
     uint2 coordB   = SplatToTexCoord(idxB, _OutWidthB);  // B tex may have a different width
     uint2 coordOut = SplatToTexCoord(i,    _OutWidth);
-    float4 colA  = _ColorA.Load(int3(coordA, 0));
-    float4 colB  = _ColorB.Load(int3(coordB, 0));
-    _OutColor[coordOut] = lerp(colA, colB, t);
+    float4 colA = DecodeChunkColor(_ColorA.Load(int3(coordA, 0)), _ChunksA, _ChunkCountA, idxA);
+    float4 colB = DecodeChunkColor(_ColorB.Load(int3(coordB, 0)), _ChunksB, _ChunkCountB, idxB);
+    _OutColor[coordOut] = EncodeOutputColor(lerp(colA, colB, t));
 
     // ── SH — passthrough A (clustered SH lerp deferred to morph/runtime) ─────
     // TODO: proper SH lerp once formats are normalised across both assets.
@@ -255,19 +322,20 @@ void CopyUnmatchedA(uint3 id : SV_DispatchThreadID)
     float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
     _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
 
-    // ── Other (rotation + scale) — pass through unchanged ───────────────────
+    // ── Other (rotation + scale) — re-encode for the output's identity chunk bounds ──
     uint outOtherStride = OtherStride(scaleFmtA);
-    uint rotEnc   = _OtherA.Load(srcIdx * OtherStride(scaleFmtA));
-    float3 scale  = DecodeVec(_OtherA, srcIdx * OtherStride(scaleFmtA) + 4, scaleFmtA);
+    uint rotEnc    = _OtherA.Load(srcIdx * OtherStride(scaleFmtA));
+    float3 scaleNorm = DecodeVec(_OtherA, srcIdx * OtherStride(scaleFmtA) + 4, scaleFmtA);
+    float3 scale   = DecodeChunkScale(scaleNorm, _ChunksA, _ChunkCountA, srcIdx);
     _OutOther.Store(dstIdx * outOtherStride,     rotEnc);
-    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(scale));
+    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(EncodeChunkScale(scale)));
 
-    // ── Color — scale opacity channel by (1 - t) ────────────────────────────
+    // ── Color — decode A's chunk-relative color, scale opacity by (1 - t), re-encode ──
     uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidth);
     uint2 coordDst = SplatToTexCoord(dstIdx, _OutWidth);
-    float4 col = _ColorA.Load(int3(coordSrc, 0));
+    float4 col = DecodeChunkColor(_ColorA.Load(int3(coordSrc, 0)), _ChunksA, _ChunkCountA, srcIdx);
     col.a *= (1.0 - _T);
-    _OutColor[coordDst] = col;
+    _OutColor[coordDst] = EncodeOutputColor(col);
 }
 
 // ── CopyUnmatchedB ────────────────────────────────────────────────────────────
@@ -292,17 +360,19 @@ void CopyUnmatchedB(uint3 id : SV_DispatchThreadID)
     float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
     _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
 
-    // ── Other ────────────────────────────────────────────────────────────────
-    uint outOtherStride = OtherStride(scaleFmtB);
-    uint rotEnc  = _OtherB.Load(srcIdx * OtherStride(scaleFmtB));
-    float3 scale = DecodeVec(_OtherB, srcIdx * OtherStride(scaleFmtB) + 4, scaleFmtB);
+    // ── Other — output stride matches A's format (m_BufOutOther is allocated from A) ──
+    uint scaleFmtA = (_SplatFormatA >> 8) & 0xFF;
+    uint outOtherStride = OtherStride(scaleFmtA);
+    uint rotEnc      = _OtherB.Load(srcIdx * OtherStride(scaleFmtB));
+    float3 scaleNorm = DecodeVec(_OtherB, srcIdx * OtherStride(scaleFmtB) + 4, scaleFmtB);
+    float3 scale     = DecodeChunkScale(scaleNorm, _ChunksB, _ChunkCountB, srcIdx);
     _OutOther.Store(dstIdx * outOtherStride,     rotEnc);
-    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(scale));
+    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(EncodeChunkScale(scale)));
 
-    // ── Color — scale opacity channel by t ───────────────────────────────────
+    // ── Color — decode B's chunk-relative color, scale opacity by t, re-encode ──
     uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidthB);
     uint2 coordDst = SplatToTexCoord(dstIdx, _OutWidth);
-    float4 col = _ColorB.Load(int3(coordSrc, 0));
+    float4 col = DecodeChunkColor(_ColorB.Load(int3(coordSrc, 0)), _ChunksB, _ChunkCountB, srcIdx);
     col.a *= _T;
-    _OutColor[coordDst] = col;
+    _OutColor[coordDst] = EncodeOutputColor(col);
 }
