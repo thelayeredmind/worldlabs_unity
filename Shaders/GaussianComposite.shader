@@ -8,7 +8,7 @@ Shader "Hidden/Gaussian Splatting/Composite"
             ZWrite Off
             ZTest Always
             Cull Off
-            Blend SrcAlpha OneMinusSrcAlpha
+            Blend One OneMinusSrcAlpha
 
 CGPROGRAM
 #pragma vertex vert
@@ -36,10 +36,7 @@ SamplerState sampler_GaussianSplatRT;
 half4 frag (v2f i) : SV_Target
 {
     float2 uv = i.vertex.xy / _ScreenParams.xy;
-    half4 col = _GaussianSplatRT.SampleLevel(sampler_GaussianSplatRT, uv, 0);
-    col.rgb = GammaToLinearSpace(col.rgb);
-    col.a = saturate(col.a * 1.5);
-    return col;
+    return _GaussianSplatRT.SampleLevel(sampler_GaussianSplatRT, uv, 0);
 }
 ENDCG
         }
