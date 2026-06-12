@@ -611,8 +611,8 @@ namespace GaussianSplatting.Runtime
             if (m_SplatCount == 0) 
                 return;
 
-            m_centerEyeCamera = Camera.main;
-            
+            m_centerEyeCamera = ResolveCenterEyeCamera();
+
             int posSize, posMarker;
             int otherSize, otherMarker;
             int shSize, shMarker;
@@ -1194,14 +1194,18 @@ namespace GaussianSplatting.Runtime
             if (!HasExternalBuffers && !HasValidRuntimeData)
             {
                 var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
-                if (m_PrevAsset != m_Asset || m_PrevHash != curHash || m_centerEyeCamera == null)
+                if (m_PrevAsset != m_Asset || m_PrevHash != curHash)
                 {
                     m_PrevAsset = m_Asset;
                     m_PrevHash  = curHash;
                     CreateResourcesForAsset();
                 }
             }
-            
+
+            // Re-resolve every frame: in edit mode this tracks whichever scene view camera is active,
+            // and in play mode picks up Camera.main if it appears after this renderer was initialized.
+            m_centerEyeCamera = ResolveCenterEyeCamera();
+
             if ((m_Sorter == null || m_Sorter.activeType != m_gpuSortType) && splatCount > 0)
             {
                 UpdateSortingType(m_gpuSortType);
@@ -1216,6 +1220,21 @@ namespace GaussianSplatting.Runtime
             {
                 m_centerCamMatrix = m_centerEyeCamera.worldToCameraMatrix;
             }
+        }
+
+        // Camera.main is a runtime concept and is frequently null in edit mode (no active MainCamera
+        // in the scene), which would otherwise leave m_centerEyeCamera permanently null. Fall back to
+        // the active scene view camera so sorting and selection behave correctly while editing.
+        static Camera ResolveCenterEyeCamera()
+        {
+            if (Application.isPlaying)
+                return Camera.main;
+#if UNITY_EDITOR
+            var sceneView = UnityEditor.SceneView.lastActiveSceneView;
+            if (sceneView != null && sceneView.camera != null)
+                return sceneView.camera;
+#endif
+            return Camera.main;
         }
 
         public static int CompleteGaussianCount()
