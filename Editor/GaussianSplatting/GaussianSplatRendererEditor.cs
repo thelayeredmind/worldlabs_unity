@@ -672,7 +672,7 @@ namespace GaussianSplatting.Editor
                                 WriteEntryData(mask, existing, newIndices);
                                 EditorUtility.SetDirty(mask);
                                 AssetDatabase.SaveAssets();
-                                gs.SetMaskDirty();
+                                var gsRef = gs; EditorApplication.delayCall += () => gsRef?.SetMaskDirty();
                             }
                         }
                         else
@@ -687,7 +687,7 @@ namespace GaussianSplatting.Editor
                             WriteEntryData(mask, entry, newIndices);
                             EditorUtility.SetDirty(mask);
                             AssetDatabase.SaveAssets();
-                            gs.SetMaskDirty();
+                            var gsRef = gs; EditorApplication.delayCall += () => gsRef?.SetMaskDirty();
                         }
                     }
                 }

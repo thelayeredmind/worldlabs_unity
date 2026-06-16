@@ -1484,19 +1484,20 @@ namespace GaussianSplatting.Runtime
 
             if (lo < 0 && hi >= 0)
             {
-                // Before first entry: lerp from all-zero to first entry's set.
+                // Before first entry: lerp from fully invisible (all 0) to first entry's selection.
                 float t = Mathf.InverseLerp(0f, sorted[hi].weight, m_MaskT);
                 foreach (var idx in sorted[hi].splatIndices)
                     if (idx >= 0 && idx < m_SplatCount) weights[idx] = t;
             }
             else if (lo >= 0 && hi < 0)
             {
-                // After last entry: lerp from last entry's set to all-ones.
+                // After last entry: lerp from last entry's selection to fully visible (all 1).
                 float t = Mathf.InverseLerp(sorted[lo].weight, 1f, m_MaskT);
+                var loWeights = new float[m_SplatCount];
                 foreach (var idx in sorted[lo].splatIndices)
-                    if (idx >= 0 && idx < m_SplatCount) weights[idx] = 1f;
+                    if (idx >= 0 && idx < m_SplatCount) loWeights[idx] = 1f;
                 for (int i = 0; i < m_SplatCount; i++)
-                    weights[i] = Mathf.Lerp(weights[i], 1f, t);
+                    weights[i] = Mathf.Lerp(loWeights[i], 1f, t);
             }
             else if (lo == hi)
             {

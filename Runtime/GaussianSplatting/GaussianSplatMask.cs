@@ -21,26 +21,45 @@ namespace GaussianSplatting.Runtime
             // Legacy field — populated on old assets, migrated to dataAsset by the editor on next save.
             [HideInInspector] public int[] legacySplatIndices;
 
-            // Runtime array, populated from dataAsset.bytes in OnAfterDeserialize. Never serialized.
-            [NonSerialized] public int[] splatIndices = Array.Empty<int>();
+            // Cached runtime array. Populated lazily on first access, or set directly by the editor.
+            [NonSerialized] int[] m_SplatIndices;
+            [NonSerialized] bool m_SplatIndicesLoaded;
+
+            public int[] splatIndices
+            {
+                get
+                {
+                    if (!m_SplatIndicesLoaded)
+                    {
+                        if (dataAsset != null && dataAsset.bytes != null && dataAsset.bytes.Length > 0)
+                            m_SplatIndices = BytesToIndices(dataAsset.bytes);
+                        else if (legacySplatIndices != null && legacySplatIndices.Length > 0)
+                            m_SplatIndices = legacySplatIndices;
+                        else
+                            m_SplatIndices = Array.Empty<int>();
+                        m_SplatIndicesLoaded = true;
+                    }
+                    return m_SplatIndices;
+                }
+                set
+                {
+                    m_SplatIndices = value;
+                    m_SplatIndicesLoaded = true;
+                }
+            }
+
+            public void InvalidateCache() { m_SplatIndicesLoaded = false; }
         }
 
         public List<Entry> entries = new();
 
         public void OnBeforeSerialize() { }
 
+        // Invalidate caches so splatIndices re-reads from dataAsset on next access.
         public void OnAfterDeserialize()
         {
             foreach (var entry in entries)
-            {
-                if (entry == null) continue;
-                if (entry.dataAsset != null && entry.dataAsset.bytes != null)
-                    entry.splatIndices = BytesToIndices(entry.dataAsset.bytes);
-                else if (entry.legacySplatIndices != null && entry.legacySplatIndices.Length > 0)
-                    entry.splatIndices = entry.legacySplatIndices;
-                else
-                    entry.splatIndices = Array.Empty<int>();
-            }
+                entry?.InvalidateCache();
         }
 
         public static int[] BytesToIndices(byte[] bytes)

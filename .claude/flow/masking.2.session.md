@@ -49,3 +49,16 @@
 [/Task]
 
 [^] Continue masking. Last: review clean — binary sub-asset storage working, delete is fast. Next: drift or wrap-up. Confirm: none.
+
+[Task] Interpolation fix + boundary behavior
+
+[S] Fix interpolation after new entry save; boundary: no entry at 0 → invisible, no entry at 1 → fully visible
+
+[R] Interpolation broke after adding S2 → root cause: AssetDatabase reimport fires OnAfterDeserialize mid-write, invalidates lazy splatIndices cache before UpdateMaskBuffer runs → fixed: SetMaskDirty via EditorApplication.delayCall, one frame after SaveAssets settles
+[R] Boundary: before first entry lerp from invisible; after last entry lerp to fully visible (all splats weight 1) → implemented
+[/S]
+[/Task]
+
+[^] Continue masking. Last: review clean — interpolation and boundaries working. Next: drift or wrap-up. Confirm: none.
+
+--- CLOSED 2026-06-16 — Inspector UX (keyframe dots, click-to-load, Shift-union), binary sub-asset storage, lazy splatIndices, deferred dirty, boundary behavior ---
