@@ -15,4 +15,15 @@
 [/S]
 [/Task]
 
-[^] Continue masking. Last: review clean — keyframe dots on MaskT slider complete. Next: drift or wrap-up. Confirm: none.
+[Task] Inspector UX: click dot → snap MaskT + load entry selection into GPU edit buffer
+
+[S] Click handling on keyframe dots — snap MaskT + RestoreSelectedBits
+
+[R] Click on dot didn't work — slider consumed MouseDown first → fixed: hit test runs before slider draws
+[R] Slider head didn't snap to dot position → fixed: update serialized property before evt.Use()
+[R] Dot at 0.5 was offset left → fixed: right padding now uses EditorGUIUtility.fieldWidth + 5 instead of 4px
+[R] No hover feedback → fixed: dot grows 40% and turns white on MouseMove hover
+[/S]
+[/Task]
+
+[^] Continue masking. Last: review clean — click-to-snap + selection load + hover feedback all working. Next: drift or wrap-up. Confirm: none.

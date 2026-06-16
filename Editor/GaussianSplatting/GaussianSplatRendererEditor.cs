@@ -178,6 +178,53 @@ namespace GaussianSplatting.Editor
 
             var sliderLabel = new GUIContent("Mask T", "Reveal position along the mask timeline (0–1).");
             Rect sliderRect = EditorGUILayout.GetControlRect();
+
+            float labelWidth = EditorGUIUtility.labelWidth;
+            float trackX = sliderRect.x + labelWidth;
+            float trackW = sliderRect.width - labelWidth - EditorGUIUtility.fieldWidth - 5f;
+            float trackY = sliderRect.y + sliderRect.height * 0.5f;
+            float dotR = 4f;
+
+            // Check dot clicks BEFORE the slider draws so it doesn't consume the event first
+            var evt = Event.current;
+            if (mask != null && mask.entries != null && evt.type == EventType.MouseDown)
+            {
+                foreach (var entry in mask.entries)
+                {
+                    if (entry == null) continue;
+                    float cx = trackX + entry.weight * trackW;
+                    var hitRect = new Rect(cx - dotR * 2f, trackY - dotR * 2f, dotR * 4f, dotR * 4f);
+                    if (!hitRect.Contains(evt.mousePosition)) continue;
+
+                    Undo.RecordObject(gs, "Load Mask Entry");
+                    gs.m_MaskT = entry.weight;
+                    EditorUtility.SetDirty(gs);
+
+                    gs.EditDeselectAll();
+                    var indices = entry.selection?.splatIndices;
+                    if (indices != null && indices.Length > 0)
+                    {
+                        int wordCount = (gs.splatCount + 31) / 32;
+                        var bits = new uint[wordCount];
+                        foreach (int idx in indices)
+                        {
+                            if (idx >= 0 && idx < gs.splatCount)
+                                bits[idx >> 5] |= 1u << (idx & 31);
+                        }
+                        gs.RestoreSelectedBits(bits);
+                    }
+                    gs.UpdateEditCountsAndBounds();
+                    ToolManager.SetActiveContext<GaussianToolContext>();
+                    // Update serialized property so the slider draws at the snapped position,
+                    // then consume the event so the slider doesn't also start dragging.
+                    m_PropMaskT.floatValue = entry.weight;
+                    serializedObject.ApplyModifiedProperties();
+                    evt.Use();
+                    RepaintAll();
+                    break;
+                }
+            }
+
             EditorGUI.BeginChangeCheck();
             float newT = EditorGUI.Slider(sliderRect, sliderLabel, gs.m_MaskT, 0f, 1f);
             if (EditorGUI.EndChangeCheck())
@@ -190,26 +237,28 @@ namespace GaussianSplatting.Editor
             if (mask == null || mask.entries == null || mask.entries.Count == 0)
                 return;
 
-            float labelWidth = EditorGUIUtility.labelWidth;
-            float trackX = sliderRect.x + labelWidth;
-            float trackW = sliderRect.width - labelWidth - 4f;
-            float trackY = sliderRect.y + sliderRect.height * 0.5f;
-            float dotR = 4f; // 5 * 0.8
-
-            if (Event.current.type == EventType.Repaint)
+            if (evt.type == EventType.MouseMove || evt.type == EventType.Repaint)
             {
+                bool needsRepaint = false;
                 var dot = GetDotTexture();
                 var prevColor = GUI.color;
-                var dotColor = new Color(0.65f, 0.65f, 0.65f);
                 foreach (var entry in mask.entries)
                 {
                     if (entry == null) continue;
                     float cx = trackX + entry.weight * trackW;
-                    var dotRect = new Rect(cx - dotR, trackY - dotR, dotR * 2f, dotR * 2f);
-                    GUI.color = dotColor;
-                    GUI.DrawTexture(dotRect, dot);
+                    var hitRect = new Rect(cx - dotR * 2f, trackY - dotR * 2f, dotR * 4f, dotR * 4f);
+                    bool hovered = hitRect.Contains(evt.mousePosition);
+                    if (evt.type == EventType.MouseMove) { needsRepaint = true; }
+                    if (evt.type == EventType.Repaint)
+                    {
+                        float r = hovered ? dotR * 1.4f : dotR;
+                        var dotRect = new Rect(cx - r, trackY - r, r * 2f, r * 2f);
+                        GUI.color = hovered ? Color.white : new Color(0.65f, 0.65f, 0.65f);
+                        GUI.DrawTexture(dotRect, dot);
+                    }
                 }
                 GUI.color = prevColor;
+                if (needsRepaint) RepaintAll();
             }
         }
 
