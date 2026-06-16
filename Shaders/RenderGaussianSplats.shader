@@ -42,7 +42,6 @@ struct v2f
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
     float4 vertex : SV_POSITION;
-    uint splatIdx : TEXCOORD1;
 };
 
 StructuredBuffer<SplatViewData> _SplatViewData;
@@ -62,7 +61,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
 	v2f o = (v2f)0;
     instID = _OrderBuffer[instID];
-	o.splatIdx = instID;
 
 	SplatViewData view = _SplatViewData[instID];
 
@@ -115,6 +113,16 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 				o.col.a = -1;
 			}
 		}
+
+		if (_SplatMaskValid && o.col.a >= 0)
+		{
+			o.col.a *= _SplatMaskWeights[instID];
+			if (o.col.a < _AlphaDiscardThreshold)
+			{
+				o.vertex = asfloat(0x7fc00000);
+				return o;
+			}
+		}
 	}
     return o;
 }
@@ -161,9 +169,6 @@ half4 frag (v2f i) : SV_Target
 		}
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
-
-	if (_SplatMaskValid)
-		alpha *= _SplatMaskWeights[i.splatIdx];
 
     if (alpha < _AlphaDiscardThreshold)
         discard;
@@ -423,7 +428,6 @@ struct v2f
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
     float4 vertex : SV_POSITION;
-    uint splatIdx : TEXCOORD1;
 };
 
 StructuredBuffer<SplatViewData> _SplatViewData;
@@ -441,7 +445,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
 	v2f o = (v2f)0;
     instID = _OrderBuffer[instID];
-	o.splatIdx = instID;
 
 	SplatViewData view = _SplatViewData[instID];
 
@@ -469,6 +472,9 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 	o.col.g = f16tof32(view.color.x);
 	o.col.b = f16tof32(view.color.y >> 16);
 	o.col.a = f16tof32(view.color.y);
+
+	if (_SplatMaskValid)
+		o.col.a *= _SplatMaskWeights[instID];
 
 	float opacity = max(o.col.a, 0);
 	if (opacity < _AlphaDiscardThreshold)
@@ -538,9 +544,6 @@ half4 frag (v2f i) : SV_Target
 		}
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
-
-	if (_SplatMaskValid)
-		alpha *= _SplatMaskWeights[i.splatIdx];
 
 	// Tight quads mean alpha is always >= threshold here; no discard needed.
     return half4(i.col.rgb * alpha, alpha);

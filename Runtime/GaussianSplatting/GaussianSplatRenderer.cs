@@ -968,7 +968,6 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(cs, Props.SplatCutoutsCount, m_Cutouts?.Length ?? 0);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatCutouts, m_GpuEditCutouts);
 
-            UpdateMaskBuffer();
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatMaskWeights, m_GpuMaskWeights ?? (HasExternalBuffers ? m_ExternalPos : m_GpuPosData));
             cmb.SetComputeIntParam(cs, Props.SplatMaskValid, m_GpuMaskWeights != null ? 1 : 0);
         }
@@ -1235,6 +1234,8 @@ namespace GaussianSplatting.Runtime
             {
                 m_centerCamMatrix = m_centerEyeCamera.worldToCameraMatrix;
             }
+
+            UpdateMaskBuffer();
         }
 
         // Camera.main is a runtime concept and is frequently null in edit mode (no active MainCamera
@@ -1415,7 +1416,7 @@ namespace GaussianSplatting.Runtime
 
         void UpdateMaskBuffer()
         {
-            if (m_Mask == null || m_SplatCount == 0 || m_Mask.entries == null || m_Mask.entries.Count == 0)
+            if (m_Mask == null || m_SplatCount == 0)
             {
                 DisposeBuffer(ref m_GpuMaskWeights);
                 return;
@@ -1427,32 +1428,77 @@ namespace GaussianSplatting.Runtime
                 m_GpuMaskWeights = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, sizeof(float)) { name = "GaussianMaskWeights" };
             }
 
-            // Evaluate mask at m_MaskT: find the two bracketing entries and lerp splat visibility.
-            var entries = m_Mask.entries;
             var weights = new float[m_SplatCount];
 
-            if (entries == null || entries.Count == 0)
+            // Base case: no entries — uniform global alpha across all splats.
+            if (m_Mask.entries == null || m_Mask.entries.Count == 0)
             {
+                for (int i = 0; i < m_SplatCount; i++) weights[i] = m_MaskT;
                 m_GpuMaskWeights.SetData(weights);
                 return;
             }
 
-            // Sort entries by weight ascending (non-destructive).
-            var sorted = new System.Collections.Generic.List<GaussianSplatMask.Entry>(entries);
+            // Sort entries by weight ascending (non-destructive, guarded against nulls).
+            var sorted = new System.Collections.Generic.List<GaussianSplatMask.Entry>();
+            foreach (var e in m_Mask.entries)
+                if (e != null && e.selection?.splatIndices != null) sorted.Add(e);
             sorted.Sort((a, b) => a.weight.CompareTo(b.weight));
 
-            // Apply each entry whose weight <= m_MaskT, blending the last partial entry.
-            foreach (var entry in sorted)
+            if (sorted.Count == 0)
             {
-                if (entry.selection?.splatIndices == null) continue;
-                float entryContrib = Mathf.Clamp01(m_MaskT >= entry.weight ? 1f :
-                    (sorted.IndexOf(entry) == 0 ? 0f :
-                    Mathf.InverseLerp(sorted[sorted.IndexOf(entry) - 1].weight, entry.weight, m_MaskT)));
-                foreach (var idx in entry.selection.splatIndices)
-                {
-                    if (idx >= 0 && idx < m_SplatCount)
-                        weights[idx] = Mathf.Max(weights[idx], entryContrib);
-                }
+                for (int i = 0; i < m_SplatCount; i++) weights[i] = m_MaskT;
+                m_GpuMaskWeights.SetData(weights);
+                return;
+            }
+
+            // Find the two bracketing entries. Build a per-splat float[] for each and lerp.
+            // Below first entry: splat is visible iff it's in the first entry (lerp from 0).
+            // Above last entry: splat is visible iff it's in the last entry (lerp to 1).
+            // Between two entries: lerp between their two bitmaps.
+
+            // Find lower and upper bracket.
+            int lo = -1, hi = -1;
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                if (sorted[i].weight <= m_MaskT) lo = i;
+                if (hi < 0 && sorted[i].weight >= m_MaskT) hi = i;
+            }
+
+            if (lo < 0 && hi >= 0)
+            {
+                // Before first entry: lerp from all-zero to first entry's set.
+                float t = Mathf.InverseLerp(0f, sorted[hi].weight, m_MaskT);
+                foreach (var idx in sorted[hi].selection.splatIndices)
+                    if (idx >= 0 && idx < m_SplatCount) weights[idx] = t;
+            }
+            else if (lo >= 0 && hi < 0)
+            {
+                // After last entry: lerp from last entry's set to all-ones.
+                float t = Mathf.InverseLerp(sorted[lo].weight, 1f, m_MaskT);
+                // Start with last entry's splats fully visible, fill remainder by t.
+                foreach (var idx in sorted[lo].selection.splatIndices)
+                    if (idx >= 0 && idx < m_SplatCount) weights[idx] = 1f;
+                for (int i = 0; i < m_SplatCount; i++)
+                    weights[i] = Mathf.Lerp(weights[i], 1f, t);
+            }
+            else if (lo == hi)
+            {
+                // Exactly on an entry.
+                foreach (var idx in sorted[lo].selection.splatIndices)
+                    if (idx >= 0 && idx < m_SplatCount) weights[idx] = 1f;
+            }
+            else
+            {
+                // Between lo and hi: lerp between the two entry bitmaps.
+                float t = Mathf.InverseLerp(sorted[lo].weight, sorted[hi].weight, m_MaskT);
+                var loWeights = new float[m_SplatCount];
+                var hiWeights = new float[m_SplatCount];
+                foreach (var idx in sorted[lo].selection.splatIndices)
+                    if (idx >= 0 && idx < m_SplatCount) loWeights[idx] = 1f;
+                foreach (var idx in sorted[hi].selection.splatIndices)
+                    if (idx >= 0 && idx < m_SplatCount) hiWeights[idx] = 1f;
+                for (int i = 0; i < m_SplatCount; i++)
+                    weights[i] = Mathf.Lerp(loWeights[i], hiWeights[i], t);
             }
 
             m_GpuMaskWeights.SetData(weights);
