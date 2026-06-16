@@ -145,8 +145,72 @@ namespace GaussianSplatting.Editor
             
             EditorUtility.SetDirty(gs);
             serializedObject.Update();
-            
+
             Debug.Log("[Gaussian Splatting] Resources auto-assigned successfully.");
+        }
+
+        static Texture2D s_DotTexture;
+
+        static Texture2D GetDotTexture()
+        {
+            if (s_DotTexture != null) return s_DotTexture;
+            const int size = 32;
+            s_DotTexture = new Texture2D(size, size, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave };
+            var pixels = new Color32[size * size];
+            float center = (size - 1) * 0.5f;
+            float outerR = center;
+            float innerR = outerR - 1.5f;
+            for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                float d = Mathf.Sqrt((x - center) * (x - center) + (y - center) * (y - center));
+                byte a = d <= innerR ? (byte)255 : d <= outerR ? (byte)(255 * (outerR - d)) : (byte)0;
+                pixels[y * size + x] = new Color32(255, 255, 255, a);
+            }
+            s_DotTexture.SetPixels32(pixels);
+            s_DotTexture.Apply();
+            return s_DotTexture;
+        }
+
+        void DrawMaskTSliderWithKeyframes(GaussianSplatRenderer gs)
+        {
+            var mask = gs.m_Mask;
+
+            var sliderLabel = new GUIContent("Mask T", "Reveal position along the mask timeline (0–1).");
+            Rect sliderRect = EditorGUILayout.GetControlRect();
+            EditorGUI.BeginChangeCheck();
+            float newT = EditorGUI.Slider(sliderRect, sliderLabel, gs.m_MaskT, 0f, 1f);
+            if (EditorGUI.EndChangeCheck())
+            {
+                Undo.RecordObject(gs, "Set Mask T");
+                gs.m_MaskT = newT;
+                EditorUtility.SetDirty(gs);
+            }
+
+            if (mask == null || mask.entries == null || mask.entries.Count == 0)
+                return;
+
+            float labelWidth = EditorGUIUtility.labelWidth;
+            float trackX = sliderRect.x + labelWidth;
+            float trackW = sliderRect.width - labelWidth - 4f;
+            float trackY = sliderRect.y + sliderRect.height * 0.5f;
+            float dotR = 4f; // 5 * 0.8
+
+            if (Event.current.type == EventType.Repaint)
+            {
+                var dot = GetDotTexture();
+                var prevColor = GUI.color;
+                var dotColor = new Color(0.65f, 0.65f, 0.65f);
+                foreach (var entry in mask.entries)
+                {
+                    if (entry == null) continue;
+                    float cx = trackX + entry.weight * trackW;
+                    var dotRect = new Rect(cx - dotR, trackY - dotR, dotR * 2f, dotR * 2f);
+                    GUI.color = dotColor;
+                    GUI.DrawTexture(dotRect, dot);
+                }
+                GUI.color = prevColor;
+            }
         }
 
         public override void OnInspectorGUI()
@@ -470,7 +534,7 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.Space();
             GUILayout.Label("Mask", EditorStyles.boldLabel);
             EditorGUILayout.PropertyField(m_PropMask);
-            EditorGUILayout.PropertyField(m_PropMaskT);
+            DrawMaskTSliderWithKeyframes(gs);
 
             using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
             {
