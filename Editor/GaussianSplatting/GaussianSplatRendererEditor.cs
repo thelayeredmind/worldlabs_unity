@@ -34,6 +34,8 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropRenderMode;
         SerializedProperty m_PropPointDisplaySize;
         SerializedProperty m_PropCutouts;
+        SerializedProperty m_PropMask;
+        SerializedProperty m_PropMaskT;
         SerializedProperty m_PropShaderSplats;
         SerializedProperty m_PropShaderComposite;
         SerializedProperty m_PropShaderDebugPoints;
@@ -91,6 +93,8 @@ namespace GaussianSplatting.Editor
             m_PropRenderMode = serializedObject.FindProperty("m_RenderMode");
             m_PropPointDisplaySize = serializedObject.FindProperty("m_PointDisplaySize");
             m_PropCutouts = serializedObject.FindProperty("m_Cutouts");
+            m_PropMask = serializedObject.FindProperty("m_Mask");
+            m_PropMaskT = serializedObject.FindProperty("m_MaskT");
             m_PropShaderSplats = serializedObject.FindProperty("m_ShaderSplats");
             m_PropShaderComposite = serializedObject.FindProperty("m_ShaderComposite");
             m_PropShaderDebugPoints = serializedObject.FindProperty("m_ShaderDebugPoints");
@@ -459,6 +463,65 @@ namespace GaussianSplatting.Editor
                             new GUIContent("Brush Radius (px)", "Screen-space brush radius in pixels. Scroll wheel also resizes."),
                             GaussianBrushSelectTool.BrushRadiusPx, 5f, 500f);
                         if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushRadiusPx = r;
+                    }
+                }
+            }
+
+            EditorGUILayout.Space();
+            GUILayout.Label("Mask", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(m_PropMask);
+            EditorGUILayout.PropertyField(m_PropMaskT);
+
+            using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
+            {
+                if (GUILayout.Button("Save Selection as Mask Entry"))
+                {
+                    var mask = gs.m_Mask;
+                    if (mask == null)
+                    {
+                        string path = EditorUtility.SaveFilePanelInProject(
+                            "Save Splat Mask", "SplatMask", "asset", "Choose location for new GaussianSplatMask asset");
+                        if (!string.IsNullOrEmpty(path))
+                        {
+                            mask = ScriptableObject.CreateInstance<GaussianSplatMask>();
+                            AssetDatabase.CreateAsset(mask, path);
+                            gs.m_Mask = mask;
+                            serializedObject.Update();
+                        }
+                    }
+
+                    if (mask != null)
+                    {
+                        var snap = gs.SnapshotSelectedBits();
+                        var indices = new System.Collections.Generic.List<int>();
+                        int wordCount = snap.Length;
+                        for (int w = 0; w < wordCount; w++)
+                        {
+                            uint word = snap[w];
+                            while (word != 0)
+                            {
+                                uint lsb = word & (uint)(-(int)word);
+                                int bit = 0;
+                                if ((lsb & 0xFFFF0000u) != 0) bit += 16;
+                                if ((lsb & 0xFF00FF00u) != 0) bit += 8;
+                                if ((lsb & 0xF0F0F0F0u) != 0) bit += 4;
+                                if ((lsb & 0xCCCCCCCCu) != 0) bit += 2;
+                                if ((lsb & 0xAAAAAAAAu) != 0) bit += 1;
+                                indices.Add(w * 32 + bit);
+                                word &= word - 1;
+                            }
+                        }
+
+                        var entry = new GaussianSplatMask.Entry
+                        {
+                            label = $"Selection {mask.entries.Count}",
+                            weight = gs.m_MaskT,
+                            selection = new GaussianSplatMask.Selection { splatIndices = indices.ToArray() }
+                        };
+                        Undo.RecordObject(mask, "Add Mask Entry");
+                        mask.entries.Add(entry);
+                        EditorUtility.SetDirty(mask);
+                        AssetDatabase.SaveAssets();
                     }
                 }
             }

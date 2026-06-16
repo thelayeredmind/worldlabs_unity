@@ -295,6 +295,10 @@ namespace GaussianSplatting.Runtime
 
         public GaussianCutout[] m_Cutouts;
 
+        [Header("Mask")]
+        public GaussianSplatMask m_Mask;
+        [Range(0f, 1f)] public float m_MaskT = 0f;
+
         public Shader m_ShaderSplats;
         public Shader m_ShaderComposite;
         public Shader m_ShaderDebugPoints;
@@ -333,6 +337,8 @@ namespace GaussianSplatting.Runtime
         internal Matrix4x4 m_centerCamMatrix;
         public bool m_OptimizeForQuest;
 
+
+        GraphicsBuffer m_GpuMaskWeights; // per-splat float, evaluated from m_Mask at m_MaskT
 
         // these buffers are only for splat editing, and are lazily created
         GraphicsBuffer m_GpuEditCutouts;
@@ -414,6 +420,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int DeleteSelectionCenter = Shader.PropertyToID("_DeleteSelectionCenter");
             public static readonly int DeleteSelectionExtents = Shader.PropertyToID("_DeleteSelectionExtents");
             public static readonly int SplatDeletedBitsRW = Shader.PropertyToID("_SplatDeletedBitsRW");
+            public static readonly int SplatMaskWeights = Shader.PropertyToID("_SplatMaskWeights");
+            public static readonly int SplatMaskValid = Shader.PropertyToID("_SplatMaskValid");
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -959,6 +967,10 @@ namespace GaussianSplatting.Runtime
             UpdateCutoutsBuffer();
             cmb.SetComputeIntParam(cs, Props.SplatCutoutsCount, m_Cutouts?.Length ?? 0);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatCutouts, m_GpuEditCutouts);
+
+            UpdateMaskBuffer();
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatMaskWeights, m_GpuMaskWeights ?? (HasExternalBuffers ? m_ExternalPos : m_GpuPosData));
+            cmb.SetComputeIntParam(cs, Props.SplatMaskValid, m_GpuMaskWeights != null ? 1 : 0);
         }
 
         public static Texture2D CreateColorTextureForMorph(Unity.Collections.NativeArray<byte> colorDataArr, GaussianSplatAsset.ColorFormat colorFormat, int splatCount)
@@ -1006,6 +1018,8 @@ namespace GaussianSplatting.Runtime
             mat.SetInteger(Props.SplatCount,       HasExternalBuffers ? m_ExternalSplatCount : m_SplatCount);
             mat.SetInteger(Props.SplatChunkCount,  m_GpuChunksValid ? m_GpuChunks.count : 0);
             mat.SetInteger(Props.OptimizeForQuest, m_OptimizeForQuest ? 1 : 0);
+            mat.SetBuffer(Props.SplatMaskWeights, m_GpuMaskWeights ?? activePos);
+            mat.SetInt(Props.SplatMaskValid, m_GpuMaskWeights != null ? 1 : 0);
         }
 
         static void DisposeBuffer(ref GraphicsBuffer buf)
@@ -1041,6 +1055,7 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuEditDeleted);
             DisposeBuffer(ref m_GpuEditCountsBounds);
             DisposeBuffer(ref m_GpuEditCutouts);
+            DisposeBuffer(ref m_GpuMaskWeights);
 
             m_Sorter?.DisposeResources();
 
@@ -1396,6 +1411,51 @@ namespace GaussianSplatting.Runtime
 
             m_GpuEditCutouts.SetData(data);
             data.Dispose();
+        }
+
+        void UpdateMaskBuffer()
+        {
+            if (m_Mask == null || m_SplatCount == 0 || m_Mask.entries == null || m_Mask.entries.Count == 0)
+            {
+                DisposeBuffer(ref m_GpuMaskWeights);
+                return;
+            }
+
+            if (m_GpuMaskWeights == null || m_GpuMaskWeights.count != m_SplatCount)
+            {
+                DisposeBuffer(ref m_GpuMaskWeights);
+                m_GpuMaskWeights = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, sizeof(float)) { name = "GaussianMaskWeights" };
+            }
+
+            // Evaluate mask at m_MaskT: find the two bracketing entries and lerp splat visibility.
+            var entries = m_Mask.entries;
+            var weights = new float[m_SplatCount];
+
+            if (entries == null || entries.Count == 0)
+            {
+                m_GpuMaskWeights.SetData(weights);
+                return;
+            }
+
+            // Sort entries by weight ascending (non-destructive).
+            var sorted = new System.Collections.Generic.List<GaussianSplatMask.Entry>(entries);
+            sorted.Sort((a, b) => a.weight.CompareTo(b.weight));
+
+            // Apply each entry whose weight <= m_MaskT, blending the last partial entry.
+            foreach (var entry in sorted)
+            {
+                if (entry.selection?.splatIndices == null) continue;
+                float entryContrib = Mathf.Clamp01(m_MaskT >= entry.weight ? 1f :
+                    (sorted.IndexOf(entry) == 0 ? 0f :
+                    Mathf.InverseLerp(sorted[sorted.IndexOf(entry) - 1].weight, entry.weight, m_MaskT)));
+                foreach (var idx in entry.selection.splatIndices)
+                {
+                    if (idx >= 0 && idx < m_SplatCount)
+                        weights[idx] = Mathf.Max(weights[idx], entryContrib);
+                }
+            }
+
+            m_GpuMaskWeights.SetData(weights);
         }
 
         bool EnsureEditingBuffers()

@@ -42,6 +42,7 @@ struct v2f
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
     float4 vertex : SV_POSITION;
+    uint splatIdx : TEXCOORD1;
 };
 
 StructuredBuffer<SplatViewData> _SplatViewData;
@@ -51,6 +52,8 @@ uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 uint _SceneDepthOcclusionEnabled;
 float2 _GaussianRTSize;
+StructuredBuffer<float> _SplatMaskWeights;
+uint _SplatMaskValid;
 
 Texture2D _CameraDepthTexture;
 SamplerState sampler_point_clamp;
@@ -59,6 +62,7 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
 	v2f o = (v2f)0;
     instID = _OrderBuffer[instID];
+	o.splatIdx = instID;
 
 	SplatViewData view = _SplatViewData[instID];
 
@@ -157,6 +161,9 @@ half4 frag (v2f i) : SV_Target
 		}
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
+
+	if (_SplatMaskValid)
+		alpha *= _SplatMaskWeights[i.splatIdx];
 
     if (alpha < _AlphaDiscardThreshold)
         discard;
@@ -416,6 +423,7 @@ struct v2f
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
     float4 vertex : SV_POSITION;
+    uint splatIdx : TEXCOORD1;
 };
 
 StructuredBuffer<SplatViewData> _SplatViewData;
@@ -424,6 +432,8 @@ uint _SplatBitsValid;
 uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 float _ProximityDepthRange;
+StructuredBuffer<float> _SplatMaskWeights;
+uint _SplatMaskValid;
 
 Texture2D<float> _GaussianPrepassDepth;
 
@@ -431,6 +441,7 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
 	v2f o = (v2f)0;
     instID = _OrderBuffer[instID];
+	o.splatIdx = instID;
 
 	SplatViewData view = _SplatViewData[instID];
 
@@ -527,6 +538,9 @@ half4 frag (v2f i) : SV_Target
 		}
 		i.col.rgb = lerp(i.col.rgb, selectedColor, 0.5);
 	}
+
+	if (_SplatMaskValid)
+		alpha *= _SplatMaskWeights[i.splatIdx];
 
 	// Tight quads mean alpha is always >= threshold here; no discard needed.
     return half4(i.col.rgb * alpha, alpha);
