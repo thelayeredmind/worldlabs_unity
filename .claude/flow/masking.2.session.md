@@ -27,3 +27,25 @@
 [/Task]
 
 [^] Continue masking. Last: review clean — click-to-snap + selection load + hover feedback all working. Next: drift or wrap-up. Confirm: none.
+
+[Task] Shift+click on keyframe dot unions that entry's selection with the current GPU selection
+
+[S] Shift+click dot: union entry bitmask into existing GPU selection via bitwise OR
+
+[R] Shift+click dot unions selection — working
+[/S]
+[/Task]
+
+[F] "Hold on, busy..." on entry delete = Unity reimporting a large int[] from the ScriptableObject. Not a code loop — pure serialization cost.
+
+[D] Fix: move int[] splatIndices out of SO into a hidden sub-asset (TextAsset binary). SO stays lean; reimport is instant. Migrate on load via OnAfterDeserialize.
+
+[Task] Store GaussianSplatMask selection data as binary sub-assets to eliminate reimport stall on delete
+
+[S] Replace int[] splatIndices in Entry with a TextAsset sub-asset reference; write/read raw bytes; migrate existing assets on load
+
+[R] Delete entry caused "Hold on, busy..." stall → root cause: large int[] in ScriptableObject triggers full AssetDatabase reimport on every mutation → fixed: moved indices to GaussianSplatMaskData hidden sub-asset (byte[]); SO stays lean; OnAfterDeserialize populates runtime int[] from bytes; legacy field kept for migration
+[/S]
+[/Task]
+
+[^] Continue masking. Last: review clean — binary sub-asset storage working, delete is fast. Next: drift or wrap-up. Confirm: none.

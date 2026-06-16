@@ -339,6 +339,10 @@ namespace GaussianSplatting.Runtime
 
 
         GraphicsBuffer m_GpuMaskWeights; // per-splat float, evaluated from m_Mask at m_MaskT
+        bool m_MaskDirty = true;
+        GaussianSplatMask m_MaskPrev;
+        float m_MaskTPrev = -1f;
+        int m_MaskEntryCountPrev = -1;
 
         // these buffers are only for splat editing, and are lazily created
         GraphicsBuffer m_GpuEditCutouts;
@@ -1235,7 +1239,19 @@ namespace GaussianSplatting.Runtime
                 m_centerCamMatrix = m_centerEyeCamera.worldToCameraMatrix;
             }
 
-            UpdateMaskBuffer();
+            int entryCount = m_Mask?.entries?.Count ?? 0;
+            if (m_Mask != m_MaskPrev || m_MaskT != m_MaskTPrev || entryCount != m_MaskEntryCountPrev)
+            {
+                m_MaskDirty = true;
+                m_MaskPrev = m_Mask;
+                m_MaskTPrev = m_MaskT;
+                m_MaskEntryCountPrev = entryCount;
+            }
+            if (m_MaskDirty)
+            {
+                UpdateMaskBuffer();
+                m_MaskDirty = false;
+            }
         }
 
         // Camera.main is a runtime concept and is frequently null in edit mode (no active MainCamera
@@ -1414,6 +1430,8 @@ namespace GaussianSplatting.Runtime
             data.Dispose();
         }
 
+        public void SetMaskDirty() => m_MaskDirty = true;
+
         void UpdateMaskBuffer()
         {
             if (m_Mask == null || m_SplatCount == 0)
@@ -1441,7 +1459,7 @@ namespace GaussianSplatting.Runtime
             // Sort entries by weight ascending (non-destructive, guarded against nulls).
             var sorted = new System.Collections.Generic.List<GaussianSplatMask.Entry>();
             foreach (var e in m_Mask.entries)
-                if (e != null && e.selection?.splatIndices != null) sorted.Add(e);
+                if (e != null && e.splatIndices != null) sorted.Add(e);
             sorted.Sort((a, b) => a.weight.CompareTo(b.weight));
 
             if (sorted.Count == 0)
@@ -1468,15 +1486,14 @@ namespace GaussianSplatting.Runtime
             {
                 // Before first entry: lerp from all-zero to first entry's set.
                 float t = Mathf.InverseLerp(0f, sorted[hi].weight, m_MaskT);
-                foreach (var idx in sorted[hi].selection.splatIndices)
+                foreach (var idx in sorted[hi].splatIndices)
                     if (idx >= 0 && idx < m_SplatCount) weights[idx] = t;
             }
             else if (lo >= 0 && hi < 0)
             {
                 // After last entry: lerp from last entry's set to all-ones.
                 float t = Mathf.InverseLerp(sorted[lo].weight, 1f, m_MaskT);
-                // Start with last entry's splats fully visible, fill remainder by t.
-                foreach (var idx in sorted[lo].selection.splatIndices)
+                foreach (var idx in sorted[lo].splatIndices)
                     if (idx >= 0 && idx < m_SplatCount) weights[idx] = 1f;
                 for (int i = 0; i < m_SplatCount; i++)
                     weights[i] = Mathf.Lerp(weights[i], 1f, t);
@@ -1484,7 +1501,7 @@ namespace GaussianSplatting.Runtime
             else if (lo == hi)
             {
                 // Exactly on an entry.
-                foreach (var idx in sorted[lo].selection.splatIndices)
+                foreach (var idx in sorted[lo].splatIndices)
                     if (idx >= 0 && idx < m_SplatCount) weights[idx] = 1f;
             }
             else
@@ -1493,9 +1510,9 @@ namespace GaussianSplatting.Runtime
                 float t = Mathf.InverseLerp(sorted[lo].weight, sorted[hi].weight, m_MaskT);
                 var loWeights = new float[m_SplatCount];
                 var hiWeights = new float[m_SplatCount];
-                foreach (var idx in sorted[lo].selection.splatIndices)
+                foreach (var idx in sorted[lo].splatIndices)
                     if (idx >= 0 && idx < m_SplatCount) loWeights[idx] = 1f;
-                foreach (var idx in sorted[hi].selection.splatIndices)
+                foreach (var idx in sorted[hi].splatIndices)
                     if (idx >= 0 && idx < m_SplatCount) hiWeights[idx] = 1f;
                 for (int i = 0; i < m_SplatCount; i++)
                     weights[i] = Mathf.Lerp(loWeights[i], hiWeights[i], t);

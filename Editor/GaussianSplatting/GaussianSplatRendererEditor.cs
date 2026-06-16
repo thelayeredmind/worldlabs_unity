@@ -52,6 +52,7 @@ namespace GaussianSplatting.Editor
         int m_CameraIndex = 0;
 
         bool m_ExportBakeTransform;
+        bool m_AnyDotHovered;
         float m_DeleteDensity = 1f;
         float m_DeleteHardness = 1f;
 
@@ -149,6 +150,28 @@ namespace GaussianSplatting.Editor
             Debug.Log("[Gaussian Splatting] Resources auto-assigned successfully.");
         }
 
+        // Writes indices into a GaussianSplatMaskData sub-asset, replacing any existing one for this entry.
+        static void WriteEntryData(GaussianSplatMask mask, GaussianSplatMask.Entry entry, int[] indices)
+        {
+            string maskPath = AssetDatabase.GetAssetPath(mask);
+
+            if (entry.dataAsset != null)
+            {
+                AssetDatabase.RemoveObjectFromAsset(entry.dataAsset);
+                entry.dataAsset = null;
+            }
+
+            var dataObj = ScriptableObject.CreateInstance<GaussianSplatMaskData>();
+            dataObj.name = $"_{entry.label}_{entry.weight:F3}";
+            dataObj.hideFlags = HideFlags.HideInHierarchy;
+            dataObj.bytes = GaussianSplatMask.IndicesToBytes(indices);
+            AssetDatabase.AddObjectToAsset(dataObj, maskPath);
+
+            entry.dataAsset = dataObj;
+            entry.splatIndices = indices;
+            entry.legacySplatIndices = null;
+        }
+
         static Texture2D s_DotTexture;
 
         static Texture2D GetDotTexture()
@@ -200,18 +223,23 @@ namespace GaussianSplatting.Editor
                     gs.m_MaskT = entry.weight;
                     EditorUtility.SetDirty(gs);
 
-                    gs.EditDeselectAll();
-                    var indices = entry.selection?.splatIndices;
+                    var indices = entry.splatIndices;
                     if (indices != null && indices.Length > 0)
                     {
                         int wordCount = (gs.splatCount + 31) / 32;
-                        var bits = new uint[wordCount];
+                        var bits = evt.shift ? (gs.SnapshotSelectedBits() ?? new uint[wordCount]) : new uint[wordCount];
+                        if (bits.Length != wordCount) { var b2 = new uint[wordCount]; bits.CopyTo(b2, 0); bits = b2; }
                         foreach (int idx in indices)
                         {
                             if (idx >= 0 && idx < gs.splatCount)
                                 bits[idx >> 5] |= 1u << (idx & 31);
                         }
+                        gs.EditDeselectAll(); // ensures GPU buffer exists
                         gs.RestoreSelectedBits(bits);
+                    }
+                    else if (!evt.shift)
+                    {
+                        gs.EditDeselectAll();
                     }
                     gs.UpdateEditCountsAndBounds();
                     ToolManager.SetActiveContext<GaussianToolContext>();
@@ -239,7 +267,7 @@ namespace GaussianSplatting.Editor
 
             if (evt.type == EventType.MouseMove || evt.type == EventType.Repaint)
             {
-                bool needsRepaint = false;
+                bool anyHovered = false;
                 var dot = GetDotTexture();
                 var prevColor = GUI.color;
                 foreach (var entry in mask.entries)
@@ -248,7 +276,7 @@ namespace GaussianSplatting.Editor
                     float cx = trackX + entry.weight * trackW;
                     var hitRect = new Rect(cx - dotR * 2f, trackY - dotR * 2f, dotR * 4f, dotR * 4f);
                     bool hovered = hitRect.Contains(evt.mousePosition);
-                    if (evt.type == EventType.MouseMove) { needsRepaint = true; }
+                    if (hovered) anyHovered = true;
                     if (evt.type == EventType.Repaint)
                     {
                         float r = hovered ? dotR * 1.4f : dotR;
@@ -258,7 +286,12 @@ namespace GaussianSplatting.Editor
                     }
                 }
                 GUI.color = prevColor;
-                if (needsRepaint) RepaintAll();
+                // Only repaint when hover state changes to avoid triggering a continuous repaint loop.
+                if (evt.type == EventType.MouseMove && anyHovered != m_AnyDotHovered)
+                {
+                    m_AnyDotHovered = anyHovered;
+                    Repaint();
+                }
             }
         }
 
@@ -625,16 +658,37 @@ namespace GaussianSplatting.Editor
                             }
                         }
 
-                        var entry = new GaussianSplatMask.Entry
+                        var newIndices = indices.ToArray();
+                        var existing = mask.entries.Find(e => e != null && Mathf.Abs(e.weight - gs.m_MaskT) < 0.001f);
+                        if (existing != null)
                         {
-                            label = $"Selection {mask.entries.Count}",
-                            weight = gs.m_MaskT,
-                            selection = new GaussianSplatMask.Selection { splatIndices = indices.ToArray() }
-                        };
-                        Undo.RecordObject(mask, "Add Mask Entry");
-                        mask.entries.Add(entry);
-                        EditorUtility.SetDirty(mask);
-                        AssetDatabase.SaveAssets();
+                            bool replace = EditorUtility.DisplayDialog(
+                                "Replace Mask Entry?",
+                                $"An entry \"{existing.label}\" already exists at weight {existing.weight:F3}. Replace its selection?",
+                                "Replace", "Cancel");
+                            if (replace)
+                            {
+                                Undo.RecordObject(mask, "Replace Mask Entry");
+                                WriteEntryData(mask, existing, newIndices);
+                                EditorUtility.SetDirty(mask);
+                                AssetDatabase.SaveAssets();
+                                gs.SetMaskDirty();
+                            }
+                        }
+                        else
+                        {
+                            var entry = new GaussianSplatMask.Entry
+                            {
+                                label = $"Selection {mask.entries.Count}",
+                                weight = gs.m_MaskT,
+                            };
+                            Undo.RecordObject(mask, "Add Mask Entry");
+                            mask.entries.Add(entry);
+                            WriteEntryData(mask, entry, newIndices);
+                            EditorUtility.SetDirty(mask);
+                            AssetDatabase.SaveAssets();
+                            gs.SetMaskDirty();
+                        }
                     }
                 }
             }
