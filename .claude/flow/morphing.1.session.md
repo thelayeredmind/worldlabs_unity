@@ -52,4 +52,7 @@ Ready to wind up.
 [C] ResolveRemainderByNearestNeighbor (CPU NearestIndex loop) replaced with ResolveRemainderOnGpu — dispatches leftover-vs-full-opposite-set search through the same ICorrespondenceDispatcher.FindBestMatches used by the round loop, reusing its existing main-thread GPU marshalling (MainThreadDispatcher in the window) — same call pattern as the existing round loop at line 97-98, no new threading risk.
 [/S]
 [/Task]
-[^] Continue morphing. Last: review clean — user confirmed "it works" after GPU-dispatched remainder fix (no more 85% hang, no more stale Debug Points splats). Next: drift or wrap-up. Confirm: none.
+[CKP] User committed — "fix: guarantee morph output splat count never exceeds max(left,right) splat count" — GPU-dispatched remainder resolution.
+[^] Continue morphing. Last: wrap-up complete — context.md written (corrected per user: correspondence is offline due to Quest runtime cost, not splat-count mismatch), CLAUDE.md updated with GPU-dispatch-over-CPU-loop convention.
+
+--- CLOSED 2026-06-19 — added inspector second-creation-path button for Morph Map Builder; fixed morph output splat-count invariant via GPU-dispatched remainder resolution ---

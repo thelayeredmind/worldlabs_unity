@@ -27,6 +27,7 @@ The following exist in this fork but not in upstream Aras or the reference branc
 - Quest-specific settings should be documented with `// Quest: <value>` in tooltips as the reference branch does
 - Do not add editor-only code paths (`#if UNITY_EDITOR`) to the GPU hot path
 - Keep WorldLabs package includes using the full package path: `Packages/com.worldlabs.gaussian-splatting/Shaders/...`
+- When adding a per-splat distance/correspondence search (editor tooling, not the runtime hot path), dispatch it through the existing GPU compute path (e.g. `ICorrespondenceDispatcher`/`SplatCorrespondence.compute`) rather than a CPU loop — the same O(n·m) search done serially on CPU is orders of magnitude slower at real asset scale (100k–2M+ splats) and can look indistinguishable from a hang
 
 ---
 
