@@ -114,6 +114,19 @@ namespace GaussianSplatting.Editor
                 progress?.Report(0.05f + 0.8f * (round + 1) / kMaxMatchRounds);
             }
 
+            // Collisions left over after the round cap (or a stalled round) can leave splats
+            // unmatched on both sides simultaneously, which inflates the morph's total splat
+            // count past max(nL, nR). Strict 1:1 uniqueness isn't required for morphing — only
+            // that every splat has somewhere to move toward — so leftovers are resolved by a
+            // nearest-neighbor lookup against the full opposite set (matched or not), duplicates
+            // allowed, guaranteeing matchedCount >= min(nL, nR). Dispatched on the GPU via the
+            // same ICorrespondenceDispatcher as the round loop — a CPU brute-force here is the
+            // same O(n*m) distance search as SplatCorrespondence.compute's FindBestMatch kernel,
+            // just serial instead of massively parallel, and grinds for minutes at real asset
+            // scale (100k-2M+ splats) instead of completing promptly.
+            ResolveRemainderOnGpu(posL, posR, colL, colR, dispatcher, posWeight, colorWeight,
+                ref remainingL, ref remainingR, pairs, ct);
+
             progress?.Report(1f);
 
             return new Result
@@ -122,6 +135,48 @@ namespace GaussianSplatting.Editor
                 unmatchedLeft  = remainingL,
                 unmatchedRight = remainingR,
             };
+        }
+
+        /// <summary>
+        /// Resolves splats still unmatched on both sides after the round loop. Unlike the main
+        /// matching pass, this does not enforce one-to-one uniqueness — each leftover splat is
+        /// paired with its nearest neighbor in the full opposite set (matched splats included),
+        /// so a destination splat may end up claimed by several leftover splats. That is fine for
+        /// morphing purposes: the goal is that every splat converges to some position, not that
+        /// every pairing is exclusive. The search is dispatched on the GPU (same kernel/weights as
+        /// the round loop) since it is the same O(n*m) distance search as the main matching pass —
+        /// running it on CPU instead would be orders of magnitude slower at real asset scale.
+        /// </summary>
+        static void ResolveRemainderOnGpu(
+            Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
+            ICorrespondenceDispatcher dispatcher, float posWeight, float colWeight,
+            ref int[] remainingL, ref int[] remainingR,
+            List<int2> pairs, CancellationToken ct)
+        {
+            if (remainingL.Length > 0 && posR.Length > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+                var subPosL = remainingL.Select(i => posL[i]).ToArray();
+                var subColL = remainingL.Select(i => colL[i]).ToArray();
+                dispatcher.FindBestMatches(subPosL, subColL, posR, colR, posWeight, colWeight,
+                    out int[] bestMatch, out _);
+                for (int i = 0; i < remainingL.Length; i++)
+                    pairs.Add(new int2(remainingL[i], bestMatch[i]));
+            }
+
+            if (remainingR.Length > 0 && posL.Length > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+                var subPosR = remainingR.Select(j => posR[j]).ToArray();
+                var subColR = remainingR.Select(j => colR[j]).ToArray();
+                dispatcher.FindBestMatches(subPosR, subColR, posL, colL, posWeight, colWeight,
+                    out int[] bestMatch, out _);
+                for (int j = 0; j < remainingR.Length; j++)
+                    pairs.Add(new int2(bestMatch[j], remainingR[j]));
+            }
+
+            remainingL = Array.Empty<int>();
+            remainingR = Array.Empty<int>();
         }
 
         // ── Duplicate resolution ──────────────────────────────────────────────
