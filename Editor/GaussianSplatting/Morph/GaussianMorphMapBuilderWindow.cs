@@ -43,10 +43,16 @@ namespace GaussianSplatting.Editor
         ManualResetEventSlim m_GpuDone;
 
         [MenuItem(kMenuPath)]
-        public static void Open()
+        public static void Open() => OpenWindow(null, null);
+
+        public static void Open(GaussianSplatAsset left, GaussianSplatAsset right) => OpenWindow(left, right);
+
+        static void OpenWindow(GaussianSplatAsset left, GaussianSplatAsset right)
         {
             var w = GetWindowWithRect<GaussianMorphMapBuilderWindow>(new Rect(50, 50, 400, 260), false, "Morph Map Builder", true);
             w.minSize = new Vector2(360, 240);
+            w.m_AssetLeft  = left;
+            w.m_AssetRight = right;
             w.Show();
         }
 

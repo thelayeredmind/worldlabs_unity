@@ -56,6 +56,13 @@ namespace GaussianSplatting.Editor
                 GUILayout.FlexibleSpace();
             }
 
+            EditorGUILayout.Space(2);
+            using (new EditorGUI.DisabledScope(morpher.assetLeft == null || morpher.assetRight == null))
+            {
+                if (GUILayout.Button("Build Morph Map…"))
+                    GaussianMorphMapBuilderWindow.Open(morpher.assetLeft, morpher.assetRight);
+            }
+
             EditorGUILayout.Space(4);
 
             // ── MorphMap ─────────────────────────────────────────────────────
