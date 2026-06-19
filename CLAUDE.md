@@ -28,6 +28,7 @@ The following exist in this fork but not in upstream Aras or the reference branc
 - Do not add editor-only code paths (`#if UNITY_EDITOR`) to the GPU hot path
 - Keep WorldLabs package includes using the full package path: `Packages/com.worldlabs.gaussian-splatting/Shaders/...`
 - When adding a per-splat distance/correspondence search (editor tooling, not the runtime hot path), dispatch it through the existing GPU compute path (e.g. `ICorrespondenceDispatcher`/`SplatCorrespondence.compute`) rather than a CPU loop — the same O(n·m) search done serially on CPU is orders of magnitude slower at real asset scale (100k–2M+ splats) and can look indistinguishable from a hang
+- When verifying GPU buffer state, compile errors, or runtime asset state in this package, use the Unity MCP tools (`unity_execute_code`, `unity_get_compilation_errors`) against the live editor instance instead of relying on visual judgment alone — has caught stride/buffer-size mismatches and ambiguous-reference compile errors that weren't visible from the editor UI
 
 ---
 
