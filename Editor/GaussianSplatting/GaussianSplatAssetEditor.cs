@@ -92,7 +92,7 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.FloatField(kv.Value);
                 EditorGUILayout.EndHorizontal();
             }
-            
+
             EditorGUILayout.Space();
             EditorGUILayout.TextField("Data Hash", gs.dataHash.ToString());
         }

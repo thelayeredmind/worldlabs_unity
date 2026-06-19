@@ -6,7 +6,6 @@ using UnityEngine;
 
 namespace GaussianSplatting.Runtime
 {
-    [CreateAssetMenu(fileName = "GaussianSplatMask", menuName = "Gaussian Splat/Splat Mask")]
     public class GaussianSplatMask : ScriptableObject, ISerializationCallbackReceiver
     {
         [Serializable]

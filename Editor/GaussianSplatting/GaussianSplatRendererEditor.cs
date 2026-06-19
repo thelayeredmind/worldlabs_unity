@@ -150,6 +150,57 @@ namespace GaussianSplatting.Editor
             Debug.Log("[Gaussian Splatting] Resources auto-assigned successfully.");
         }
 
+        // Creates a GaussianSplatMask as a sub-asset of the given GaussianSplatAsset.
+        static GaussianSplatMask CreateMaskSubAsset(GaussianSplatAsset gs, string maskName)
+        {
+            string assetPath = AssetDatabase.GetAssetPath(gs);
+            if (string.IsNullOrEmpty(assetPath))
+                return null;
+
+            var mask = ScriptableObject.CreateInstance<GaussianSplatMask>();
+            mask.name = maskName;
+
+            AssetDatabase.AddObjectToAsset(mask, assetPath);
+            AssetDatabase.SaveAssets();
+            return mask;
+        }
+
+        class CreateMaskNamePrompt : EditorWindow
+        {
+            string m_Name = "Mask";
+            Action<string> m_OnCreate;
+
+            public static void Show(Action<string> onCreate)
+            {
+                var wnd = CreateInstance<CreateMaskNamePrompt>();
+                wnd.m_OnCreate = onCreate;
+                wnd.titleContent = new GUIContent("Create Mask");
+                wnd.minSize = wnd.maxSize = new Vector2(300, 80);
+                wnd.ShowUtility();
+            }
+
+            void OnGUI()
+            {
+                GUI.SetNextControlName("MaskNameField");
+                m_Name = EditorGUILayout.TextField("Name", m_Name);
+                GUI.FocusControl("MaskNameField");
+
+                EditorGUILayout.Space();
+                EditorGUILayout.BeginHorizontal();
+                if (GUILayout.Button("Cancel"))
+                    Close();
+                using (new EditorGUI.DisabledScope(string.IsNullOrWhiteSpace(m_Name)))
+                {
+                    if (GUILayout.Button("Create"))
+                    {
+                        m_OnCreate(m_Name);
+                        Close();
+                    }
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+        }
+
         // Writes indices into a GaussianSplatMaskData sub-asset, replacing any existing one for this entry.
         static void WriteEntryData(GaussianSplatMask mask, GaussianSplatMask.Entry entry, int[] indices)
         {
@@ -616,6 +667,20 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.Space();
             GUILayout.Label("Mask", EditorStyles.boldLabel);
             EditorGUILayout.PropertyField(m_PropMask);
+            using (new EditorGUI.DisabledScope(gs.asset == null))
+            {
+                if (GUILayout.Button("Create Mask"))
+                {
+                    var gsRef = gs;
+                    CreateMaskNamePrompt.Show(name =>
+                    {
+                        var mask = CreateMaskSubAsset(gsRef.asset, name);
+                        Undo.RecordObject(gsRef, "Create Mask");
+                        gsRef.m_Mask = mask;
+                        serializedObject.Update();
+                    });
+                }
+            }
             DrawMaskTSliderWithKeyframes(gs);
 
             using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
@@ -623,17 +688,11 @@ namespace GaussianSplatting.Editor
                 if (GUILayout.Button("Save Selection as Mask Entry"))
                 {
                     var mask = gs.m_Mask;
-                    if (mask == null)
+                    if (mask == null && gs.asset != null)
                     {
-                        string path = EditorUtility.SaveFilePanelInProject(
-                            "Save Splat Mask", "SplatMask", "asset", "Choose location for new GaussianSplatMask asset");
-                        if (!string.IsNullOrEmpty(path))
-                        {
-                            mask = ScriptableObject.CreateInstance<GaussianSplatMask>();
-                            AssetDatabase.CreateAsset(mask, path);
-                            gs.m_Mask = mask;
-                            serializedObject.Update();
-                        }
+                        mask = CreateMaskSubAsset(gs.asset, "Mask");
+                        gs.m_Mask = mask;
+                        serializedObject.Update();
                     }
 
                     if (mask != null)
