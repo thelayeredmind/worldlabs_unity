@@ -345,6 +345,10 @@ uint _SplatFormat;
 #define VECTOR_FMT_16 1
 #define VECTOR_FMT_11 2
 #define VECTOR_FMT_6 3
+// Morph output only (never an asset import format): Norm6 bit layout, but written
+// 4-byte-aligned per splat by SplatMorph.compute (OUT_OTHER_STRIDE) instead of the
+// tightly-packed 2-byte stride real Norm6 assets use. Same decode, different stride.
+#define VECTOR_FMT_6_PADDED 4
 
 uint LoadUShort(SplatBufferDataType dataBuffer, uint addrU)
 {
@@ -406,7 +410,7 @@ float3 LoadAndDecodeVector(SplatBufferDataType dataBuffer, uint addrU, uint fmt)
         }
         res = DecodePacked_11_10_11(val0);
     }
-    else if (fmt == VECTOR_FMT_6)
+    else if (fmt == VECTOR_FMT_6 || fmt == VECTOR_FMT_6_PADDED)
     {
         if (addrU != addrA)
             val0 >>= 16;
@@ -468,6 +472,8 @@ SplatData LoadSplatData(uint idx)
         otherStride += 4;
     else if (scaleFmt == VECTOR_FMT_6)
         otherStride += 2;
+    else if (scaleFmt == VECTOR_FMT_6_PADDED)
+        otherStride += 4;
     if (shFormat > VECTOR_FMT_6)
         otherStride += 2;
     uint otherAddr = idx * otherStride;

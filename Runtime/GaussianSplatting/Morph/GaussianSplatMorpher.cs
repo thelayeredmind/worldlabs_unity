@@ -265,10 +265,23 @@ namespace GaussianSplatting.Runtime
                 if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] blend t={m_T:F2} matched={m_MatchedCount} total={m_TotalMorphCount} outPos={m_BufOutPos != null} outChunk={m_BufOutChunk != null} shader={m_MorphShader != null}");
                 DispatchMorph();
                 if (Time.frameCount % 60 == 0) RequestPosReadback();
+
+                // The morph kernels always write position as Norm11 and scale as Norm6-padded
+                // (GaussianSplatting.hlsl's VECTOR_FMT_6_PADDED — same bit layout as Norm6, but
+                // 4-byte-aligned per splat per SplatMorph.compute's OUT_OTHER_STRIDE, not the
+                // tightly-packed 2-byte stride real Norm6 assets use), regardless of the source
+                // assets' formats. Declare both explicitly instead of passing through
+                // m_SplatFormat, which still carries asset Left's source pos/scale formats and
+                // would make the renderer decode the output with the wrong stride.
+                const uint kVectorFmtNorm11 = 2;
+                const uint kVectorFmtNorm6Padded = 4; // not a GaussianSplatAsset.VectorFormat value — morph-output-only, see VECTOR_FMT_6_PADDED
+                uint outSplatFormat = kVectorFmtNorm11
+                    | (kVectorFmtNorm6Padded << 8)
+                    | (m_SplatFormat & 0xFF0000u); // SH format passthrough from asset Left
                 m_Renderer.SetExternalBuffers(
                     m_BufOutPos, m_BufOutOther, m_BufOutSH, m_TexOutColor,
                     m_BufOutChunk, m_BufOutChunk != null,
-                    m_TotalMorphCount, m_SplatFormat);
+                    m_TotalMorphCount, outSplatFormat);
             }
         }
 
@@ -291,8 +304,11 @@ namespace GaussianSplatting.Runtime
             m_MorphShader.SetBuffer(k,  "_OutSH",    m_BufOutSH);
             m_MorphShader.SetTexture(k, "_OutColor", m_TexOutColor);
 
-            if (m_BufChunksA != null) m_MorphShader.SetBuffer(k, "_ChunksA", m_BufChunksA);
-            if (m_BufChunksB != null) m_MorphShader.SetBuffer(k, "_ChunksB", m_BufChunksB);
+            // _ChunksA/_ChunksB must always have something bound — the kernel's chunkCount==0
+            // guard means an uncompressed asset's dummy binding is never actually read, but
+            // Unity's compute shader validation still requires every declared resource bound.
+            m_MorphShader.SetBuffer(k, "_ChunksA", m_BufChunksA != null ? m_BufChunksA : m_BufPosA);
+            m_MorphShader.SetBuffer(k, "_ChunksB", m_BufChunksB != null ? m_BufChunksB : m_BufPosB);
 
             // Ceiling division — integer truncation drops the last partial chunk, leaving tail splats undechunked.
             int chunkCountA = m_BufChunksA != null ? (m_AssetLeft.splatCount  + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize : 0;
@@ -327,7 +343,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetBuffer(kA, "_OutOther", m_BufOutOther);
                 m_MorphShader.SetBuffer(kA, "_OutSH",    m_BufOutSH);
                 m_MorphShader.SetTexture(kA,"_OutColor", m_TexOutColor);
-                if (m_BufChunksA != null) m_MorphShader.SetBuffer(kA, "_ChunksA", m_BufChunksA);
+                m_MorphShader.SetBuffer(kA, "_ChunksA", m_BufChunksA != null ? m_BufChunksA : m_BufPosA);
                 m_MorphShader.SetInt("_ChunkCountA",  chunkCountA);
                 m_MorphShader.SetInt("_UnmatchedCount",  m_UnmatchedLeftCount);
                 m_MorphShader.SetInt("_OutOffset",       m_MatchedCount);
@@ -353,7 +369,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetBuffer(kB, "_OutOther", m_BufOutOther);
                 m_MorphShader.SetBuffer(kB, "_OutSH",    m_BufOutSH);
                 m_MorphShader.SetTexture(kB,"_OutColor", m_TexOutColor);
-                if (m_BufChunksB != null) m_MorphShader.SetBuffer(kB, "_ChunksB", m_BufChunksB);
+                m_MorphShader.SetBuffer(kB, "_ChunksB", m_BufChunksB != null ? m_BufChunksB : m_BufPosB);
                 m_MorphShader.SetInt("_ChunkCountB",     chunkCountB);
                 m_MorphShader.SetInt("_UnmatchedCount",  m_UnmatchedRightCount);
                 m_MorphShader.SetInt("_OutOffset",       m_MatchedCount + m_UnmatchedLeftCount);
@@ -410,7 +426,14 @@ namespace GaussianSplatting.Runtime
         void AccumulateAssetBounds(GaussianSplatAsset asset)
         {
             var layer = asset.LayerData[0];
-            if (layer.m_ChunkData == null) return;
+            if (layer.m_ChunkData == null)
+            {
+                // Uncompressed assets have no per-chunk bounds to read — fall back to the
+                // asset-level bounds computed at import time.
+                m_WorldBoundsMin = Vector3.Min(m_WorldBoundsMin, asset.boundsMin);
+                m_WorldBoundsMax = Vector3.Max(m_WorldBoundsMax, asset.boundsMax);
+                return;
+            }
             var chunkBytes = layer.m_ChunkData.GetData<byte>();
             int chunkCount = chunkBytes.Length / 64;
             for (int i = 0; i < chunkCount; i++)
@@ -512,10 +535,13 @@ namespace GaussianSplatting.Runtime
             // Layout: [0..matchedCount-1] matched | [matchedCount..+uL-1] unmatched A | [..+uR-1] unmatched B
             var layerA = m_AssetLeft.LayerData[0];
             int nA = m_AssetLeft.splatCount;
-            // Per-splat strides derived from actual buffer byte lengths
-            int posStride   = layerA.m_PosData.GetData<byte>().Length   / nA;
-            int otherStride = layerA.m_OtherData.GetData<byte>().Length  / nA;
-            int shStride    = layerA.m_SHData != null ? layerA.m_SHData.GetData<byte>().Length / nA : 0;
+            // Position and Other are always written in the morph kernels' own fixed packed
+            // layout (Norm11 pos, rot+Norm6-scale Other) regardless of the source assets'
+            // formats — see SplatMorph.compute's OUT_OTHER_STRIDE. Only SH is a passthrough
+            // copy of A's source data, so its stride still derives from A's actual format.
+            const int posStride = 4;   // EncodeNorm11, 1 uint/splat
+            const int otherStride = 8; // OUT_OTHER_STRIDE: rot(4) + Norm6 scale(4)
+            int shStride = layerA.m_SHData != null ? layerA.m_SHData.GetData<byte>().Length / nA : 0;
 
             int posLen   = (m_TotalMorphCount * posStride   + 3) & ~3;
             int otherLen = (m_TotalMorphCount * otherStride + 3) & ~3;

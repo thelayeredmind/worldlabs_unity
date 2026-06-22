@@ -549,8 +549,9 @@ namespace GaussianSplatting.Runtime
                 }
 
                 // Use caller-provided chunk buffer — never dispose it, the caller owns it.
-                // Only swap when the buffer reference actually changes.
-                if (m_GpuChunks != chunks)
+                // Swap when the buffer reference changes, or when m_GpuChunks was never
+                // initialized (null == null is otherwise indistinguishable from "no change").
+                if (m_GpuChunks != chunks || m_GpuChunks == null)
                 {
                     if (!m_GpuChunksExternallyOwned) DisposeBuffer(ref m_GpuChunks);
                     m_GpuChunksExternallyOwned = chunks != null;

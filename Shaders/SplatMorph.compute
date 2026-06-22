@@ -227,6 +227,11 @@ uint OtherStride(uint fmt)
     return 4 + 12; // FMT_32F
 }
 
+// The output Other buffer is always packed as rot(4, 10.10.10.2) + scale(4, Norm6) — the
+// morph kernels never preserve the source scale format. OtherStride(scaleFmtA) must not be
+// used for output writes/allocation, since it reflects the SOURCE stride, not this layout.
+#define OUT_OTHER_STRIDE 8u
+
 uint2 SplatToTexCoord(uint idx, uint texWidth)
 {
     // Color textures use the renderer's Morton 16x16 swizzle (see SplatIndexToPixelIndex
@@ -283,9 +288,8 @@ void MorphSplats(uint3 id : SV_DispatchThreadID)
     float3 scaleB = DecodeChunkScale(scaleNormB, _ChunksB, _ChunkCountB, idxB);
     float3 scaleOut = lerp(scaleA, scaleB, t);
 
-    uint outOtherStride = OtherStride(scaleFmtA);
-    _OutOther.Store(i * outOtherStride,     EncodeRot(qOut));
-    _OutOther.Store(i * outOtherStride + 4, EncodeNorm6(EncodeChunkScale(scaleOut)));
+    _OutOther.Store(i * OUT_OTHER_STRIDE,     EncodeRot(qOut));
+    _OutOther.Store(i * OUT_OTHER_STRIDE + 4, EncodeNorm6(EncodeChunkScale(scaleOut)));
 
     // ── Color ──────────────────────────────────────────────────────────────
     uint2 coordA   = SplatToTexCoord(idxA, _OutWidth);   // A tex sized same as output
@@ -323,12 +327,11 @@ void CopyUnmatchedA(uint3 id : SV_DispatchThreadID)
     _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
 
     // ── Other (rotation + scale) — re-encode for the output's identity chunk bounds ──
-    uint outOtherStride = OtherStride(scaleFmtA);
     uint rotEnc    = _OtherA.Load(srcIdx * OtherStride(scaleFmtA));
     float3 scaleNorm = DecodeVec(_OtherA, srcIdx * OtherStride(scaleFmtA) + 4, scaleFmtA);
     float3 scale   = DecodeChunkScale(scaleNorm, _ChunksA, _ChunkCountA, srcIdx);
-    _OutOther.Store(dstIdx * outOtherStride,     rotEnc);
-    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(EncodeChunkScale(scale)));
+    _OutOther.Store(dstIdx * OUT_OTHER_STRIDE,     rotEnc);
+    _OutOther.Store(dstIdx * OUT_OTHER_STRIDE + 4, EncodeNorm6(EncodeChunkScale(scale)));
 
     // ── Color — decode A's chunk-relative color, scale opacity by (1 - t), re-encode ──
     uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidth);
@@ -360,14 +363,12 @@ void CopyUnmatchedB(uint3 id : SV_DispatchThreadID)
     float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
     _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
 
-    // ── Other — output stride matches A's format (m_BufOutOther is allocated from A) ──
-    uint scaleFmtA = (_SplatFormatA >> 8) & 0xFF;
-    uint outOtherStride = OtherStride(scaleFmtA);
+    // ── Other ────────────────────────────────────────────────────────────────
     uint rotEnc      = _OtherB.Load(srcIdx * OtherStride(scaleFmtB));
     float3 scaleNorm = DecodeVec(_OtherB, srcIdx * OtherStride(scaleFmtB) + 4, scaleFmtB);
     float3 scale     = DecodeChunkScale(scaleNorm, _ChunksB, _ChunkCountB, srcIdx);
-    _OutOther.Store(dstIdx * outOtherStride,     rotEnc);
-    _OutOther.Store(dstIdx * outOtherStride + 4, EncodeNorm6(EncodeChunkScale(scale)));
+    _OutOther.Store(dstIdx * OUT_OTHER_STRIDE,     rotEnc);
+    _OutOther.Store(dstIdx * OUT_OTHER_STRIDE + 4, EncodeNorm6(EncodeChunkScale(scale)));
 
     // ── Color — decode B's chunk-relative color, scale opacity by t, re-encode ──
     uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidthB);
