@@ -113,17 +113,21 @@ uint EncodeNorm11(float3 v)
 
 float3 DecodeNorm6(uint enc)
 {
+    // 6.5.5 layout — matches RuntimeSplatProcessing.EncodeFloat3ToNorm655 / GaussianSplatting.hlsl's
+    // DecodePacked_6_5_5, the canonical Norm6 packing used by real (imported) Norm6 assets.
     return float3(
-        (enc & 31u)          / 31.0,
-        ((enc >> 5) & 63u)   / 63.0,
+        (enc & 63u)          / 63.0,
+        ((enc >> 6) & 31u)   / 31.0,
         ((enc >> 11) & 31u)  / 31.0);
 }
 
 uint EncodeNorm6(float3 v)
 {
+    // 6.5.5 layout — must match GaussianSplatting.hlsl's DecodePacked_6_5_5, the decoder the
+    // renderer uses for both real Norm6 assets and this morph output (VECTOR_FMT_6_PADDED).
     v = saturate(v);
-    return (uint)(v.x * 31.0 + 0.5)
-         | ((uint)(v.y * 63.0 + 0.5) << 5)
+    return (uint)(v.x * 63.0 + 0.5)
+         | ((uint)(v.y * 31.0 + 0.5) << 6)
          | ((uint)(v.z * 31.0 + 0.5) << 11);
 }
 
