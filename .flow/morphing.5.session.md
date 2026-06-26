@@ -76,3 +76,8 @@ Compile check (port 7890): 0 errors, isCompiling false.
 ✓ Clean (compile)
 [/S]
 [^] Continue morphing. Last: guard fix written, compiles clean. Next: user's turn -- re-test the partial-clip scenario in KitchenOfMemories (Left+Right assigned, no morphMap), confirm no NullReferenceException and the morpher idles cleanly until the map is added. Confirm: none.
+
+- review: user committed and pushed (SetAssets morphMap guard), pulled into KOM, ran final check against test level -- clean. Ready for wrap-up and final push.
+[/Task] -- closed: SetAssets() now tears down to idle when any of assetLeft/assetRight/morphMap is missing. Smoke tested clean against KOM test level.
+
+--- CLOSED 2026-06-26 — SetAssets() null-guard extended to cover morphMap, not just the two assets. Committed, pushed, pulled into KitchenOfMemories, verified clean against the test level. No open threads. ---
