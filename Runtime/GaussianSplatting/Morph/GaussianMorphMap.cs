@@ -17,6 +17,14 @@ namespace GaussianSplatting.Runtime
         [SerializeField] public int splatCountRight;
 
         /// <summary>
+        /// AssetDatabase GUIDs of the GaussianSplatAssets this map was built from. Empty on maps
+        /// built before this field existed — GaussianSplatMorpher.MapIsSwapped() falls back to
+        /// the splat-count heuristic in that case.
+        /// </summary>
+        [SerializeField] public string leftAssetGuid;
+        [SerializeField] public string rightAssetGuid;
+
+        /// <summary>
         /// Matched pairs. x = index into Left asset, y = index into Right asset.
         /// No ordering guarantee — the morpher sorts by dst component at activation.
         /// </summary>

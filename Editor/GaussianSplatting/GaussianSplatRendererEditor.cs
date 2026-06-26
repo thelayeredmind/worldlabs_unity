@@ -907,7 +907,7 @@ namespace GaussianSplatting.Editor
         Bounds OnGetFrameBounds()
         {
             var gs = target as GaussianSplatRenderer;
-            if (!gs || !gs.HasValidRenderSetup)
+            if (!gs || !gs.HasValidRenderSetup || !gs.asset)
                 return new Bounds(Vector3.zero, Vector3.one);
             Bounds bounds = default;
             bounds.SetMinMax(gs.asset.boundsMin, gs.asset.boundsMax);

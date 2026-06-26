@@ -509,9 +509,30 @@ namespace GaussianSplatting.Runtime
         /// True if the current Left/Right assignment is swapped relative to the orientation
         /// the MorphMap was built with (matchedPairs.x/unmatchedLeft index AssetRight, and
         /// matchedPairs.y/unmatchedRight index AssetLeft).
+        ///
+        /// Compares by asset GUID identity when the map carries one (built after this field was
+        /// added) — this is unambiguous even when AssetLeft/AssetRight have equal or coincidentally
+        /// matching splat counts. Falls back to the splat-count heuristic only for maps built
+        /// before leftAssetGuid/rightAssetGuid existed.
         /// </summary>
         bool MapIsSwapped()
         {
+#if UNITY_EDITOR
+            if (!string.IsNullOrEmpty(m_MorphMap.leftAssetGuid) || !string.IsNullOrEmpty(m_MorphMap.rightAssetGuid))
+            {
+                string leftGuid  = UnityEditor.AssetDatabase.AssetPathToGUID(UnityEditor.AssetDatabase.GetAssetPath(m_AssetLeft));
+                string rightGuid = UnityEditor.AssetDatabase.AssetPathToGUID(UnityEditor.AssetDatabase.GetAssetPath(m_AssetRight));
+
+                if (leftGuid == m_MorphMap.leftAssetGuid && rightGuid == m_MorphMap.rightAssetGuid)
+                    return false;
+                if (leftGuid == m_MorphMap.rightAssetGuid && rightGuid == m_MorphMap.leftAssetGuid)
+                    return true;
+
+                Debug.LogWarning($"GaussianSplatMorpher: MorphMap asset GUIDs don't match AssetLeft/AssetRight " +
+                    $"by identity; falling back to splat-count comparison.", this);
+            }
+#endif
+
             if (m_AssetLeft.splatCount == m_MorphMap.splatCountLeft &&
                 m_AssetRight.splatCount == m_MorphMap.splatCountRight)
                 return false;

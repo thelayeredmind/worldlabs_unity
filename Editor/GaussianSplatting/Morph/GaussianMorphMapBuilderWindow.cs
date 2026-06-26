@@ -300,6 +300,8 @@ namespace GaussianSplatting.Editor
             var map = CreateInstance<GaussianMorphMap>();
             map.splatCountLeft  = left.splatCount;
             map.splatCountRight = right.splatCount;
+            map.leftAssetGuid   = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(left));
+            map.rightAssetGuid  = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(right));
             map.matchedPairs    = result.matchedPairs;
             map.unmatchedLeft   = result.unmatchedLeft;
             map.unmatchedRight  = result.unmatchedRight;

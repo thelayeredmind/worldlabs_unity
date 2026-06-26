@@ -31,3 +31,8 @@ Diff review: only references existing members already used identically elsewhere
 [/Task] -- closed: SetAssets(left, right, map) added to GaussianSplatMorpher, reviewed clean. Unblocks KitchenOfMemories' morph-pair Timeline clip case once consumed via the existing git package dependency. Not yet committed.
 
 [^] Continue morphing. Last: Task closed clean -- SetAssets shipped, reviewed. Next: drift or wrap-up. Commit nudge pending.
+
+[CKP] User committed and pushed SetAssets to GaussianSplatMorpher, updated the package in KitchenOfMemories, opened test scene for smoke tests there.
+[^] Continue morphing. Last: committed/pushed, confirmed by user. Next: switching to KitchenOfMemories' gaussian-morphing target to wire the Timeline mixer against SetAssets and smoke test. Suspended here -- no open task.
+
+--- CLOSED 2026-06-26 — Added SetAssets(left,right,map) to GaussianSplatMorpher for runtime asset-pair assignment, unblocking the morph-pair Timeline case in KitchenOfMemories. Committed and pushed by user. ---
