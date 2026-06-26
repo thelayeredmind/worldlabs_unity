@@ -66,6 +66,40 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        /// <summary>
+        /// Assigns a new asset pair and MorphMap from outside the component (e.g. a Timeline
+        /// mixer driving a morph-pair clip) — assetLeft/assetRight/morphMap have no public
+        /// setter otherwise, and SwapAssets() only swaps the pair already in place.
+        ///
+        /// If the component is currently disabled, only the fields are assigned; OnEnable's
+        /// existing null-guard/Setup() path picks them up whenever the component is next
+        /// enabled. If already enabled and both left/right are non-null, rebuilds immediately
+        /// via the same ReleaseGpuResources()/Setup() sequence SwapAssets() uses. If already
+        /// enabled and either is null, tears down to idle exactly like OnEnable's null-guard —
+        /// releases GPU resources and hands the captured asset back to the renderer.
+        /// </summary>
+        public void SetAssets(GaussianSplatAsset left, GaussianSplatAsset right, GaussianMorphMap map)
+        {
+            m_AssetLeft = left;
+            m_AssetRight = right;
+            m_MorphMap = map;
+
+            if (m_Renderer == null) return; // disabled — OnEnable will Setup() when next enabled
+
+            if (m_AssetLeft == null || m_AssetRight == null)
+            {
+                m_Renderer.SetExternalBuffers(null, null, null, null, null, false, 0, 0);
+                m_Renderer.m_Asset = m_CapturedAsset;
+                m_Renderer.UpdateRessources();
+
+                ReleaseGpuResources();
+                return;
+            }
+
+            ReleaseGpuResources();
+            Setup();
+        }
+
         // ── GPU resources ─────────────────────────────────────────────────────
 
         GaussianSplatRenderer m_Renderer;
