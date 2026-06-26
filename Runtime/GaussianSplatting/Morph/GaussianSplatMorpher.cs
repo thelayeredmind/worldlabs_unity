@@ -86,7 +86,7 @@ namespace GaussianSplatting.Runtime
 
             if (m_Renderer == null) return; // disabled — OnEnable will Setup() when next enabled
 
-            if (m_AssetLeft == null || m_AssetRight == null)
+            if (m_AssetLeft == null || m_AssetRight == null || m_MorphMap == null)
             {
                 m_Renderer.SetExternalBuffers(null, null, null, null, null, false, 0, 0);
                 m_Renderer.m_Asset = m_CapturedAsset;

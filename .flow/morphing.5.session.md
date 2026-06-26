@@ -51,3 +51,28 @@ Compile check (port 7890): 0 errors, isCompiling false.
 --- CLOSED 2026-06-26 — Two fixes shipped this session: (1) GaussianMorphMap orientation detection now uses asset-GUID identity instead of a splat-count heuristic, fixing the "swap resets on clip restart" bug surfaced from KitchenOfMemories' Timeline morph-pair clip. (2) GaussianSplatRendererEditor.OnGetFrameBounds() null-guarded against gs.asset being null during active morph takeover (Frame Selected NRE). Both smoke tested clean by user. Not yet committed. ---
 
 [^] Continue morphing. Last: both Tasks closed clean this session, smoke tested. Next: drift or wrap-up. Commit nudge pending -- two uncommitted fixes in this repo (GaussianMorphMap GUID + OnGetFrameBounds null-guard). Also: KitchenOfMemories has its own pending checkpoint (enabled-toggling change, user said they'd commit it) and will need its package reference bumped once this repo's fixes are pushed.
+
+[CKP] User committed and pushed both fixes (GaussianMorphMap GUID identity + OnGetFrameBounds null-guard), updated the package reference in KitchenOfMemories.
+[^] Continue morphing. Last: committed/pushed, package updated, confirmed by user. Next: switching back to KitchenOfMemories' gaussian-morphing target to implement the directionality fix on GaussianSplatTrack/Clip -- aligning left/right asset assignment with the clip's own understanding of map orientation. Suspended here -- no open task.
+
+--- CLOSED 2026-06-26 — Both fixes committed and pushed. Package updated in KitchenOfMemories. Target switch back to KitchenOfMemories to resume the directionality fix on the clip itself. ---
+
+[^] Resumed — KitchenOfMemories' GaussianSplatMixerBehaviour was changed this session to call SetAssets with a partial set (assetLeft+assetRight, morphMap still null) so the morpher's Inspector fields populate while a clip is being authored. This surfaced a latent bug here: SetAssets() (line 81-101) only null-guards assetLeft/assetRight before calling Setup() -- it never checks m_MorphMap. Setup() -> BuildIndexBuffer() -> MapIsSwapped() (line 521) then dereferences a null m_MorphMap directly, throwing NullReferenceException repeatedly (once per ProcessFrame call while the clip is on this partial state).
+
+[F] Confirmed via Read: SetAssets' early-return guard at line 89 is `if (m_AssetLeft == null || m_AssetRight == null)` -- morphMap is fully absent from this condition, even though Setup() requires all three to do anything meaningful (per the OnEnable guard at line 147, which DOES check all three, but is bypassed when SetAssets is called directly on an already-enabled morpher).
+
+[Task] Add m_MorphMap to SetAssets()'s early-return guard, alongside the existing assetLeft/assetRight check -- any missing one of the three should tear down to idle (release GPU resources, restore captured asset) rather than attempting Setup(). This makes SetAssets' contract consistent: safe to call with any subset of the three, matching how OnEnable already treats incomplete state.
+
+Task: SetAssets() tears down to idle when any of assetLeft/assetRight/morphMap is missing, not just the two assets.
+
+Ready to wind up.
+[^] Continue morphing. Last: Task opened. Next: wind up and execute.
+
+[S] Add m_MorphMap to SetAssets' early-return guard
+- reviewable surface: code diff; smoke test by replaying the partial-clip scenario in KitchenOfMemories (assetLeft+assetRight, no map) and confirming no exception
+Attempt 1
+Changed SetAssets' guard from `if (m_AssetLeft == null || m_AssetRight == null)` to also check `|| m_MorphMap == null`. Any incomplete trio now tears down to idle (SetExternalBuffers(null...), restores m_CapturedAsset, ReleaseGpuResources) instead of falling through to Setup() -> BuildIndexBuffer() -> MapIsSwapped(), which was dereferencing a null map.
+Compile check (port 7890): 0 errors, isCompiling false.
+✓ Clean (compile)
+[/S]
+[^] Continue morphing. Last: guard fix written, compiles clean. Next: user's turn -- re-test the partial-clip scenario in KitchenOfMemories (Left+Right assigned, no morphMap), confirm no NullReferenceException and the morpher idles cleanly until the map is added. Confirm: none.
