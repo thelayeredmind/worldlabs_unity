@@ -867,6 +867,7 @@ namespace GaussianSplatting.Runtime
         {
             RefreshEffectLayers();
             Initialize();
+            GaussianQualityHUD.Register(this);
         }
 
         public void RefreshEffectLayers()
@@ -1075,6 +1076,7 @@ namespace GaussianSplatting.Runtime
 
         public void OnDisable()
         {
+            GaussianQualityHUD.Unregister(this);
             m_EffectLayerBuffer?.Release();
             m_EffectLayerBuffer = null;
             DeInitialize();
