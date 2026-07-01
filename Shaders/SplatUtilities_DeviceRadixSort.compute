@@ -274,10 +274,13 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     GSPLAT_APPLY_EFFECTS(splat, effectColorOverride);
 
     float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
-    // Use the explicitly-passed _MatrixVP (set per-dispatch in CalcViewData), not UNITY_MATRIX_VP -- the latter is
-    // Unity's ambient global and can reflect the wrong camera when multiple cameras (e.g. SceneView + Game) dispatch
-    // this kernel within the same editor tick. Matches how _MatrixMV is already used explicitly elsewhere in this file.
-    float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
+    // UNITY_MATRIX_VP, not the explicitly-passed _MatrixVP: UNITY_MATRIX_VP resolves per-eye during stereo XR
+    // instanced rendering (matches the vertex shader's own UNITY_MATRIX_VP use), while _MatrixVP is uploaded
+    // once per CalcViewData call from a single mono Camera and is identical for both eyes -- using it here
+    // caused a per-eye clip-position mismatch (splats positioned/culled with one matrix, reprojected correctly
+    // per-eye downstream), visible on Quest/OpenXR as the whole world warping inward toward the viewer.
+    // _MatrixVP still exists for the frustum-plane cull below and other explicit uses in this file.
+    float4 centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
     half opacityScale = _SplatOpacityScale;
     float splatScale = _SplatScale;
 
