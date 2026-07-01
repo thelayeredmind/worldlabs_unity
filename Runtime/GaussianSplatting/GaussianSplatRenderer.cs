@@ -372,6 +372,7 @@ namespace GaussianSplatting.Runtime
         internal GraphicsBuffer m_GpuView;
         internal GraphicsBuffer m_GpuIndexBuffer;
         internal GraphicsBuffer m_GpuVisibleIndices;
+        float m_LastCullCounterLogTime;
         internal GraphicsBuffer m_GpuIndirectArgs;
         internal Camera m_centerEyeCamera;
         internal Matrix4x4 m_centerCamMatrix;
@@ -445,6 +446,7 @@ namespace GaussianSplatting.Runtime
             public static readonly int MatrixWorldToObject = Shader.PropertyToID("_MatrixWorldToObject");
             public static readonly int VecScreenParams = Shader.PropertyToID("_VecScreenParams");
             public static readonly int VecWorldSpaceCameraPos = Shader.PropertyToID("_VecWorldSpaceCameraPos");
+            public static readonly int FrustumPlanes = Shader.PropertyToID("_FrustumPlanes");
             public static readonly int SelectionCenter = Shader.PropertyToID("_SelectionCenter");
             public static readonly int SelectionDelta = Shader.PropertyToID("_SelectionDelta");
             public static readonly int SelectionDeltaRot = Shader.PropertyToID("_SelectionDeltaRot");
@@ -454,7 +456,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int SplatPosMouseDown = Shader.PropertyToID("_SplatPosMouseDown");
             public static readonly int SplatOtherMouseDown = Shader.PropertyToID("_SplatOtherMouseDown");
             public static readonly int OptimizeForQuest = Shader.PropertyToID("_OptimizeForQuest");
-            public static readonly int VisibleIndices = Shader.PropertyToID("_VisibleIndices");
+            // Repurposed from unused "_VisibleIndices" scaffolding: atomic counter of splats that survive per-splat culling in CalcViewData.
+            public static readonly int VisibleIndices = Shader.PropertyToID("_CullSurvivorCounter");
             public static readonly int IndirectArgs = Shader.PropertyToID("_IndirectArgs");
             public static readonly int InvertSort = Shader.PropertyToID("_InvertSort");
             public static readonly int ZTest = Shader.PropertyToID("_ZTest");
@@ -1115,6 +1118,7 @@ namespace GaussianSplatting.Runtime
 
             DisposeBuffer(ref m_GpuView);
             DisposeBuffer(ref m_GpuIndexBuffer);
+            DisposeBuffer(ref m_GpuVisibleIndices);
             DisposeBuffer(ref m_GpuSortDistances);
             DisposeBuffer(ref m_GpuSortKeys);
 
@@ -1158,6 +1162,9 @@ namespace GaussianSplatting.Runtime
             DestroyImmediate(m_MatDebugBoxes);
         }
 
+        // Reused across CalcViewData calls to avoid a per-frame allocation for the frustum-plane upload.
+        static readonly Vector4[] s_FrustumPlaneVectors = new Vector4[6];
+
         internal void CalcViewData(CommandBuffer cmb, Camera cam, Matrix4x4 matrix)
         {
             if (cam.cameraType == CameraType.Preview)
@@ -1192,6 +1199,17 @@ namespace GaussianSplatting.Runtime
 
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecScreenParams, screenPar);
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecWorldSpaceCameraPos, camPos);
+
+            // World-space frustum planes (same GeometryUtility API already used for the CPU-side per-renderer
+            // cull in GatherSplatsForCamera), for the per-splat bounding-sphere-vs-frustum cull in CSCalcViewData.
+            var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(cam);
+            for (int i = 0; i < 6; i++)
+            {
+                var p = frustumPlanes[i];
+                s_FrustumPlaneVectors[i] = new Vector4(p.normal.x, p.normal.y, p.normal.z, p.distance);
+            }
+            cmb.SetComputeVectorArrayParam(m_CSSplatUtilities, Props.FrustumPlanes, s_FrustumPlaneVectors);
+
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatScale, m_SplatScale);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatOpacityScale, m_OpacityScale);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
@@ -1200,8 +1218,34 @@ namespace GaussianSplatting.Runtime
 
             UpdateEffectLayerBuffer(cmb);
 
+            // Cull survivor counter: 1-uint atomic buffer, cleared each dispatch, incremented in CalcViewData
+            // for every splat that survives per-splat culling. Read back on CPU to measure cull effectiveness.
+            if (m_GpuVisibleIndices == null || m_GpuVisibleIndices.count != 1)
+            {
+                m_GpuVisibleIndices?.Release();
+                m_GpuVisibleIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint)) { name = "GaussianCullSurvivorCounter" };
+            }
+            cmb.SetBufferData(m_GpuVisibleIndices, new uint[] { 0 });
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, Props.VisibleIndices, m_GpuVisibleIndices);
+
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
+
+            // Temporary: async-readback the cull survivor counter every 2s while wiring up per-splat GPU culling.
+            // Only requested right after a real dispatch, so the value logged is always from this frame, never stale.
+            if (Time.realtimeSinceStartup - m_LastCullCounterLogTime > 2f)
+            {
+                m_LastCullCounterLogTime = Time.realtimeSinceStartup;
+                string logName = name;
+                int logSplatCount = splatCount;
+                UnityEngine.Rendering.AsyncGPUReadback.Request(m_GpuVisibleIndices, req =>
+                {
+                    if (req.hasError) return;
+                    uint counter = req.GetData<uint>()[0];
+                    float cutPercent = logSplatCount > 0 ? 100f * (1f - (float)counter / logSplatCount) : 0f;
+                    Debug.Log($"[CullCounter] {logName}: splatCount={logSplatCount} survivorCounter={counter} cut={cutPercent:F1}%");
+                });
+            }
         }
 
         void UpdateEffectLayerBuffer(CommandBuffer cmb)

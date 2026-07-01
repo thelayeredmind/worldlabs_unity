@@ -242,3 +242,203 @@ Verification pointer: editor check -- multiple GaussianSplatRenderer instances a
 [F] CPU frustum-cull verified live across the full discrimination range on the 18-renderer Piranesi stress scene: 0% cut (camera framing all active renderers, cutPercent=0), 57% cut (14 active renderers, camera pointed at empty space with slight spill -- 5/14 renderers survived, correctly matching "slight spill" description), 100% cut (camera moved fully out of bounds and facing away, total=499644, submitted=0). Confirms GatherSplatsForCamera's frustum test discriminates correctly across the full in/out spectrum, not just a binary pass/fail.
 
 [^] Continue performance. Last: CPU frustum-cull activity verified end-to-end on live Piranesi stress scene -- 0%/57%/100% cut results all match expected framing. Culling implementation (GatherSplatsForCamera, TryGetLocalBounds, TransformBounds) confirmed working correctly. Next: drift -- decide whether to promote Pass 1 (opaque/early-Z shader path, already TBDR-correct but not default) as the next lever, pick up the LOD port plan, or the on-device Low-vs-VeryHigh test (still blocked on Quest access). Confirm: none.
+
+- user redirected sharply: forget frag/vert-level culling ideas from prior sessions (not from original author, misguided) -- want pure per-splat bounding-box-vs-frustum culling: inside frustum or not, binary, no submission to vertex/fragment if outside. Not related to contribution-threshold/discard logic.
+
+[F] Confirmed via code read: no existing per-splat bounding-box-vs-frustum test anywhere in CSCalcViewData today. Existing checks are deleted-bits, cutout-layers, behindCam (single-point w<=0 test, not a bounding-box test), and alpha/contribution threshold -- none test clip-space XY extent against frustum. A splat centered on-screen but fully outside frustum XY currently passes through to vertex/fragment relying on hardware clipping.
+
+[D] Integration point: inline at the top of the existing CSCalcViewData kernel (no new dispatch), reusing SplatData.pos/scale (already loaded) and centerClipPos (already computed) at that point in the kernel.
+
+[D] Bound shape: conservative bounding sphere per splat, radius = margin * max(scale.xyz), tested in clip space -- generous margin, never wrongly culls a visible splat, over-inclusive at edges is acceptable.
+
+[D] Measurement plan: GPU-side atomic counter buffer incremented when a splat survives the new test; baseline = known pre-kernel splat count (sum of splatCount over currently-submitted/dispatched renderers, already obtainable); after = counter readback. Direct per-splat before/after cut, not a CPU approximation.
+
+[Activity] Add a per-splat bounding-sphere-vs-frustum cull to CSCalcViewData -- inline at the top of the kernel, using each splat's already-loaded pos/scale to build a conservative bounding sphere (radius = margin * max(scale.xyz)) tested in clip space against the frustum; splats fully outside are eliminated (view.pos.w = 0, early return) before any covariance/SH/color work runs, never reaching vertex/fragment. A GPU-side atomic counter records how many splats pass the test per dispatch, read back to compare against the known pre-kernel splat count (submitted-renderers' total), giving a direct before/after per-splat cut percentage -- verified live against the current scene.
+
+[^] Continue performance. Last: Activity opened for per-splat GPU bounding-sphere-vs-frustum cull inside CSCalcViewData, with atomic counter for before/after verification. Next: STAGE TAG-TEAM -- wind-up: implement GPU counter buffer wiring (C# alloc/bind/readback) first, then the kernel-side bounding-sphere test. Confirm: none.
+
+[R1] User asked why all renderers log even though only 1 is in the Scene view frustum. Investigated live.
+
+[F] m_GpuVisibleIndices/m_GpuIndirectArgs (repurposed as _CullSurvivorCounter) were pre-existing dead scaffolding: declared fields/shader props never allocated, bound, or referenced anywhere in the package before this session. Confirmed via grep across the whole package -- no compute/shader file referenced them. Reused m_GpuVisibleIndices (name directionally fits "survived cull") for the atomic counter; left m_GpuIndirectArgs alone (name implies a different, draw-indirect-args shape).
+
+[C] GaussianSplatRenderer.cs CalcViewData(): added counter buffer alloc/clear/bind (1-uint GraphicsBuffer, cleared via cmb.SetBufferData each dispatch), plus an AsyncGPUReadback.Request-based debug log (throttled ~2s per renderer) reporting splatCount vs counter -- moved here from Update() after finding Update() runs every frame regardless of cull state, so logging there read stale/wrong-cadence data.
+
+[C] SplatUtilities_DeviceRadixSort.compute CSCalcViewData: added RWStructuredBuffer<uint> _CullSurvivorCounter and an InterlockedAdd increment on the kernel's normal-completion path (not the contribution-cull early-return), as a wiring proof before any real bounding-sphere logic is added.
+
+[X] First readback attempt showed garbage survivorCounter values (billions, e.g. 3182078635) -- later readings from the same buffers came back sane (<=splatCount). Root cause not yet isolated; suspicion is a race between per-renderer buffer clear/bind and the async readback firing against a buffer already reused/rebound by a different renderer's dispatch this frame, since all renderers share the same CommandBuffer execution but each owns its own GraphicsBuffer instance -- not yet confirmed, deprioritized once the bigger issue below was found.
+
+[F] **Real, confirmed architectural bug**: `m_ActiveSplats` (GaussianSplatRenderSystem.cs) is a single instance List, not keyed per-camera. GatherSplatsForCamera clears and repopulates this ONE shared list on every call, regardless of which camera calls it. In the editor, multiple cameras can call OnCameraPreCull (via GaussianSplatURPFeature.OnCameraPreCull) within the same tick -- confirmed live: Scene view camera (instanceID=-49600) correctly resolved to 1 renderer in m_ActiveSplats, but immediately after, a camera named "Main Camera" (instanceID=61544, type=Game) also called GatherSplatsForCamera and overwrote the list with 16 renderers. SortAndRenderSplats/CalcViewData then consumed whichever result was last written -- meaning the actual rendered/measured cull result for a given frame depends on caller order, not on the intended camera's frustum alone.
+
+[F] "Main Camera" GameObject is confirmed live via Resources.FindObjectsOfTypeAll<Camera>() to be enabled=false, gameObject.activeInHierarchy=false, UniversalAdditionalCameraData.renderType=Base, cameraStack.Count=0 (no stacking) -- genuinely disabled, not a naming collision with Scene view (different instanceID, isSceneViewCam=False confirmed via reference-equality check against SceneView.lastActiveSceneView.camera). Yet its OnCameraPreCull still fires. Console stack trace for these calls shows UnityEngine.GUIUtility:ProcessEvent as the caller -- an editor-wide GUI/input event pump, not the normal per-frame render loop -- suggesting some editor GUI event (not yet identified) triggers a one-off render/precull pass for this camera despite it being disabled. Nothing was selected in the Hierarchy at the time (ruled out Inspector-preview-of-selection as the trigger).
+
+[D] This is a real, user-flagged concern with production implications, not just a debug-session artifact: if a disabled camera's OnCameraPreCull can still fire and silently clobber the shared m_ActiveSplats list, then in any real multi-camera Quest/VR setup (e.g. stereo rendering, UI overlay cameras, disabled debug cameras left in a scene) the actually-rendered cull result could silently reflect the wrong camera's frustum. This directly undermines trust in every m_ActiveSplats-based measurement taken this session (all the culling percentages measured earlier may have been reading a clobbered/stale result, not the intended camera's).
+
+[>] Root cause of WHY the disabled Main Camera's OnCameraPreCull still fires -- not yet found. Next diagnostic step (stack-trace capture scoped to cam.name=="Main Camera") was proposed but not yet written to the file (user paused to ask about logging first).
+[>] The deeper architectural fix -- making m_ActiveSplats per-camera (e.g. keyed by camera instance ID) instead of a single shared list -- explicitly deferred by user in favor of first understanding why the disabled camera fires at all.
+[>] Garbage CullCounter readback values (see [X] above) not yet root-caused, deprioritized under the bigger finding.
+
+[^] Continue performance. Last: caught up the session log after a real gap -- logged the dead-scaffolding reuse, the counter wiring, the garbage-readback anomaly, and (most importantly) the confirmed m_ActiveSplats single-shared-list bug where a disabled "Main Camera" object's still-firing OnCameraPreCull silently overwrites the Scene view camera's correct cull result. Next: was about to add a stack-trace-scoped log for cam.name=="Main Camera" to find the real caller behind the disabled camera still firing -- paused when user asked whether this had been logged yet. Resume there once user confirms. Confirm: none (this catch-up entry itself, since it was written after the fact from conversation review rather than turn-by-turn).
+
+[C] GaussianSplatURPFeature.cs OnCameraPreCull: added a scoped Debug.Log (cam.name=="Main Camera" only) reporting enabled/activeInHierarchy state plus System.Environment.StackTrace, to capture the real caller behind the disabled camera's OnCameraPreCull still firing.
+
+[F] Compile check: 0 errors, isCompiling=false. Clean.
+
+[^] Continue performance. Last: attempt 1 clean -- scoped stack-trace log added for cam.name=="Main Camera" in OnCameraPreCull. Next: user needs to trigger the editor event that causes this (e.g. reproduce whatever GUI action fired it before) and report the logged stack trace back, so the real caller (currently only known to pass through GUIUtility:ProcessEvent) can be identified. Confirm: none.
+
+[F] User reproduced and reported the full console log. Stack trace for every "Main Camera" firing is identical and terminal: `UnityEngine.Debug:Log -> GaussianSplatURPFeature:OnCameraPreCull -> UnityEngine.GUIUtility:ProcessEvent`. No further managed frames exist above ProcessEvent -- it is Unity's native editor GUI event pump calling directly into the callback, not another script.
+
+[D] Root cause resolved: this is expected URP editor behavior, not a bug in our code. `ScriptableRendererFeature.OnCameraPreCull` is invoked by the pipeline for every camera it knows about on each editor GUI event (repaint, input, etc.), independent of that camera's `enabled`/`activeInHierarchy` state -- URP's callback dispatch iterates registered cameras at the pipeline level, not GameObject active state. A disabled camera firing this callback is not something we can or should prevent.
+
+[D] Consequence: the real, actionable bug is unchanged and now the sole target -- `m_ActiveSplats` (GaussianSplatRenderSystem.cs) being a single shared List, not keyed per-camera, is what lets a harmless extra callback firing clobber another camera's correct gather result. The fix is to make this per-camera, deferred earlier pending this exact investigation -- now unblocked.
+
+[^] Continue performance. Last: stack-trace investigation concluded -- disabled "Main Camera" firing OnCameraPreCull is normal URP editor behavior (native GUIUtility:ProcessEvent calling the callback for all known cameras regardless of active state), not a bug to fix. Next: the deferred architectural fix -- make m_ActiveSplats per-camera (e.g. Dictionary keyed by camera instance ID) instead of one shared List -- is now the clear next slice. Confirm: none.
+
+- user deleted the "Main Camera" GameObject (removes the clobbering scenario without needing the per-camera architectural fix, for this scene). Redirecting to: the [CullCounter] survivor numbers themselves look off -- add a cut-percentage figure to that log to make it easier to judge.
+
+[C] GaussianSplatRenderer.cs CalcViewData() cull-counter log (line ~1233): added cutPercent = 100 * (1 - survivorCounter/splatCount), appended to the existing log line as cut={cutPercent:F1}%.
+
+[F] Compile check: 0 errors, isCompiling=false. Clean.
+
+[^] Continue performance. Last: attempt 1 clean -- [CullCounter] log now reports cut percentage alongside splatCount/survivorCounter. Next: user to re-trigger and report the logged values so the "something is off" concern about survivor counts can be judged concretely. Confirm: none.
+
+[F] Read the console log directly. Confirms the earlier-session garbage-readback anomaly ([X] entry) is real and reproducible, not a one-off: first [CullCounter] log this session for Piranesi_500k_separated1 read `survivorCounter=3233032602 cut=-1643319.0%` -- garbage. Same renderer, ~7s later (next 2s-throttled log): `survivorCounter=196177 cut=0.3%` -- sane, self-corrected.
+
+[D] Root cause identified from GaussianSplatRenderer.cs:1211-1234: `AsyncGPUReadback.Request(m_GpuVisibleIndices, ...)` (line 1229) reads the live GraphicsBuffer handle directly, not tied to the specific command buffer (`cmb`) that recorded this frame's clear+dispatch (lines 1216-1220). Command buffers in Unity are recorded then submitted later (batched); on the very first CalcViewData call, the readback can be requested before `cmb` has actually been submitted/executed by the GPU, so it reads whatever uninitialized memory the freshly-allocated GraphicsBuffer (line 1214) contains -- not a per-renderer race (as suspected earlier), a request-before-first-execution race specific to cold start.
+
+[D] cut=0.3% for the settled reading is also suspiciously low given the scene camera was previously found to isolate a subset of the 18-way Piranesi split -- not yet explained, deprioritized until the garbage-value issue is resolved since we can't yet trust which readings are "settled" vs still-transient.
+
+[^] Continue performance. Last: root-caused the garbage CullCounter readback as a request-before-first-execution race (AsyncGPUReadback fires before the clearing/dispatching command buffer has actually run on cold start), not a cross-renderer race. Next: decide fix approach -- e.g. skip logging/readback on the first N frames per renderer, or request readback via a GPU fence/frame-count gate tied to actual cmb execution -- and separately investigate why the settled cut% (0.3%) looks too low for the camera framing. Confirm: none.
+
+- user reframed the settled 0.3% reading itself as the real finding: standing at the far end of a renderer where only a few splats should be visible, cut should be 60%+ -- the low cut% is not a readback artifact, it's evidence the cull isn't working.
+
+[F] Re-read CSCalcViewData directly: the counter-increment line's own comment (now-removed) said "Wiring check only: counts every splat reaching here, no bounding-sphere cull logic yet" -- confirms the bounding-sphere-vs-frustum test itself was never implemented in a prior turn, only the counter/readback/log wiring around it. The kernel only ever set view.pos.w=0 for deleted/cutout/behind-camera/below-contribution-threshold splats, none of which are spatial/frustum tests -- explains the near-zero cut regardless of camera framing.
+
+[C] SplatUtilities_DeviceRadixSort.compute CSCalcViewData: implemented the actual per-splat bounding-sphere-vs-frustum cull, inserted right after `behindCam` is computed and before covariance/SH/color work. World-space radius = splatScale * max(abs(axis)) of splat.scale transformed through _MatrixObjectToWorld's 3x3 (object-to-world scale, no translation). Converted to a clip-space margin via UNITY_MATRIX_P._m00/_m11 (same diagonal terms CalcCovariance2D already uses for tanFovX/aspect), with a 1.5x margin constant (kCullMargin) for conservative over-inclusion. Splat culled (behindCam=true, view.pos.w=0) only when centerClipPos.xy is fully outside the inflated [-w,w] range on either axis -- never touches the existing deleted/cutout/behindCam(z)/contribution-threshold checks, purely additive. Updated the counter-increment comment to reflect real cull logic now runs above it (was "wiring check only").
+
+[F] Compile check: 0 errors, 0 warnings, isCompiling=false. Clean.
+
+[^] Continue performance. Last: attempt 1 clean -- real bounding-sphere-vs-frustum cull implemented in CSCalcViewData (was previously wiring-only, explaining the near-zero cut%). Next: user to re-trigger and report new [CullCounter] cut% values from the same far-end vantage point used to flag the bug, to verify the cull now actually discriminates (expecting 60%+ cut from that position). Confirm: none.
+
+- user reported: compiled clean, but cull still not working -- cut=0.2%, effectively unchanged from before the fix (was 0.3%). Also corrected process: must AssetDatabase.Refresh() and wait for isCompiling=false before trusting a compile-error check, not check immediately.
+
+[D] Static re-read of the new cull logic did not reveal an obvious bug by inspection alone (world-space radius via splat.scale * _MatrixObjectToWorld's 3x3, projected to clip-space margin via UNITY_MATRIX_P._m00/_m11). Decided to add temporary debug instrumentation rather than keep guessing from code reading.
+
+[C] Added temporary debug readback: `_CullDebug` RWStructuredBuffer<float> (8 floats) in SplatUtilities_DeviceRadixSort.compute, written for idx==0 (baseline, always in-frustum) and for the last splat that fails the new outsideFrustum test this dispatch (worldRadius, clipMarginX, centerClipPos.x, centerClipPos.w each). Wired in GaussianSplatRenderer.cs: m_GpuCullDebug GraphicsBuffer (alloc once, cleared each dispatch), bound via new Props.CullDebug ("_CullDebug"), read back alongside the existing cull counter and logged as [CullDebug].
+
+[F] Compile check done correctly this time: triggered AssetDatabase.Refresh() via unity_execute_code, polled unity_editor_state until isCompiling=false, then unity_get_compilation_errors -- 0 errors, clean.
+
+[^] Continue performance. Last: attempt 1 clean -- debug instrumentation added (idx0 baseline + last-culled-splat raw values: worldRadius, clipMarginX, clipX, w) to see actual magnitudes rather than reason further from code alone. Next: user to re-trigger from the same far-end vantage point and report the new [CullDebug] log line so the real bug in the bounding-sphere-vs-frustum math can be found empirically. Confirm: none.
+
+- user reported cut still 0.2% after adding debug instrumentation, unchanged.
+
+[F] From [CullDebug] readback: lastCulled splat had clipX/w ~ 0.64 (well inside NDC [-1,1] on X) -- meaning the "culled" splat wasn't actually far outside view, and only 389 of 196,726 splats were being eliminated total. User clarified: camera was pushed to the far edge of a landscape asset looking outward, with ~70% of splats clustered near scene center (behind the camera) -- expected 60%+ cut, not 0.2%.
+
+[D] Investigated whether centerClipPos was using the wrong camera's view-projection matrix: found CSCalcViewData used UNITY_MATRIX_VP (Unity's ambient global, fragile with multiple cameras like SceneView+Game dispatching compute in the same editor tick) instead of the explicitly-set _MatrixVP (set correctly per-dispatch in C#, but left commented out). Rest of the file already prefers explicitly-passed matrices (_MatrixMV used directly elsewhere) -- switched centerClipPos to use _MatrixVP to match. Compiled clean.
+
+[F] User re-tested: cut still 0.2%, unchanged after the _MatrixVP fix. Matrix choice was not the (or not the only) cause.
+
+- user pointed out the console read was contaminated by leftover spam: a `[GatherDebug]` Debug.Log in GatherSplatsForCamera (added during the earlier disabled-Main-Camera investigation, GaussianSplatRenderer.cs ~line 136-138) fires on every GUI event and was flooding the 50-entry console buffer, burying the throttled [CullCounter]/[CullDebug] lines needed to diagnose this. User asked to remove that log entirely (not the CullDebug instrumentation, which was a momentary misunderstanding, corrected immediately).
+
+[C] Removed: `[GatherDebug]` Debug.Log line and its sceneCam lookup in GatherSplatsForCamera (GaussianSplatRenderer.cs). Also removed the temporary `_CullDebug` GPU debug-readback instrumentation (SplatUtilities_DeviceRadixSort.compute's _CullDebug buffer and idx0/lastCulled writes, GaussianSplatRenderer.cs's m_GpuCullDebug buffer/Props.CullDebug/its AsyncGPUReadback+log) since it was inconclusive and added its own log noise -- the underlying [CullCounter] survivor-count/cut% log remains intact and unaffected.
+
+[F] Compile check: 0 errors, 0 warnings, isCompiling=false. Clean.
+
+[^] Continue performance. Last: cleaned up console noise -- removed the GatherDebug spam log and the (inconclusive) CullDebug GPU instrumentation, keeping [CullCounter] intact. Next: re-test cull% from the same far-end vantage point with a clean console, then re-approach root-causing why cut is still ~0.2% when 60%+ is expected (the _MatrixVP fix didn't move the number, so the bug is elsewhere -- likely in the worldRadius/margin calculation being far too generous, or centerClipPos itself not reflecting the expected view). Confirm: none.
+
+[F] Re-verified compile after the cleanup: triggered AssetDatabase.Refresh(), confirmed isCompiling=false, then unity_get_compilation_errors -- 0 errors, 0 warnings. Clean.
+
+[^] Continue performance. Last: cleanup compile re-verified clean (0 errors/warnings) after removing GatherDebug/CullDebug. Next: user to re-trigger from the same far-end vantage point with the now-unspammed console, report the [CullCounter] cut% so root-causing the still-near-zero cull can continue. Confirm: none.
+
+- user left a @@ comment on SplatUtilities_DeviceRadixSort.compute:305 -- "Does our entire elimination algorithm trust that behindCam is correct?"
+
+[F] Traced _CullSurvivorCounter's InterlockedAdd (line ~364, before this session's fix): placed at kernel scope AFTER both `if (!behindCam)` blocks, unconditionally -- not gated on !behindCam. Confirmed via git log -p (both compute-shader counter and its C# wiring in GaussianSplatRenderer.cs are wholly uncommitted, added this session, no prior author) that this was written before the bounding-sphere-frustum cull existed, when the kernel's only early-exit was the contribution-cull `return` at line ~355. When the bounding-sphere cull was added afterward, it sets `behindCam = true` without returning -- execution falls through to the counter increment regardless. Only the contribution-cull path (which does `return` early) is actually excluded from the count.
+
+[D] Root cause of the stuck ~0.2% [CullCounter] reading, unrelated to the _MatrixVP change or worldRadius/margin math investigated earlier: the metric itself cannot see deleted/cutout/bounding-sphere-frustum culls, only contribution-threshold culls. The bounding-sphere cull may already be working correctly -- this bug is in the measurement, not necessarily the cull logic.
+
+[^] Continue performance. Last: root-caused the survivor-counter placement bug (counts fall-through, not actual survival, for every cull path except contribution-threshold) in response to user's @@ comment. Proposed fix rejected mid-edit -- user called out a full tag-team protocol break (no wind-up/scoping proposal offered before editing). Next: wind-up properly -- propose the counter-placement fix via AskUserQuestion before touching the file, get a verification pointer, let the user's turn shape it. Confirm: none.
+
+- user asked directly: who introduced behindCam -- us or the original author? Traced via git log -p: introduced by Nigel Hartman (commit d0ee5559, Feb 11 2026), predates Seb's/WorldLabs' fork work entirely. Its exact form (`bool behindCam = centerClipPos.w <= 0; if (!behindCam) {...render...}`) has been the sole gate on the whole per-splat render path since that commit -- not something introduced this session, but this session's frustum cull was newly coupled to it (writing into it, gating on it).
+
+[F] centerClipPos.w<=0 as a concept is legitimate (GL.GetGPUProjectionMatrix-based clip-space projection, confirmed via GaussianSplatRenderer.cs:1178/1190 -- _MatrixVP = matProj*matView is a real, standard clip-space matrix, w<=0 correctly means "at/behind the camera eye point"). But the deleted/cutout checks (lines ~284-295, predating this session) also force centerClipPos.w=0 as a side channel for "don't render this splat" -- unrelated to camera position. So behindCam conflates three unrelated reasons (deleted, cutout, actually-behind-camera) into one boolean by corrupting a shared value, and this session's frustum cull was gated on/writing into that same conflated flag.
+
+- user: "STOP FOLLOWING BEHIND CAM" -- redirected away from further diagnosing behindCam's history/consequences, back to the standing instruction (given two turns earlier) to just write an independent cull with no behindCam dependency.
+
+[C] SplatUtilities_DeviceRadixSort.compute CSCalcViewData: removed behindCam entirely from this kernel. New single bool `splatCulled = centerClipPos.w<=0 || outsideFrustum` (deleted/cutout's forced w=0 still checked directly, no longer via a shared flag with camera-behind logic) gates both `view.pos.w=0` and the single render block (`if (!splatCulled)`), replacing the two previously-separate `if (!behindCam)` blocks.
+
+- user pushed on the frustum test itself: "why is it so hard to just get the camera frustum and check whether our splat point with scaled (gaussian) radius is inside or outside of that" -- correctly identified the clip-space-margin-via-_m00/_m11 approach as an indirect hack rather than the textbook operation (plane-vs-sphere test in world space).
+
+[D] Chose to reuse GeometryUtility.CalculateFrustumPlanes(cam) (Unity API, already used for the CPU-side per-renderer cull in GatherSplatsForCamera, GaussianSplatRenderer.cs:120) rather than hand-rolling clip-space plane extraction in HLSL -- upload the 6 world-space planes as a float4[6] constant per dispatch, test each splat's world-space bounding sphere (worldRadius = kCullMargin * splatScale * max scale axis) against all 6 via signed-distance-vs-radius, same technique as the existing per-renderer cull, just per-splat.
+
+[C] GaussianSplatRenderer.cs: added Props.FrustumPlanes ("_FrustumPlanes"), a static s_FrustumPlaneVectors[6] reused across calls (no per-frame alloc), computed via GeometryUtility.CalculateFrustumPlanes(cam) inside CalcViewData (the CSCalcViewData dispatch site, distinct from the two other _VecWorldSpaceCameraPos call sites at EditUpdateSelection/EditBrushSelect which were left untouched -- confirmed via grep these are unrelated editor-selection kernels), uploaded via SetComputeVectorArrayParam.
+
+[C] SplatUtilities_DeviceRadixSort.compute: declared `float4 _FrustumPlanes[6]`. Replaced the clip-space-margin outsideFrustum test with a real world-space plane-vs-sphere loop (`[unroll]` over 6 planes, `dot(plane.xyz, centerWorldPos) + plane.w < -worldRadius` => outside), fully independent of centerClipPos/w for the frustum portion -- only the separate deleted/cutout w<=0 check remains clip-space-based, ORed in as its own term.
+
+[C] Same pass: moved the _CullSurvivorCounter InterlockedAdd inside the `if (!splatCulled)` block (was previously outside/after it, counting fall-through rather than actual survival -- same class of bug as the original behindCam-era counter placement issue, now fixed for the new splatCulled-based structure).
+
+[F] Compile verified clean twice (once after the plane-cull C#+compute changes, once after the counter-placement fix): AssetDatabase.Refresh -> isCompiling=false -> unity_get_compilation_errors => 0 errors, 0 warnings both times.
+
+[^] Continue performance. Last: behindCam fully removed from CSCalcViewData -- replaced with a self-contained splatCulled bool combining (a) deleted/cutout's direct w<=0 check and (b) a real world-space plane-vs-sphere frustum test using GeometryUtility.CalculateFrustumPlanes(cam) (same API as the existing CPU per-renderer cull), no more clip-space margin approximation. Survivor counter moved inside the surviving-splat block so cut% now reflects true survival. Compile clean. Next: user to re-trigger from the same far-end vantage point used earlier to flag the stuck ~0.2% reading, report the new [CullCounter] cut% -- first real test of whether the plane-based cull actually discriminates as expected (60%+ from that framing). Confirm: none.
+
+- user drove the camera from the center of the original unseparated 500k-splat asset ("Original") through a corridor to the far end, recording for playback, and read the console log live.
+
+[F] Read [CullCounter] log for "Original" (splatCount=500000) across the drive: cut% swung 49.1% -> 94.7% -> 99.7% -> 65.3% -> 88.9% -> 58.0% -> 98.3% -> 99.3% as the camera moved. Real per-frame discrimination tracking camera framing (narrow corridor views -> high cut%, more open views -> lower cut%), not a stuck flat value. First reading showed the known cold-start garbage-readback artifact (survivorCounter=3241205150, cut=-648141.1%, self-corrected on the next log 2s later) -- same pre-existing AsyncGPUReadback-before-first-dispatch race noted earlier this session, not a new regression.
+
+[D] Plane-based bounding-sphere-vs-frustum cull confirmed working end-to-end: replacing behindCam-coupled clip-space-margin math with GeometryUtility.CalculateFrustumPlanes(cam) + world-space plane-vs-sphere test resolved the stuck ~0.2% reading from before this fix -- cut% now varies meaningfully (5.5% to 100% observed across all renderers this session) with camera framing, as expected for a real frustum cull.
+
+[^] Continue performance. Last: per-splat bounding-sphere-vs-frustum cull verified working via a live corridor camera drive on the 500k "Original" asset -- cut% swings 49-99% tracking camera framing, confirming the plane-based rewrite (replacing behindCam-coupled clip-space margin math) actually discriminates correctly. Next: drift -- decide whether to clean up the known cold-start garbage-readback artifact (still present, self-correcting, not blocking), promote this cull to non-debug/production-ready state (remove/gate the per-renderer Debug.Log spam), or move to a different open thread (Pass 1 opaque/early-Z promotion, LOD port plan, on-device Low-vs-VeryHigh test). Confirm: none.
+
+- user: clear the logs except for the culling count.
+
+[C] GaussianSplatURPFeature.cs OnCameraPreCull: removed the leftover `[GS-DEBUG]` scoped stack-trace log (cameraData.camera.name=="Main Camera" branch) from the earlier disabled-Main-Camera investigation -- root-caused weeks ago as expected URP behavior, no longer needed. [CullCounter] log in GaussianSplatRenderer.cs:1246 and all Debug.LogError calls (legitimate null-check/invalid-param error paths, not debug spam) left untouched.
+
+[F] Compile check: AssetDatabase.Refresh -> isCompiling=false -> unity_get_compilation_errors => 0 errors, 0 warnings.
+
+[^] Continue performance. Last: removed the stale [GS-DEBUG] OnCameraPreCull stack-trace log, leaving [CullCounter] as the only debug-tier logging in the cull path. Compile clean. Next: drift -- decide whether to clean up the cold-start garbage-readback artifact, promote the cull to non-debug/production-ready state, or move to a different open thread (Pass 1 opaque/early-Z promotion, LOD port plan, on-device Low-vs-VeryHigh test). Confirm: none.
+
+- user: confirmed this is a real performance lever (fragment/ALU-cost reduction targeting bottleneck #1, overdraw -- not a bandwidth or sort-cost fix, those remain separate open threads) and declared the feature done.
+
+[/Activity]
+
+Per-splat bounding-sphere-vs-frustum cull in CSCalcViewData: implemented, code-reviewed live via user's own @@ comments (caught and fixed a real coupling to Nigel Hartman's pre-fork behindCam variable, replaced with a self-contained splatCulled bool and a proper world-space plane-vs-sphere test via GeometryUtility.CalculateFrustumPlanes), verified end-to-end via a live corridor camera drive on the 500k "Original" asset (cut% 49-99.7% tracking camera framing correctly), and cleaned of debug log spam. Known residual: cold-start AsyncGPUReadback garbage-value artifact on first frame (self-corrects, not blocking, not addressed this session).
+
+[^] Continue performance. Last: per-splat frustum-cull Activity declared complete by user. Next: drift -- open threads available: Pass 1 (opaque/early-Z shader path, already TBDR-correct, not yet promoted to default), LOD port plan (CPU job/thread traversal -> index buffer -> reduced-count dispatch, sketched but not implemented), on-device Low-vs-VeryHigh compression test (blocked on Quest access), cold-start readback artifact cleanup. Confirm: none.
+
+- user, entering wrap-up: flagged the outer "find TBDR strategy mismatches for Quest" Activity (opened earlier this session, its destination is a concrete named list of mismatches) was never explicitly closed -- its sub-work (CPU frustum cull, separator bounds fix, per-splat frustum cull) all completed underneath it but the outer wrapper stayed open. Chose to complete it properly rather than close it unexamined.
+
+[S] Compile the destination's actual deliverable: a named list of TBDR strategy mismatches, from material already logged this session plus one final adjacent check (SH/ALU cost path) before finalizing.
+
+[F] Checked ShadeSH (GaussianSplatting.hlsl:139): shOrder-gated branches are uniform (same _SHOrder value across an entire dispatch, not per-splat), so no wavefront-divergence penalty on TBDR -- ruled out as a mismatch.
+
+[F] Found a 4th, distinct mismatch via direct code read of CSCalcViewData (SplatUtilities_DeviceRadixSort.compute:333-365): col.a (opacity = splat.opacity * opacityScale) is known immediately from LoadSplatData alone, with no dependency on covariance or SH. Yet the contribution-cull check (col.a < _ContributionCullThreshold) only runs at line 361, AFTER the full covariance computation (CalcCovariance3D/CalcCovariance2D/DecomposeCovariance) and complete SH evaluation (ShadeSH, up to 3rd degree -- the kernel's most ALU-expensive code) have already executed for that splat. A cheap, already-available rejection criterion gates the kernel's most expensive work too late to save any of that cost.
+
+[D] Compiled list -- 4 concrete, code-grounded TBDR strategy mismatches found this session, all in this fork's own pipeline code (not spark-comparison-derived):
+1. **Fragment/overdraw default path** (RenderGaussianSplats.shader): production uses Pass 0 (alpha-blend + discard, disables Adreno early-Z) while Pass 1 (vertex-side opacity cull + tight quad sizing, TBDR-correct, ~19ms overdraw saving per its own comment) sits unused as an "experiment." Not fixed this session -- promotion to default remains open.
+2. **No spatial culling at any level** (GaussianSplatRenderer.cs / SplatUtilities_DeviceRadixSort.compute): object-level had no frustum test at all; per-splat had only an opacity threshold, not spatial. FIXED this session -- CPU object-level frustum cull added to GatherSplatsForCamera, GPU per-splat bounding-sphere-vs-frustum cull added to CSCalcViewData, both verified live.
+3. **Sort dispatched over full m_SplatCount regardless of culling** (GaussianSplatRenderer.cs:1308, CSSetIndices/CSCalcDistances): every culled/off-screen splat still gets a sort key computed and radix-sorted every frame -- culling implemented this session saves fragment/ALU cost but not sort cost. Not fixed this session -- remains open, same shape as the LOD port plan's stated goal (reduce dispatch count, not just discard results).
+4. **Contribution-cull ordering in CSCalcViewData** (SplatUtilities_DeviceRadixSort.compute:333-365): opacity (col.a) is known from LoadSplatData alone, cheap and immediate, but the cull check against it runs only after covariance computation and full SH evaluation -- the kernel's most expensive ALU work -- have already executed for every splat, including ones that will be discarded a few lines later. Not fixed this session -- reordering the check earlier (right after LoadSplatData, before covariance/SH) is a small, mechanical fix, flagged as new open work.
+
+[/S]
+[/Activity]
+
+[^] Continue performance. Last: outer TBDR-strategy-mismatch Activity closed -- compiled the destination's required deliverable, a 4-item named list (fragment/overdraw default path, spatial culling [fixed], sort dispatch count, contribution-cull ordering), each grounded in this fork's own code, not spark-comparison. 2 of 4 fixed this session (spatial culling); 3 of 4 remain open work (Pass 1 promotion, sort-dispatch-count reduction, contribution-cull reordering). Next: wrap-up resumes at Step 2 -- session has no other open Activity/S wrappers remaining. Confirm: none.
+
+- user, still in wrap-up: found a second unclosed wrapper -- the LOD-port-plan Activity (opened line 100), suspended (not closed) at line 127 to pursue the TBDR-mismatch investigation, never resumed. Chose to resume and actually complete it, not just close the wrapper.
+
+[S] Re-derive the LOD port plan's shape now that per-splat and per-renderer frustum culling exist, discarding the prior unreviewed 6-step draft (flagged as a protocol violation earlier -- produced without tag-team turns) rather than treating it as settled.
+
+[F] Confirmed via direct code read: today's per-splat frustum cull (SplatUtilities_DeviceRadixSort.compute:302-330) runs inside CSCalcViewData, which dispatches AFTER CSSetIndices (identity fill, still unconditional over _SplatCount) and the full sort. The cull's splatCulled result is computed too late in dispatch order to reduce sort-dispatch count -- mismatch #3 (sort always full count) is structurally unaffected by today's work, confirmed unchanged.
+
+[D] What DID change: a proven, working plane-vs-sphere visibility test (GeometryUtility.CalculateFrustumPlanes(cam) + world-space bounding sphere, verified live via corridor camera drive) now exists as reusable code -- LOD no longer needs to derive its own "is this visible" math from scratch.
+
+- user asked directly whether the splat-based cull should move earlier in the pipeline, ahead of CSSetIndices/sort, instead of staying inside CSCalcViewData.
+
+[D] Reframed the LOD port plan around this: moving frustum-cull compaction earlier (new/adapted early kernel writing a compacted index list of only surviving splats, replacing CSSetIndices's identity fill) would let CSCalcDistances/the sort/CSCalcViewData all dispatch over a reduced count -- directly fixing mismatch #3, using the exact plane-vs-sphere math already proven today, independent of LOD's screen-space-error/budget logic entirely.
+
+[D] Revised plan, in two sequential activities rather than one from-scratch LOD build:
+1. **Frustum-cull compaction** (new activity, not done today): move today's plane-vs-sphere test earlier in the dispatch order, produce a compacted index buffer of surviving splats, resize CSCalcDistances/sort/CSCalcViewData dispatch calls to the compacted count. Solves mismatch #3 on its own merits, no LOD-specific concepts (no hierarchy, no CPU Job, no screen-space error) required.
+2. **LOD, built on top of (1)**: once the pipeline is proven dispatch-count-elastic (index buffer + reduced count flowing through the same three stages), LOD becomes "swap the selection source" -- a CPU-side hierarchy/screen-space-error/budget selection replacing or supplementing the frustum test's compacted index list, not a from-scratch pipeline rework. The CPU-vs-GPU tradeoff analysis from the original draft ([F]/[D] at lines 104-110, C# Job System on CPU given its 13%-utilized headroom) still holds and carries forward to this stage.
+
+[/S]
+[/Activity]
+
+[^] Continue performance. Last: LOD-port-plan Activity resumed and closed -- re-derived (not retained from the prior unreviewed draft) that today's frustum cull runs too late to reduce sort-dispatch-count itself, but its plane-vs-sphere math is reusable. Reframed as two sequential activities: frustum-cull compaction (earlier dispatch, compacted index buffer, fixes mismatch #3 directly, no LOD concepts needed) first, then LOD as "swap the selection source" on top of that plumbing. Neither implemented today -- both are new open work. Next: wrap-up resumes at Step 2 -- re-scan for any remaining unclosed wrappers before proceeding to Step 3 (~ entries) and beyond. Confirm: none.

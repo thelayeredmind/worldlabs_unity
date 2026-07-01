@@ -51,6 +51,11 @@ float4 _VecScreenParams;
 float4 _VecWorldSpaceCameraPos;
 int _SelectionMode;
 
+// World-space frustum planes (xyz = normal, w = distance), from GeometryUtility.CalculateFrustumPlanes(cam) --
+// same source as the CPU-side per-renderer frustum cull in GatherSplatsForCamera. Unity's plane convention:
+// a point is on the frustum's inside/positive side when dot(normal, point) + distance >= 0.
+float4 _FrustumPlanes[6];
+
 RWStructuredBuffer<uint> _SplatSortDistances;
 RWStructuredBuffer<uint> _SplatSortKeys;
 uint _SplatCount;
@@ -252,6 +257,9 @@ bool IsSplatCut(float3 pos)
     return finalCut;
 }
 
+// Atomic counter of splats surviving per-splat culling in CSCalcViewData, for measuring cull effectiveness.
+RWStructuredBuffer<uint> _CullSurvivorCounter;
+
 [numthreads(GROUP_SIZE,1,1)]
 void CSCalcViewData (uint3 id : SV_DispatchThreadID)
 {
@@ -266,8 +274,10 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     GSPLAT_APPLY_EFFECTS(splat, effectColorOverride);
 
     float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
-    //float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
-    float4 centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
+    // Use the explicitly-passed _MatrixVP (set per-dispatch in CalcViewData), not UNITY_MATRIX_VP -- the latter is
+    // Unity's ambient global and can reflect the wrong camera when multiple cameras (e.g. SceneView + Game) dispatch
+    // this kernel within the same editor tick. Matches how _MatrixMV is already used explicitly elsewhere in this file.
+    float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
     half opacityScale = _SplatOpacityScale;
     float splatScale = _SplatScale;
 
@@ -290,8 +300,37 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     }
 
     view.pos = centerClipPos;
-    bool behindCam = centerClipPos.w <= 0;
-    if (!behindCam)
+
+    // Per-splat cull. Two independent reasons, combined with OR:
+    // (1) deleted/cutout above already forced centerClipPos.w=0 -- checked directly, not derived from any
+    //     other flag; (2) bounding-sphere-vs-frustum test: world-space sphere (radius = margin * max scale
+    //     axis, object-to-world scale via the object-space basis vector lengths) tested against the same
+    //     6 world-space planes GeometryUtility.CalculateFrustumPlanes(cam) produces for the CPU-side
+    //     per-renderer cull in GatherSplatsForCamera -- a real plane-vs-sphere test, not a clip-space margin
+    //     approximation. Splat survives only if the sphere is at least partially inside every plane.
+    float3 worldScaleAxis = mul((float3x3)_MatrixObjectToWorld, splat.scale);
+    float worldRadius = splatScale * max(max(abs(worldScaleAxis.x), abs(worldScaleAxis.y)), abs(worldScaleAxis.z));
+    const float kCullMargin = 1.5;
+    worldRadius *= kCullMargin;
+
+    bool outsideFrustum = false;
+    [unroll]
+    for (int planeIdx = 0; planeIdx < 6; planeIdx++)
+    {
+        float4 plane = _FrustumPlanes[planeIdx];
+        float signedDist = dot(plane.xyz, centerWorldPos) + plane.w;
+        if (signedDist < -worldRadius)
+        {
+            outsideFrustum = true;
+            break;
+        }
+    }
+
+    bool splatCulled = centerClipPos.w <= 0 || outsideFrustum;
+    if (splatCulled)
+        view.pos.w = 0;
+
+    if (!splatCulled)
     {
         float4 boxRot = splat.rot;
         float3 boxSize = splat.scale;
@@ -328,8 +367,14 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
 
         view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
         view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
+
+        // Counts every splat surviving deleted/cutout/frustum/contribution culling. Must stay inside this
+        // block: splatCulled==true skips straight to _SplatViewData[idx]=view below without returning, so a
+        // counter placed after this block would count culled splats as survivors.
+        uint _unusedCounterIndex;
+        InterlockedAdd(_CullSurvivorCounter[0], 1, _unusedCounterIndex);
     }
-    
+
     _SplatViewData[idx] = view;
 }
 
