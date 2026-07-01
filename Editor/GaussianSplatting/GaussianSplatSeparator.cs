@@ -110,6 +110,9 @@ namespace GaussianSplatting.Editor
                 byte[] newSH    = new byte[newSplatCount * shStride];
                 byte[] newColor = new byte[newSplatCount * colorBytesPerPixel];
 
+                Vector3 newBoundsMin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+                Vector3 newBoundsMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+
                 int dstIdx = 0;
                 for (int i = 0; i < splatCount; i++)
                 {
@@ -121,6 +124,13 @@ namespace GaussianSplatting.Editor
                     Array.Copy(posData,   i * posStride,   newPos,   dstIdx * posStride,   posStride);
                     Array.Copy(otherData, i * otherStride, newOther, dstIdx * otherStride, otherStride);
                     Array.Copy(shData,    i * shStride,    newSH,    dstIdx * shStride,    shStride);
+
+                    // posStride is exactly float3 for VeryHigh (no-chunk) assets — decode directly to accumulate bounds.
+                    float px = BitConverter.ToSingle(posData, i * posStride);
+                    float py = BitConverter.ToSingle(posData, i * posStride + 4);
+                    float pz = BitConverter.ToSingle(posData, i * posStride + 8);
+                    newBoundsMin = Vector3.Min(newBoundsMin, new Vector3(px, py, pz));
+                    newBoundsMax = Vector3.Max(newBoundsMax, new Vector3(px, py, pz));
 
                     // Read from Morton-tiled texture position for src splat i, write flat to dst splat dstIdx
                     var (srcPx, srcPy) = SplatIndexToPixel(i);
@@ -153,7 +163,7 @@ namespace GaussianSplatting.Editor
                     GaussianSplatAsset.VectorFormat.Float32,
                     GaussianSplatAsset.ColorFormat.Float32x4,
                     GaussianSplatAsset.SHFormat.Float32,
-                    srcAsset.boundsMin, srcAsset.boundsMax,
+                    newBoundsMin, newBoundsMax,
                     null,
                     new[] { new Unity.Mathematics.int2(0, newSplatCount) }
                 );

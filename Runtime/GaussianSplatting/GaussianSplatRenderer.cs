@@ -79,6 +79,37 @@ namespace GaussianSplatting.Runtime
             return count;
         }
 
+        // Total splats across every registered renderer, regardless of active/valid/frustum state.
+        // Compared against CountAllGaussians() (post-cull) to measure culling effectiveness.
+        public int CountTotalGaussiansInScene()
+        {
+            int count = 0;
+            foreach (var kvp in m_Splats)
+            {
+                var gs = kvp.Key;
+                if (gs != null)
+                    count += gs.splatCount;
+            }
+            return count;
+        }
+
+        // Transforms a local-space AABB by an arbitrary transform (handles rotation, not just scale/translate).
+        static Bounds TransformBounds(Transform t, Bounds localBounds)
+        {
+            var center = localBounds.center;
+            var extents = localBounds.extents;
+            Bounds worldBounds = new Bounds(t.TransformPoint(center), Vector3.zero);
+            for (int i = 0; i < 8; i++)
+            {
+                var corner = center + new Vector3(
+                    (i & 1) == 0 ? -extents.x : extents.x,
+                    (i & 2) == 0 ? -extents.y : extents.y,
+                    (i & 4) == 0 ? -extents.z : extents.z);
+                worldBounds.Encapsulate(t.TransformPoint(corner));
+            }
+            return worldBounds;
+        }
+
         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
         public bool GatherSplatsForCamera(Camera cam)
         {
@@ -86,11 +117,20 @@ namespace GaussianSplatting.Runtime
                 return false;
             // gather all active & valid splat objects
             m_ActiveSplats.Clear();
+            var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(cam);
             foreach (var kvp in m_Splats)
             {
                 var gs = kvp.Key;
                 if (gs == null || !gs.isActiveAndEnabled || !gs.HasValidAsset || !gs.HasValidRenderSetup)
                     continue;
+                // Frustum cull: skip renderers whose world-space bounds don't touch the camera frustum.
+                // Renderers with no bounds metadata (external-buffer path) are never culled.
+                if (gs.TryGetLocalBounds(out var localBounds))
+                {
+                    var worldBounds = TransformBounds(gs.transform, localBounds);
+                    if (!GeometryUtility.TestPlanesAABB(frustumPlanes, worldBounds))
+                        continue;
+                }
                 m_ActiveSplats.Add((kvp.Key, kvp.Value));
             }
             if (m_ActiveSplats.Count == 0)
@@ -472,6 +512,31 @@ namespace GaussianSplatting.Runtime
              m_Asset.shDataSize > 0 &&
              m_Asset.colorDataSize > 0);
         public bool HasValidRenderSetup => HasExternalBuffers || (m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null);
+
+        // Local-space bounds for culling. External-buffer renderers carry no bounds metadata,
+        // so they report false (never culled) rather than guessing.
+        public bool TryGetLocalBounds(out Bounds bounds)
+        {
+            Vector3 min, max;
+            if (HasValidRuntimeData)
+            {
+                min = m_RuntimeData.boundsMin;
+                max = m_RuntimeData.boundsMax;
+            }
+            else if (m_Asset != null)
+            {
+                min = m_Asset.boundsMin;
+                max = m_Asset.boundsMax;
+            }
+            else
+            {
+                bounds = default;
+                return false;
+            }
+            bounds = default;
+            bounds.SetMinMax(min, max);
+            return true;
+        }
 
         const int kGpuViewDataSize = 40;
 
