@@ -25,4 +25,24 @@ Compile check: 0 errors, isCompiling false.
 [/S]
 [/Activity] — GaussianQualityHUD shipped and confirmed working in Play mode by user.
 
-[^] Continue quality. Last: activity complete, HUD confirmed on. Next: drift or wrap up. Confirm: none.
+[D] Next activity: label boxes stack in a fixed top-right legend column; a GL line connects each box to its splat's projected screen centre.
+
+[Activity] Extend GaussianQualityHUD so label boxes stack vertically in a fixed top-right column (one per active GaussianSplatRenderer), and each box is connected to its splat's projected world-centre by a GL line drawn via GL.Begin(GL.LINES) in OnPostRender (or a helper Camera component). The line runs from the right edge of the label box to the splat's screen-space point. Splat-to-label association is stable across frames (same order as FindObjectsByType). The existing OnGUI label content (tier name + format fields) is unchanged.
+
+Activity: Legend column + GL connector lines from each label to its splat's screen centre.
+
+Ready to wind up.
+[S] Legend column + GL connector lines
+- reviewable surface: compile check + visual in Play mode
+Attempt 1
+Rewrote GaussianQualityHUD.cs. OnGUI now stacks label boxes in a fixed top-right column, one slot per in-frustum renderer (sorted by instance ID, compacted when renderers leave the frustum). OnPostRender draws a GL line (yellow, alpha 0.85) from the left-centre of each box to the splat's projected screen position using Hidden/Internal-Colored shader + LoadPixelMatrix. Y-coordinate conversion handled explicitly between GUI space and GL screen space.
+Compile check: 0 errors, isCompiling false.
+✓ Clean (compile)
+[/S]
+[R1] Slot assignment was instance-field slot++, not static — rebuilt every frame with no memory. >> Fixed: static s_Registered list, renderers self-register on OnEnable/OnDisable.
+[R2] DrawLine GUIUtility.RotateAroundPivot corrupting GUI matrix for subsequent draws. >> Fixed: save/restore GUI.matrix around rotation.
+[>] Occlusion: hide dot/label when splat centre is occluded by scene geometry — deferred, needs colliders or depth buffer approach.
+
+--- CLOSED 2026-07-01 — Quality system oriented (format/chunk pipeline survey). GaussianQualityHUD shipped: tier name + format fields, color-coded dot, connector line to legend column, renderers self-register via static list. Confirmed working in editor at 1x Game view scale. ---
+
+[^] Continue quality. Last: session closed. Next: new session or done.
