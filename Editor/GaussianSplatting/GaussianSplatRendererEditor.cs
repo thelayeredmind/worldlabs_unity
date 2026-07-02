@@ -46,6 +46,7 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropOptimizeForQuest;
         SerializedProperty m_PropContributionCullThreshold;
         SerializedProperty m_PropAlphaDiscardThreshold;
+        SerializedProperty m_PropHotspotDebugVisualize;
         SerializedProperty m_PropOpaqueExperiment;
 
         bool m_ResourcesExpanded = false;
@@ -106,6 +107,7 @@ namespace GaussianSplatting.Editor
             m_PropOptimizeForQuest = serializedObject.FindProperty("m_OptimizeForQuest");
             m_PropContributionCullThreshold = serializedObject.FindProperty("m_ContributionCullThreshold");
             m_PropAlphaDiscardThreshold = serializedObject.FindProperty("m_AlphaDiscardThreshold");
+            m_PropHotspotDebugVisualize = serializedObject.FindProperty("m_HotspotDebugVisualize");
             m_PropOpaqueExperiment = serializedObject.FindProperty("m_OpaqueExperiment");
             s_AllEditors.Add(this);
             
@@ -374,20 +376,15 @@ namespace GaussianSplatting.Editor
 
             EditorGUILayout.Space();
             GUILayout.Label("Render Options", EditorStyles.boldLabel);
-            EditorGUILayout.PropertyField(m_PropSplatScale);
-            EditorGUILayout.PropertyField(m_PropOpacityScale);
-            EditorGUILayout.PropertyField(m_PropSHOrder);
-            EditorGUILayout.PropertyField(m_PropSHOnly);
-            EditorGUILayout.PropertyField(m_PropRenderOrder);
-            EditorGUILayout.PropertyField(m_gpuSortType);
+            foreach (var prop in new[] { m_PropSplatScale, m_PropOpacityScale, m_PropSHOrder, m_PropSHOnly, m_PropRenderOrder, m_gpuSortType })
+                EditorGUILayout.PropertyField(prop);
             if (gs.m_gpuSortType != GpuSorting.SortType.None)
             {
                 EditorGUILayout.PropertyField(m_PropSortNthFrame);
                 EditorGUILayout.PropertyField(m_CenterEyeOnly);
             }
-            EditorGUILayout.PropertyField(m_PropOptimizeForQuest);
-            EditorGUILayout.PropertyField(m_PropContributionCullThreshold);
-            EditorGUILayout.PropertyField(m_PropAlphaDiscardThreshold);
+            foreach (var prop in new[] { m_PropOptimizeForQuest, m_PropContributionCullThreshold, m_PropAlphaDiscardThreshold, m_PropHotspotDebugVisualize })
+                EditorGUILayout.PropertyField(prop);
 
             if (gs.HasValidAsset && gs.asset != null)
             {

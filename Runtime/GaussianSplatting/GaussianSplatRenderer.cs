@@ -310,6 +310,8 @@ namespace GaussianSplatting.Runtime
         public float m_ContributionCullThreshold = 0.05f;
         [Range(0, 0.5f)] [Tooltip("Fragment alpha below this value is discarded. Controls splat edge softness vs. fill rate.")]
         public float m_AlphaDiscardThreshold = 0.05f;
+        [Tooltip("Diagnostic: color splats by distance to nearest hotspot (green = full detail, red = attenuation edge) instead of their real color.")]
+        public bool m_HotspotDebugVisualize;
 
         public bool test;
 
@@ -447,6 +449,11 @@ namespace GaussianSplatting.Runtime
             public static readonly int VecScreenParams = Shader.PropertyToID("_VecScreenParams");
             public static readonly int VecWorldSpaceCameraPos = Shader.PropertyToID("_VecWorldSpaceCameraPos");
             public static readonly int FrustumPlanes = Shader.PropertyToID("_FrustumPlanes");
+            public static readonly int HotspotCount = Shader.PropertyToID("_HotspotCount");
+            public static readonly int HotspotPositions = Shader.PropertyToID("_HotspotPositions");
+            public static readonly int HotspotFullRadius = Shader.PropertyToID("_HotspotFullRadius");
+            public static readonly int HotspotAttenuationRadius = Shader.PropertyToID("_HotspotAttenuationRadius");
+            public static readonly int HotspotDebugVisualize = Shader.PropertyToID("_HotspotDebugVisualize");
             public static readonly int SelectionCenter = Shader.PropertyToID("_SelectionCenter");
             public static readonly int SelectionDelta = Shader.PropertyToID("_SelectionDelta");
             public static readonly int SelectionDeltaRot = Shader.PropertyToID("_SelectionDeltaRot");
@@ -1165,6 +1172,12 @@ namespace GaussianSplatting.Runtime
         // Reused across CalcViewData calls to avoid a per-frame allocation for the frustum-plane upload.
         static readonly Vector4[] s_FrustumPlaneVectors = new Vector4[6];
 
+        // Reused scratch arrays for hotspot upload — max 8 hotspots matches MAX_HOTSPOTS in the compute shader.
+        const int k_MaxHotspots = 8;
+        static readonly Vector4[] s_HotspotPositions    = new Vector4[k_MaxHotspots];
+        static readonly float[]   s_HotspotFullRadius   = new float[k_MaxHotspots];
+        static readonly float[]   s_HotspotAttenRadius  = new float[k_MaxHotspots];
+
         internal void CalcViewData(CommandBuffer cmb, Camera cam, Matrix4x4 matrix)
         {
             if (cam.cameraType == CameraType.Preview)
@@ -1215,6 +1228,26 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.ContributionCullThreshold, m_ContributionCullThreshold);
+
+            // Hotspot LOD — upload positions and radii from any active GaussianHotspotVolume components.
+            var hotspots = GaussianHotspotVolume.ActiveHotspots;
+            int hotspotCount = Mathf.Min(hotspots.Count, k_MaxHotspots);
+            for (int i = 0; i < hotspotCount; ++i)
+            {
+                var h = hotspots[i];
+                var wp = h.transform.position;
+                s_HotspotPositions[i]   = new Vector4(wp.x, wp.y, wp.z, 0f);
+                s_HotspotFullRadius[i]  = h.m_FullDetailRadius;
+                s_HotspotAttenRadius[i] = h.m_AttenuationRadius;
+            }
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.HotspotCount, hotspotCount);
+            if (hotspotCount > 0)
+            {
+                cmb.SetComputeVectorArrayParam(m_CSSplatUtilities, Props.HotspotPositions, s_HotspotPositions);
+                cmb.SetComputeFloatParams(m_CSSplatUtilities, Props.HotspotFullRadius, s_HotspotFullRadius);
+                cmb.SetComputeFloatParams(m_CSSplatUtilities, Props.HotspotAttenuationRadius, s_HotspotAttenRadius);
+            }
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.HotspotDebugVisualize, m_HotspotDebugVisualize ? 1 : 0);
 
             UpdateEffectLayerBuffer(cmb);
 

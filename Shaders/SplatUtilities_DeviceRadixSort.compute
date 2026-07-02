@@ -107,6 +107,67 @@ uint _SHOrder;
 uint _SHOnly;
 float _ContributionCullThreshold;
 
+// Hotspot LOD — uploaded by GaussianSplatRenderer when GaussianHotspotVolume components are present.
+// Each float4: xyz = world-space position, w = unused.
+// Parallel arrays: _HotspotFullRadius[i] and _HotspotAttenuationRadius[i] match _Hotspots[i].
+// When _HotspotCount == 0 the plain _ContributionCullThreshold path is taken instead.
+#define MAX_HOTSPOTS 8
+uint _HotspotCount;
+float4 _HotspotPositions[MAX_HOTSPOTS];
+float _HotspotFullRadius[MAX_HOTSPOTS];
+float _HotspotAttenuationRadius[MAX_HOTSPOTS];
+
+// Debug visualization: when enabled, overrides splat color with nearest-hotspot distance
+// (green = at/inside fullRadius, red = at/beyond attenuationRadius). Diagnostic only.
+uint _HotspotDebugVisualize;
+
+// Debug-only: returns the normalized [0,1] ramp fraction to the nearest hotspot
+// (0 = at/inside its fullRadius, 1 = at/beyond its attenuationRadius) for color visualization.
+float HotspotDebugFraction(float3 worldPos)
+{
+    float bestFraction = 1.0f;
+    for (uint i = 0; i < _HotspotCount; ++i)
+    {
+        float d     = distance(worldPos, _HotspotPositions[i].xyz);
+        float fullR = _HotspotFullRadius[i];
+        float attR  = _HotspotAttenuationRadius[i];
+        float fraction = (attR > fullR) ? saturate((d - fullR) / (attR - fullR)) : (d > fullR ? 1.0f : 0.0f);
+        bestFraction = min(bestFraction, fraction);
+    }
+    return bestFraction;
+}
+
+// Returns the effective contribution-cull threshold for a splat at worldPos given the
+// registered hotspots. Finds the nearest hotspot and maps distance to a threshold:
+//   dist <= fullRadius       → baseThreshold (no change)
+//   fullRadius < dist < attRadius → smoothstep ramp from baseThreshold up to 1.0
+//   dist >= attRadius        → 2.0 (guaranteed above any opacity, forces cull)
+float HotspotCullThreshold(float3 worldPos, float baseThreshold)
+{
+    if (_HotspotCount == 0)
+        return baseThreshold;
+
+    // A splat survives if it is within range of ANY hotspot, not just the nearest —
+    // evaluate each hotspot's own ramp independently, take the most permissive (lowest) threshold.
+    float bestThreshold = 2.0f;
+    for (uint i = 0; i < _HotspotCount; ++i)
+    {
+        float d     = distance(worldPos, _HotspotPositions[i].xyz);
+        float fullR = _HotspotFullRadius[i];
+        float attR  = _HotspotAttenuationRadius[i];
+
+        float t;
+        if (d <= fullR)
+            t = baseThreshold;
+        else if (d >= attR)
+            t = 2.0f;
+        else
+            t = lerp(baseThreshold, 1.0f, smoothstep(fullR, attR, d));
+        bestThreshold = min(bestThreshold, t);
+    }
+    return bestThreshold;
+}
+
 uint _SplatCutoutsCount;
 
 #define SPLAT_CUTOUT_TYPE_ELLIPSOID 0
@@ -359,9 +420,17 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         if (effectColorOverride.a >= 0)
             col.rgb = (half3)effectColorOverride.rgb;
         col.a = min(splat.opacity * opacityScale, 65000);
-        
-        // Cull splats below threshold before rasterization (more efficient than fragment discard)
-        if (col.a < _ContributionCullThreshold)
+
+        if (_HotspotDebugVisualize != 0 && _HotspotCount > 0)
+        {
+            float debugFraction = HotspotDebugFraction(centerWorldPos);
+            col.rgb = (half3)lerp(half3(0,1,0), half3(1,0,0), debugFraction);
+        }
+
+        // Cull splats below threshold before rasterization (more efficient than fragment discard).
+        // When hotspots are present the threshold is raised for splats far from all of them.
+        float cullThreshold = HotspotCullThreshold(centerWorldPos, _ContributionCullThreshold);
+        if (col.a < cullThreshold)
         {
             view.pos.w = 0;
             _SplatViewData[idx] = view;
