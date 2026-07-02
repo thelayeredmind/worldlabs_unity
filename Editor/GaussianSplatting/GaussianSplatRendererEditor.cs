@@ -56,6 +56,11 @@ namespace GaussianSplatting.Editor
         float m_DeleteDensity = 1f;
         float m_DeleteHardness = 1f;
 
+        // Reproject (stopgap test UI — not the final slider control)
+        int m_ReprojectViewpointMode; // 0 = live SceneView camera, 1 = target Transform
+        Transform m_ReprojectTargetTransform;
+        float m_ReprojectAmount = 1f;
+
         public static float DeleteHardness { get; private set; } = 1f;
 
         // Undo stack for GPU state. Each entry is deleted-bits snapshot + selected-bits snapshot to restore after undo.
@@ -744,6 +749,33 @@ namespace GaussianSplatting.Editor
                             var gsRef = gs; EditorApplication.delayCall += () => gsRef?.SetMaskDirty();
                         }
                     }
+                }
+            }
+
+            // Reproject — stopgap test UI. Real UI is a custom horizontal-drag slider; this is a
+            // numeric field + button so the viewpoint sourcing and kernel can be tested without
+            // driving them via script each time.
+            EditorGUILayout.Space();
+            GUILayout.Label("Reproject", EditorStyles.boldLabel);
+            m_ReprojectViewpointMode = EditorGUILayout.Popup("Viewpoint", m_ReprojectViewpointMode, new[] { "Scene View Camera", "Target Transform" });
+            if (m_ReprojectViewpointMode == 1)
+            {
+                m_ReprojectTargetTransform = (Transform)EditorGUILayout.ObjectField("Target", m_ReprojectTargetTransform, typeof(Transform), true);
+            }
+            m_ReprojectAmount = EditorGUILayout.FloatField("Amount", m_ReprojectAmount);
+            bool reprojectViewpointReady = m_ReprojectViewpointMode == 0
+                ? SceneView.lastActiveSceneView != null
+                : m_ReprojectTargetTransform != null;
+            using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0 || !reprojectViewpointReady))
+            {
+                if (GUILayout.Button("Apply Reproject"))
+                {
+                    Vector3 viewpointPos = m_ReprojectViewpointMode == 0
+                        ? SceneView.lastActiveSceneView.camera.transform.position
+                        : m_ReprojectTargetTransform.position;
+                    gs.EditStorePosMouseDown();
+                    gs.EditReprojectSelection(viewpointPos, gs.transform.localToWorldMatrix, gs.transform.worldToLocalMatrix, m_ReprojectAmount);
+                    EditorUtility.SetDirty(gs);
                 }
             }
 
