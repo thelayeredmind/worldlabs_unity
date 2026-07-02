@@ -308,7 +308,7 @@ namespace GaussianSplatting.Runtime
         
         [Range(0, 1f)] [Tooltip("Splats with peak opacity below this value are culled before rasterization")]
         public float m_ContributionCullThreshold = 0.05f;
-        [Range(0, 0.5f)] [Tooltip("Fragment alpha below this value is discarded. Controls splat edge softness vs. fill rate.")]
+        [Range(0, 1f)] [Tooltip("Fragment alpha below this value is discarded. Controls splat edge softness vs. fill rate.")]
         public float m_AlphaDiscardThreshold = 0.05f;
         [Tooltip("Diagnostic: color splats by distance to nearest hotspot (green = full detail, red = attenuation edge) instead of their real color.")]
         public bool m_HotspotDebugVisualize;
