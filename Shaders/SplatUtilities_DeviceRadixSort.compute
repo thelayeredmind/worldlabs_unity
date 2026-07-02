@@ -719,9 +719,15 @@ void CSScaleSelection (uint3 id : SV_DispatchThreadID)
     }
 }
 
-// Quest: placeholder plumbing-only math — moves the splat along the world-space axis
-// from _ViewpointPos toward/away from its own position, scaled by _ReprojectAmount.
-// Real projection-based apparent-size-preserving resize is not implemented yet.
+// Moves the splat along the world-space axis from _ViewpointPos toward/away from its own
+// position, scaled by _ReprojectAmount, then rescales the splat itself by the ratio of its
+// new distance to its original distance from the viewpoint so its apparent size — as seen
+// from the viewpoint, assuming a perspective projection — stays visually constant. Scale
+// resize only applies when the asset's scale (and SH, since it shares _SplatOther's layout)
+// format is Float32, matching the position-edit precedent (CSTranslateSelection etc. already
+// gate the same way) — editable assets already imply Float32 across the board since
+// CanBeEdited() requires chunkDataSize == 0. Reuses the _SplatOtherMouseDown buffer already
+// declared above (near CSRotateSelection) — one global declaration per compute file.
 float3 _ViewpointPos;
 float _ReprojectAmount;
 
@@ -734,16 +740,32 @@ void CSReprojectSelection (uint3 id : SV_DispatchThreadID)
     if (!IsSplatSelected(idx))
         return;
 
-    uint fmt = _SplatFormat & 0xFF;
-    if (_SplatChunkCount == 0 && fmt == VECTOR_FMT_32F)
+    uint posFmt = _SplatFormat & 0xFF;
+    if (_SplatChunkCount != 0 || posFmt != VECTOR_FMT_32F)
+        return;
+
+    uint posStride = 12;
+    float3 pos = asfloat(_SplatPosMouseDown.Load3(idx * posStride));
+    float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
+    float3 toSplat = worldPos - _ViewpointPos;
+    float originalDist = length(toSplat);
+    float3 axis = originalDist > 1e-6 ? toSplat / originalDist : float3(0, 0, 1);
+    worldPos += axis * _ReprojectAmount;
+    pos = mul(_MatrixWorldToObject, float4(worldPos, 1)).xyz;
+    _SplatPos.Store3(idx * posStride, asuint(pos));
+
+    uint scaleFmt = (_SplatFormat >> 8) & 0xFF;
+    uint shFormat = (_SplatFormat >> 16) & 0xFF;
+    if (scaleFmt == VECTOR_FMT_32F && shFormat == VECTOR_FMT_32F && originalDist > 1e-6)
     {
-        uint stride = 12;
-        float3 pos = asfloat(_SplatPosMouseDown.Load3(idx * stride));
-        float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
-        float3 axis = normalize(worldPos - _ViewpointPos);
-        worldPos += axis * _ReprojectAmount;
-        pos = mul(_MatrixWorldToObject, float4(worldPos, 1)).xyz;
-        _SplatPos.Store3(idx * stride, asuint(pos));
+        float newDist = length(worldPos - _ViewpointPos);
+        float ratio = newDist / originalDist;
+
+        uint otherStride = 4 + 12; // rotation (10.10.10.2) + scale (32F float3)
+        uint otherAddr = idx * otherStride;
+        float3 scale = asfloat(_SplatOtherMouseDown.Load3(otherAddr + 4));
+        scale *= ratio;
+        _SplatOther.Store3(otherAddr + 4, asuint(scale));
     }
 }
 

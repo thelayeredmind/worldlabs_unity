@@ -1846,18 +1846,20 @@ namespace GaussianSplatting.Runtime
             editModified = true;
         }
 
-        // Quest: placeholder plumbing-only op — moves selected splats along the world-space axis
-        // from worldViewpointPos toward/away from each splat's own drag-start position, scaled by
-        // reprojectAmount. Real projection-based apparent-size-preserving resize not implemented yet.
+        // Moves selected splats along the world-space axis from worldViewpointPos toward/away from
+        // each splat's own drag-start position, scaled by reprojectAmount, and rescales each splat
+        // (assuming a perspective viewpoint) so its apparent size from that viewpoint stays constant.
+        // Scale resize only applies when the asset's scale+SH formats are Float32 — see CSReprojectSelection.
         public void EditReprojectSelection(Vector3 worldViewpointPos, Matrix4x4 localToWorld, Matrix4x4 worldToLocal, float reprojectAmount)
         {
             if (!EnsureEditingBuffers()) return;
-            if (m_GpuEditPosMouseDown == null) return; // should have captured initial state
+            if (m_GpuEditPosMouseDown == null || m_GpuEditOtherMouseDown == null) return; // should have captured initial state
 
             using var cmb = new CommandBuffer { name = "SplatReprojectSelection" };
             SetAssetDataOnCS(cmb, KernelIndices.ReprojectSelection);
 
             cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.ReprojectSelection, Props.SplatPosMouseDown, m_GpuEditPosMouseDown);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.ReprojectSelection, Props.SplatOtherMouseDown, m_GpuEditOtherMouseDown);
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, localToWorld);
             cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, worldToLocal);
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.ViewpointPos, worldViewpointPos);
@@ -1885,6 +1887,22 @@ namespace GaussianSplatting.Runtime
             var snap = new byte[m_GpuPosData.count * m_GpuPosData.stride];
             m_GpuPosData.GetData(snap);
             return snap;
+        }
+
+        // Returns a CPU snapshot of the raw other-data buffer (rotation+scale+SH index) for undo.
+        public byte[] SnapshotOtherData()
+        {
+            if (m_GpuOtherData == null) return null;
+            var snap = new byte[m_GpuOtherData.count * m_GpuOtherData.stride];
+            m_GpuOtherData.GetData(snap);
+            return snap;
+        }
+
+        // Restores a previously snapshotted other-data buffer (used by undo).
+        public void RestoreOtherData(byte[] snapshot)
+        {
+            if (snapshot == null || m_GpuOtherData == null) return;
+            m_GpuOtherData.SetData(snapshot);
         }
 
         // Restores a previously snapshotted position buffer (used by undo).

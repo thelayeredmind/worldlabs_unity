@@ -64,7 +64,8 @@ namespace GaussianSplatting.Editor
         bool m_ReprojectDragging;
         float m_ReprojectDragStartMouseX;
         float m_ReprojectDragStartAmount;
-        byte[] m_ReprojectDragUndoSnap;
+        byte[] m_ReprojectDragUndoPosSnap;
+        byte[] m_ReprojectDragUndoOtherSnap;
 
         public static float DeleteHardness { get; private set; } = 1f;
 
@@ -72,7 +73,7 @@ namespace GaussianSplatting.Editor
         static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] deletedSnap, uint[] selectedSnap)> s_DeleteUndoStack = new();
 
         // Undo stack for Reproject. Each entry is a full position-buffer snapshot taken right before an Apply.
-        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, byte[] posSnap)> s_ReprojectUndoStack = new();
+        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, byte[] posSnap, byte[] otherSnap)> s_ReprojectUndoStack = new();
 
         static int s_EditStatsUpdateCounter = 0;
 
@@ -587,8 +588,9 @@ namespace GaussianSplatting.Editor
         public static bool PopReprojectUndo()
         {
             if (s_ReprojectUndoStack.Count == 0) return false;
-            var (gs, posSnap) = s_ReprojectUndoStack.Pop();
+            var (gs, posSnap, otherSnap) = s_ReprojectUndoStack.Pop();
             if (gs == null) return false;
+            gs.RestoreOtherData(otherSnap);
             gs.RestorePosData(posSnap);
             RepaintAll();
             return true;
@@ -618,8 +620,10 @@ namespace GaussianSplatting.Editor
                         m_ReprojectDragStartMouseX = evt.mousePosition.x;
                         m_ReprojectDragStartAmount = 0f; // every drag starts fresh, never continues a leftover value
                         m_ReprojectAmount = 0f;
-                        m_ReprojectDragUndoSnap = gs.SnapshotPosData();
+                        m_ReprojectDragUndoPosSnap = gs.SnapshotPosData();
+                        m_ReprojectDragUndoOtherSnap = gs.SnapshotOtherData();
                         gs.EditStorePosMouseDown();
+                        gs.EditStoreOtherMouseDown();
                         evt.Use();
                     }
                     break;
@@ -642,8 +646,9 @@ namespace GaussianSplatting.Editor
                     {
                         GUIUtility.hotControl = 0;
                         m_ReprojectDragging = false;
-                        s_ReprojectUndoStack.Push((gs, m_ReprojectDragUndoSnap));
-                        m_ReprojectDragUndoSnap = null;
+                        s_ReprojectUndoStack.Push((gs, m_ReprojectDragUndoPosSnap, m_ReprojectDragUndoOtherSnap));
+                        m_ReprojectDragUndoPosSnap = null;
+                        m_ReprojectDragUndoOtherSnap = null;
                         // Amount is drag-relative, not a persistent value — always reads 0 once the
                         // drag ends, matching the drag-start baseline reset on the next mouse-down.
                         m_ReprojectAmount = 0f;
