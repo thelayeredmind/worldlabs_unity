@@ -43,7 +43,6 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropCSSplatUtilities_deviceRadixSort;
         SerializedProperty m_PropCSSplatUtilities_fidelityFxSort;
         SerializedProperty m_gpuSortType;
-        SerializedProperty m_PropOptimizeForQuest;
         SerializedProperty m_PropContributionCullThreshold;
         SerializedProperty m_PropAlphaDiscardThreshold;
         SerializedProperty m_PropHotspotDebugVisualize;
@@ -104,7 +103,6 @@ namespace GaussianSplatting.Editor
             m_PropCSSplatUtilities_deviceRadixSort = serializedObject.FindProperty("m_CSSplatUtilities_deviceRadixSort");
             m_PropCSSplatUtilities_fidelityFxSort = serializedObject.FindProperty("m_CSSplatUtilities_fidelityFX");
             m_gpuSortType = serializedObject.FindProperty("m_gpuSortType");
-            m_PropOptimizeForQuest = serializedObject.FindProperty("m_OptimizeForQuest");
             m_PropContributionCullThreshold = serializedObject.FindProperty("m_ContributionCullThreshold");
             m_PropAlphaDiscardThreshold = serializedObject.FindProperty("m_AlphaDiscardThreshold");
             m_PropHotspotDebugVisualize = serializedObject.FindProperty("m_HotspotDebugVisualize");
@@ -383,7 +381,7 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.PropertyField(m_PropSortNthFrame);
                 EditorGUILayout.PropertyField(m_CenterEyeOnly);
             }
-            foreach (var prop in new[] { m_PropOptimizeForQuest, m_PropContributionCullThreshold, m_PropAlphaDiscardThreshold, m_PropHotspotDebugVisualize })
+            foreach (var prop in new[] { m_PropContributionCullThreshold, m_PropAlphaDiscardThreshold, m_PropHotspotDebugVisualize })
                 EditorGUILayout.PropertyField(prop);
 
             if (gs.HasValidAsset && gs.asset != null)

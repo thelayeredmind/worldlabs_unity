@@ -47,7 +47,6 @@ struct v2f
 StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
-uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 uint _SceneDepthOcclusionEnabled;
 float2 _GaussianRTSize;
@@ -71,13 +70,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 	{
 		o.vertex = asfloat(0x7fc00000); // NaN discards the primitive
 		return o;
-	}
-
-	// Need to recalculate here for Quest (Why tho?)
-	if (_OptimizeForQuest) {
-		SplatData splat = LoadSplatData(instID);
-		float3 centerWorldPos = mul(unity_ObjectToWorld, float4(splat.pos, 1)).xyz;
-	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
 	}
 
 	bool behindCam = centerClipPos.w <= 0;
@@ -217,7 +209,6 @@ struct v2f
 StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
-uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
@@ -235,17 +226,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 		return o;
 	}
 
-	if (_OptimizeForQuest) {
-		SplatData splat = LoadSplatData(instID);
-		float3 centerWorldPos = mul(unity_ObjectToWorld, float4(splat.pos, 1)).xyz;
-	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
-	}
-
-	if (centerClipPos.w <= 0)
-	{
-		o.vertex = asfloat(0x7fc00000);
-		return o;
-	}
 
 	o.col.r = f16tof32(view.color.x >> 16);
 	o.col.g = f16tof32(view.color.x);
@@ -324,7 +304,6 @@ struct v2f
 };
 
 StructuredBuffer<SplatViewData> _SplatViewData;
-uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
@@ -342,17 +321,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 		return o;
 	}
 
-	if (_OptimizeForQuest) {
-		SplatData splat = LoadSplatData(instID);
-		float3 centerWorldPos = mul(unity_ObjectToWorld, float4(splat.pos, 1)).xyz;
-	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
-	}
-
-	if (centerClipPos.w <= 0)
-	{
-		o.vertex = asfloat(0x7fc00000);
-		return o;
-	}
 
 	o.col.r = f16tof32(view.color.x >> 16);
 	o.col.g = f16tof32(view.color.x);
@@ -433,7 +401,6 @@ struct v2f
 StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
-uint _OptimizeForQuest;
 half _AlphaDiscardThreshold;
 float _ProximityDepthRange;
 StructuredBuffer<float> _SplatMaskWeights;
@@ -456,17 +423,6 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 		return o;
 	}
 
-	if (_OptimizeForQuest) {
-		SplatData splat = LoadSplatData(instID);
-		float3 centerWorldPos = mul(unity_ObjectToWorld, float4(splat.pos, 1)).xyz;
-	    centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
-	}
-
-	if (centerClipPos.w <= 0)
-	{
-		o.vertex = asfloat(0x7fc00000);
-		return o;
-	}
 
 	o.col.r = f16tof32(view.color.x >> 16);
 	o.col.g = f16tof32(view.color.x);

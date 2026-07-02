@@ -378,8 +378,6 @@ namespace GaussianSplatting.Runtime
         internal GraphicsBuffer m_GpuIndirectArgs;
         internal Camera m_centerEyeCamera;
         internal Matrix4x4 m_centerCamMatrix;
-        public bool m_OptimizeForQuest;
-
 
         GraphicsBuffer m_GpuMaskWeights; // per-splat float, evaluated from m_Mask at m_MaskT
         bool m_MaskDirty = true;
@@ -462,7 +460,6 @@ namespace GaussianSplatting.Runtime
             public static readonly int SelectionMode = Shader.PropertyToID("_SelectionMode");
             public static readonly int SplatPosMouseDown = Shader.PropertyToID("_SplatPosMouseDown");
             public static readonly int SplatOtherMouseDown = Shader.PropertyToID("_SplatOtherMouseDown");
-            public static readonly int OptimizeForQuest = Shader.PropertyToID("_OptimizeForQuest");
             // Repurposed from unused "_VisibleIndices" scaffolding: atomic counter of splats that survive per-splat culling in CalcViewData.
             public static readonly int VisibleIndices = Shader.PropertyToID("_CullSurvivorCounter");
             public static readonly int IndirectArgs = Shader.PropertyToID("_IndirectArgs");
@@ -1097,7 +1094,6 @@ namespace GaussianSplatting.Runtime
             mat.SetInteger(Props.SplatFormat,      (int)GetSplatFormat());
             mat.SetInteger(Props.SplatCount,       HasExternalBuffers ? m_ExternalSplatCount : m_SplatCount);
             mat.SetInteger(Props.SplatChunkCount,  m_GpuChunksValid ? m_GpuChunks.count : 0);
-            mat.SetInteger(Props.OptimizeForQuest, m_OptimizeForQuest ? 1 : 0);
             mat.SetBuffer(Props.SplatMaskWeights, m_GpuMaskWeights ?? activePos);
             mat.SetInt(Props.SplatMaskValid, m_GpuMaskWeights != null ? 1 : 0);
         }
