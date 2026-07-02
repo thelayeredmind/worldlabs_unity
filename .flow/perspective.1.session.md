@@ -52,6 +52,8 @@
 
 [F] Delete-undo is a **custom** mechanism, not Unity's built-in `Undo` system for the GPU-buffer part: `s_DeleteUndoStack` (GaussianSplatRendererEditor.cs:62) is a `Stack<(GaussianSplatRenderer gs, uint[] deletedSnap, uint[] selectedSnap)>`, pushed after delete (line 813), popped by a dedicated "Undo Delete" button calling `PopDeleteUndo()` (line 557) which calls `gs.RestoreDeletedBits`/`RestoreSelectedBits`. Reproject's "feed into the same undo stack" requirement means an analogous stack snapshotting position+scale GPU buffers (not bitmasks) at drag-start, popped the same way — not literally reusing s_DeleteUndoStack's tuple shape (wrong data), but the same architectural pattern and ideally the same visible Undo button/UX.
 
+[/Activity] (superseded — the 3-mode/full design above was delivered incrementally through the separate nested Activities that follow, not as one monolithic build; closing formally at wrap-up rather than leaving open)
+
 [S] First unit: add `CSReprojectSelection` kernel (SplatUtilities_FidelityFX.compute) following `CSScaleSelection`'s structure — buffer bind, `IsSplatSelected` gate, uncompressed-format-only guard — with placeholder move+resize math (not yet full projection-based sizing), plus its C# wrapper method on `GaussianSplatRenderer.cs` (following `EditScaleSelection`'s shape). Proves the dispatch plumbing end to end before building UI or real math.
 
 [D] Verification for this turn: manual test dispatch in-editor — a temporary debug call selecting a few splats and invoking `EditReprojectSelection` with dummy params, confirmed visually (screenshot) that positions/scale actually changed. Not just a compile check.
@@ -213,3 +215,68 @@
 [C] User confirmed apparent-size-preserving resize works end to end — "It works perfect." User will commit (not Claude, per standing instruction). Uncommitted: Shaders/SplatUtilities_DeviceRadixSort.compute (resize kernel + duplicate-declaration fix), Runtime/GaussianSplatting/GaussianSplatRenderer.cs (SnapshotOtherData/RestoreOtherData, EditReprojectSelection extended), Editor/GaussianSplatting/GaussianSplatRendererEditor.cs (other-data snapshot wired into drag control + undo stack).
 
 [^] Continue Perspective. Last: apparent-size-preserving resize Activity closed — verified working in-editor by user after fixing a duplicate `_SplatOtherMouseDown` HLSL global declaration (caused a shader compile error across every kernel in the file). User is committing this work now. Remaining known open item on Perspective: locked-snapshot viewpoint mode (3rd mode — freeze SceneView cam pos/rot/projection into transient state — deferred earlier this session, only modes 0/1 exist: live cam, target Transform). Confirm: none.
+
+- user: the last feature (of Perspective) is the camera-lock tool — locked-snapshot viewpoint mode is the final unit for this target.
+
+[D] Lock trigger: explicit "Lock Viewpoint"/"Unlock" button in the Reproject section, next to the existing viewpoint-mode dropdown — not auto-captured on switching the dropdown to a new mode. Press to snapshot the current SceneView camera; press again to release back to live.
+
+- user correction: the dropdown is "SceneView Camera / Target Transform" (2 entries, not a 3rd "Locked Snapshot" mode). Lock only applies when SceneView Camera is the active mode — it is not a competing 3rd mode. What lock does: persists (freezes) the camera view sampled at the moment of lock, so the user can keep repositioning/orbiting the live SceneView camera but the reprojection's viewpoint stays fixed at the frozen snapshot until unlocked.
+
+[D] Lock is a modifier on SceneView Camera mode, not a 3rd dropdown entry. Dropdown stays 2 options (SceneView Camera / Target Transform). Lock button only meaningful/relevant while SceneView Camera mode is active; when locked, `_ViewpointPos` (and presumably orientation/projection, for future ortho-aware math) resolves from the frozen snapshot instead of `SceneView.lastActiveSceneView.camera` live, even as the user keeps moving the actual SceneView camera. Unlock returns to live resampling.
+
+[D] Switching the dropdown away from SceneView Camera while locked auto-clears the lock — selecting Target Transform silently unlocks (button resets to "Lock Viewpoint"); returning to SceneView Camera later starts fresh/live, does not resume the old snapshot.
+
+[D] Snapshot scope: position only (`camera.transform.position`, matching what `CSReprojectSelection`/`_ViewpointPos` already consumes) — no rotation/projection capture. No kernel/plumbing changes needed beyond swapping the position source; orientation/FOV remain unused today, consistent with the already-accepted perspective-only/no-ortho scope in context.md.
+
+[Activity] Add camera-lock to the existing Reproject Inspector section's SceneView Camera viewpoint mode: a "Lock Viewpoint"/"Unlock" toggle button, placed next to the existing viewpoint-mode dropdown, that is only meaningful while SceneView Camera mode is active. Pressing it while unlocked snapshots the current `SceneView.lastActiveSceneView.camera.transform.position` into new transient editor-only state and switches the button to "Unlock"; while locked, the Reproject drag control's `_ViewpointPos` resolves from that frozen position instead of resampling the live SceneView camera every frame, so the user can freely reposition/orbit the SceneView while reprojection keeps using the frozen point. Pressing "Unlock" (or switching the dropdown to Target Transform, which auto-clears any active lock and resets the button to "Lock Viewpoint") returns to live resampling. The snapshot is position-only (no rotation/projection capture), matching what the kernel already consumes, and is not persisted — lost on domain reload like the rest of this stopgap-descended UI's transient state. Complete when the user can lock the viewpoint, move the SceneView camera elsewhere, drag-reproject selected splats, and see them move/resize relative to the original locked position rather than the camera's new position — verified visually in-editor by the user.
+
+[S] First unit: `m_ReprojectViewpointLocked`/`m_ReprojectLockedViewpointPos` fields, drag-frame viewpoint resolution (line ~641) now reads the frozen position when locked, and a "Lock Viewpoint"/"Unlock Viewpoint" button next to the dropdown (only shown/relevant in SceneView Camera mode) that snapshots on press. Auto-unlock-on-dropdown-switch deferred to next turn per user's "Stop here."
+
+[C] `GaussianSplatRendererEditor.cs`: added `m_ReprojectViewpointLocked` (bool) + `m_ReprojectLockedViewpointPos` (Vector3) fields; drag-frame `viewpointPos` resolution now branches on lock state when mode==0; added Lock/Unlock button in the SceneView Camera branch of the Reproject section, disabled when unlocked and no active SceneView exists; `reprojectViewpointReady` now also true when locked even if `SceneView.lastActiveSceneView` is momentarily null. Compile clean (`unity_get_compilation_errors`, TechTests port 7891, 0 errors).
+
+[R1] Lock button should change color when locked (visual on/off feedback). Amend now.
+[R2] Draw a gizmo in the SceneView at the locked position while locked. Amend now.
+
+Amend stack: R1, R2.
+
+[S] Amend R1+R2: lock button color feedback + SceneView gizmo.
+
+[C] R1: Lock button now toggles `GUI.backgroundColor` to yellow while locked (saved/restored around the button draw, not a persistent style change).
+[C] R2: added `OnSceneGUI()` override (new — none existed in this editor class before) drawing a yellow `Handles.SphereHandleCap` at `m_ReprojectLockedViewpointPos`, sized via `HandleUtility.GetHandleSize` (screen-space-constant), only while `m_ReprojectViewpointMode == 0 && m_ReprojectViewpointLocked`.
+
+[R1] >> amended, yellow background color while locked.
+[R2] >> amended, yellow sphere gizmo in SceneView at the locked position while locked.
+
+Compile clean (`unity_get_compilation_errors`, TechTests port 7891, 0 errors).
+
+[/S]
+
+- user: for the gizmo, replace the sphere with a cone/cylinder pointing at the selected splats (direction, not just a point marker).
+
+[D] Aim target: `gs.editSelectedBounds.center` (existing selection-bounds property already read elsewhere in the Reproject section) — not a nearest-splat GPU readback.
+
+[F] `editSelectedBounds` is local-space (confirmed via `OnGetFrameBounds`'s existing usage, line ~1071, which explicitly calls `TransformBounds(gs.transform, bounds)` before use) — the gizmo's aim-target computation needs `gs.transform.TransformPoint(gs.editSelectedBounds.center)`, not the raw property.
+
+[S] Replace sphere gizmo with a cone pointing from the locked viewpoint toward the selection bounds center.
+
+[C] `OnSceneGUI()`: replaced `Handles.SphereHandleCap` with `Handles.ConeHandleCap`, oriented via `Quaternion.LookRotation(aimTarget - m_ReprojectLockedViewpointPos)` where `aimTarget = gs.transform.TransformPoint(gs.editSelectedBounds.center)` when a selection exists, falling back to a fixed forward direction if nothing is selected (avoids a degenerate zero-vector `LookRotation`). Compile clean (`unity_get_compilation_errors`, TechTests port 7891, 0 errors).
+
+[/S]
+
+- user: Target Transform viewpoint mode should show the same directional cone gizmo (currently only drawn for locked SceneView Camera mode).
+
+[D] `OnSceneGUI` gizmo condition widened from `mode==0 && locked` to also draw when `mode==1 && m_ReprojectTargetTransform != null` — cone origin becomes `m_ReprojectTargetTransform.position` in that branch, same aim-toward-`editSelectedBounds.center` logic reused unchanged.
+
+[S] Widen the SceneView gizmo to also draw for Target Transform mode, reusing the same cone/aim logic.
+
+[C] `OnSceneGUI()`: refactored to compute a single `gizmoOrigin` (locked cam position or target Transform position depending on active mode/state), then runs the same aim-toward-selection-bounds + `ConeHandleCap` draw for either case — no duplicated gizmo logic between modes. Compile clean (`unity_get_compilation_errors`, TechTests port 7891, 0 errors).
+
+[/S]
+
+- user: confirmed this is the final feature for Perspective.
+
+[/Activity] (destination reached — camera-lock for SceneView Camera mode: toggle button, yellow color feedback while locked, directional cone gizmo shared across both SceneView Camera and Target Transform viewpoint modes, all verified in-editor by the user)
+
+- user: wrap up.
+
+--- CLOSED 2026-07-02 18:16 — Reproject feature built end-to-end: kernel/plumbing, drag-slider UI, undo, apparent-size-preserving resize, and camera-lock (button, color feedback, shared directional gizmo) — feature-complete, context.md updated, commit left to user ---

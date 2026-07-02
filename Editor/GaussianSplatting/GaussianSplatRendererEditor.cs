@@ -66,6 +66,10 @@ namespace GaussianSplatting.Editor
         float m_ReprojectDragStartAmount;
         byte[] m_ReprojectDragUndoPosSnap;
         byte[] m_ReprojectDragUndoOtherSnap;
+        // Locked SceneView camera viewpoint. When set, the reproject drag control uses this frozen
+        // position instead of resampling the live SceneView camera every frame.
+        bool m_ReprojectViewpointLocked;
+        Vector3 m_ReprojectLockedViewpointPos;
 
         public static float DeleteHardness { get; private set; } = 1f;
 
@@ -360,6 +364,28 @@ namespace GaussianSplatting.Editor
             }
         }
 
+        public void OnSceneGUI()
+        {
+            bool showLockedCam = m_ReprojectViewpointMode == 0 && m_ReprojectViewpointLocked;
+            bool showTargetTransform = m_ReprojectViewpointMode == 1 && m_ReprojectTargetTransform != null;
+            if (!showLockedCam && !showTargetTransform)
+                return;
+
+            Vector3 gizmoOrigin = showLockedCam ? m_ReprojectLockedViewpointPos : m_ReprojectTargetTransform.position;
+            var gs = target as GaussianSplatRenderer;
+            Vector3 aimTarget = gs != null && gs.editSelectedSplats > 0
+                ? gs.transform.TransformPoint(gs.editSelectedBounds.center)
+                : gizmoOrigin + Vector3.forward;
+            Vector3 toTarget = aimTarget - gizmoOrigin;
+            Quaternion aimRotation = toTarget.sqrMagnitude > 1e-6f
+                ? Quaternion.LookRotation(toTarget)
+                : Quaternion.identity;
+
+            Handles.color = Color.yellow;
+            float size = HandleUtility.GetHandleSize(gizmoOrigin) * 0.3f;
+            Handles.ConeHandleCap(0, gizmoOrigin, aimRotation, size, EventType.Repaint);
+        }
+
         public override void OnInspectorGUI()
         {
             var gs = target as GaussianSplatRenderer;
@@ -634,7 +660,7 @@ namespace GaussianSplatting.Editor
                         float quadraticOffset = Mathf.Sign(dx) * dx * dx;
                         m_ReprojectAmount = m_ReprojectDragStartAmount + quadraticOffset;
                         Vector3 viewpointPos = m_ReprojectViewpointMode == 0
-                            ? SceneView.lastActiveSceneView.camera.transform.position
+                            ? (m_ReprojectViewpointLocked ? m_ReprojectLockedViewpointPos : SceneView.lastActiveSceneView.camera.transform.position)
                             : m_ReprojectTargetTransform.position;
                         gs.EditReprojectSelection(viewpointPos, gs.transform.localToWorldMatrix, gs.transform.worldToLocalMatrix, m_ReprojectAmount);
                         EditorUtility.SetDirty(gs);
@@ -855,8 +881,31 @@ namespace GaussianSplatting.Editor
             {
                 m_ReprojectTargetTransform = (Transform)EditorGUILayout.ObjectField("Target", m_ReprojectTargetTransform, typeof(Transform), true);
             }
+            else
+            {
+                using (new EditorGUI.DisabledScope(!m_ReprojectViewpointLocked && SceneView.lastActiveSceneView == null))
+                {
+                    Color prevBgColor = GUI.backgroundColor;
+                    if (m_ReprojectViewpointLocked)
+                        GUI.backgroundColor = Color.yellow;
+                    bool lockButtonPressed = GUILayout.Button(m_ReprojectViewpointLocked ? "Unlock Viewpoint" : "Lock Viewpoint");
+                    GUI.backgroundColor = prevBgColor;
+                    if (lockButtonPressed)
+                    {
+                        if (m_ReprojectViewpointLocked)
+                        {
+                            m_ReprojectViewpointLocked = false;
+                        }
+                        else
+                        {
+                            m_ReprojectLockedViewpointPos = SceneView.lastActiveSceneView.camera.transform.position;
+                            m_ReprojectViewpointLocked = true;
+                        }
+                    }
+                }
+            }
             bool reprojectViewpointReady = m_ReprojectViewpointMode == 0
-                ? SceneView.lastActiveSceneView != null
+                ? (m_ReprojectViewpointLocked || SceneView.lastActiveSceneView != null)
                 : m_ReprojectTargetTransform != null;
             using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0 || !reprojectViewpointReady))
             {
