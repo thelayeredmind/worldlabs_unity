@@ -1878,6 +1878,24 @@ namespace GaussianSplatting.Runtime
                 editModified = true;
         }
 
+        // Returns a CPU snapshot of the raw position buffer for undo. Call before any destructive op.
+        public byte[] SnapshotPosData()
+        {
+            if (m_GpuPosData == null) return null;
+            var snap = new byte[m_GpuPosData.count * m_GpuPosData.stride];
+            m_GpuPosData.GetData(snap);
+            return snap;
+        }
+
+        // Restores a previously snapshotted position buffer (used by undo).
+        public void RestorePosData(byte[] snapshot)
+        {
+            if (snapshot == null || m_GpuPosData == null) return;
+            m_GpuPosData.SetData(snapshot);
+            UpdateEditCountsAndBounds();
+            editModified = true;
+        }
+
         // Returns a CPU snapshot of the deleted bits buffer for undo. Call before any destructive op.
         public uint[] SnapshotDeletedBits()
         {

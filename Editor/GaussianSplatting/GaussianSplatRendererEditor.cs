@@ -56,15 +56,23 @@ namespace GaussianSplatting.Editor
         float m_DeleteDensity = 1f;
         float m_DeleteHardness = 1f;
 
-        // Reproject (stopgap test UI — not the final slider control)
+        // Reproject
         int m_ReprojectViewpointMode; // 0 = live SceneView camera, 1 = target Transform
         Transform m_ReprojectTargetTransform;
-        float m_ReprojectAmount = 1f;
+        float m_ReprojectAmount;
+        // Drag state for the reproject control. Set on mouse-down, cleared on mouse-up.
+        bool m_ReprojectDragging;
+        float m_ReprojectDragStartMouseX;
+        float m_ReprojectDragStartAmount;
+        byte[] m_ReprojectDragUndoSnap;
 
         public static float DeleteHardness { get; private set; } = 1f;
 
         // Undo stack for GPU state. Each entry is deleted-bits snapshot + selected-bits snapshot to restore after undo.
         static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] deletedSnap, uint[] selectedSnap)> s_DeleteUndoStack = new();
+
+        // Undo stack for Reproject. Each entry is a full position-buffer snapshot taken right before an Apply.
+        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, byte[] posSnap)> s_ReprojectUndoStack = new();
 
         static int s_EditStatsUpdateCounter = 0;
 
@@ -575,6 +583,88 @@ namespace GaussianSplatting.Editor
             return true;
         }
 
+        // Called by the Undo Reproject button. Returns true if something was restored.
+        public static bool PopReprojectUndo()
+        {
+            if (s_ReprojectUndoStack.Count == 0) return false;
+            var (gs, posSnap) = s_ReprojectUndoStack.Pop();
+            if (gs == null) return false;
+            gs.RestorePosData(posSnap);
+            RepaintAll();
+            return true;
+        }
+
+        // Horizontal click-drag control that drives Reproject directly: mouse-down snapshots the
+        // drag-start baseline once, dragging left/right maps pixel delta to an unbounded reproject
+        // amount and dispatches live every frame against that fixed baseline, mouse-up commits by
+        // pushing the pre-drag snapshot onto the undo stack. No fixed min/max — drag indefinitely.
+        void ReprojectDragControl(GaussianSplatRenderer gs)
+        {
+            const float pixelsPerUnit = 100f; // Quest: editor-only UI, no perf constraint — quadratic curve scale, chosen for comfortable drag feel
+
+            EditorGUILayout.Space(4);
+            Rect rect = GUILayoutUtility.GetRect(EditorGUIUtility.currentViewWidth, 28f, GUILayout.ExpandWidth(true));
+            EditorGUILayout.Space(4);
+            int id = GUIUtility.GetControlID(FocusType.Passive, rect);
+            Event evt = Event.current;
+
+            switch (evt.GetTypeForControl(id))
+            {
+                case EventType.MouseDown:
+                    if (rect.Contains(evt.mousePosition) && evt.button == 0)
+                    {
+                        GUIUtility.hotControl = id;
+                        m_ReprojectDragging = true;
+                        m_ReprojectDragStartMouseX = evt.mousePosition.x;
+                        m_ReprojectDragStartAmount = 0f; // every drag starts fresh, never continues a leftover value
+                        m_ReprojectAmount = 0f;
+                        m_ReprojectDragUndoSnap = gs.SnapshotPosData();
+                        gs.EditStorePosMouseDown();
+                        evt.Use();
+                    }
+                    break;
+                case EventType.MouseDrag:
+                    if (GUIUtility.hotControl == id && m_ReprojectDragging)
+                    {
+                        float dx = (evt.mousePosition.x - m_ReprojectDragStartMouseX) / pixelsPerUnit;
+                        float quadraticOffset = Mathf.Sign(dx) * dx * dx;
+                        m_ReprojectAmount = m_ReprojectDragStartAmount + quadraticOffset;
+                        Vector3 viewpointPos = m_ReprojectViewpointMode == 0
+                            ? SceneView.lastActiveSceneView.camera.transform.position
+                            : m_ReprojectTargetTransform.position;
+                        gs.EditReprojectSelection(viewpointPos, gs.transform.localToWorldMatrix, gs.transform.worldToLocalMatrix, m_ReprojectAmount);
+                        EditorUtility.SetDirty(gs);
+                        evt.Use();
+                    }
+                    break;
+                case EventType.MouseUp:
+                    if (GUIUtility.hotControl == id && m_ReprojectDragging)
+                    {
+                        GUIUtility.hotControl = 0;
+                        m_ReprojectDragging = false;
+                        s_ReprojectUndoStack.Push((gs, m_ReprojectDragUndoSnap));
+                        m_ReprojectDragUndoSnap = null;
+                        // Amount is drag-relative, not a persistent value — always reads 0 once the
+                        // drag ends, matching the drag-start baseline reset on the next mouse-down.
+                        m_ReprojectAmount = 0f;
+                        evt.Use();
+                    }
+                    break;
+                case EventType.Repaint:
+                {
+                    const float greyLevel = 0.22f;
+                    const float litLevel = 0.75f;
+                    const float amountAtFullBrightness = 5f; // ~224px of drag at pixelsPerUnit=100 under the quadratic curve
+                    // Brightness ramps with |amount| while dragging; fully grey when inactive.
+                    float brightness = m_ReprojectDragging ? Mathf.Lerp(greyLevel, litLevel, Mathf.InverseLerp(0f, amountAtFullBrightness, Mathf.Abs(m_ReprojectAmount))) : greyLevel;
+                    EditorGUI.DrawRect(rect, new Color(brightness, brightness, brightness));
+                    break;
+                }
+            }
+
+            EditorGUI.LabelField(rect, $"Reproject Amount: {m_ReprojectAmount:F2}  (click-drag)", EditorStyles.centeredGreyMiniLabel);
+        }
+
         void EditGUI(GaussianSplatRenderer gs)
         {
             // Editing tools operate on gs.asset directly — not applicable when a morpher
@@ -752,9 +842,7 @@ namespace GaussianSplatting.Editor
                 }
             }
 
-            // Reproject — stopgap test UI. Real UI is a custom horizontal-drag slider; this is a
-            // numeric field + button so the viewpoint sourcing and kernel can be tested without
-            // driving them via script each time.
+            // Reproject
             EditorGUILayout.Space();
             GUILayout.Label("Reproject", EditorStyles.boldLabel);
             m_ReprojectViewpointMode = EditorGUILayout.Popup("Viewpoint", m_ReprojectViewpointMode, new[] { "Scene View Camera", "Target Transform" });
@@ -762,21 +850,18 @@ namespace GaussianSplatting.Editor
             {
                 m_ReprojectTargetTransform = (Transform)EditorGUILayout.ObjectField("Target", m_ReprojectTargetTransform, typeof(Transform), true);
             }
-            m_ReprojectAmount = EditorGUILayout.FloatField("Amount", m_ReprojectAmount);
             bool reprojectViewpointReady = m_ReprojectViewpointMode == 0
                 ? SceneView.lastActiveSceneView != null
                 : m_ReprojectTargetTransform != null;
             using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0 || !reprojectViewpointReady))
             {
-                if (GUILayout.Button("Apply Reproject"))
-                {
-                    Vector3 viewpointPos = m_ReprojectViewpointMode == 0
-                        ? SceneView.lastActiveSceneView.camera.transform.position
-                        : m_ReprojectTargetTransform.position;
-                    gs.EditStorePosMouseDown();
-                    gs.EditReprojectSelection(viewpointPos, gs.transform.localToWorldMatrix, gs.transform.worldToLocalMatrix, m_ReprojectAmount);
-                    EditorUtility.SetDirty(gs);
-                }
+                ReprojectDragControl(gs);
+            }
+            int reprojectUndoCount = s_ReprojectUndoStack.Count;
+            using (new EditorGUI.DisabledScope(reprojectUndoCount == 0))
+            {
+                if (GUILayout.Button($"Undo Reproject ({reprojectUndoCount})"))
+                    PopReprojectUndo();
             }
 
             EditorGUILayout.Space();
@@ -862,6 +947,7 @@ namespace GaussianSplatting.Editor
                 if (GUILayout.Button("Commit to Disk"))
                 {
                     s_DeleteUndoStack.Clear();
+                    s_ReprojectUndoStack.Clear();
                     GaussianSplatCommitter.Commit(gs);
                 }
             }
