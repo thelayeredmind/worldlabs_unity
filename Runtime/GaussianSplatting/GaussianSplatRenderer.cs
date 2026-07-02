@@ -473,6 +473,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int SplatDeletedBitsRW = Shader.PropertyToID("_SplatDeletedBitsRW");
             public static readonly int SplatMaskWeights = Shader.PropertyToID("_SplatMaskWeights");
             public static readonly int SplatMaskValid = Shader.PropertyToID("_SplatMaskValid");
+            public static readonly int ViewpointPos = Shader.PropertyToID("_ViewpointPos");
+            public static readonly int ReprojectAmount = Shader.PropertyToID("_ReprojectAmount");
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -499,6 +501,7 @@ namespace GaussianSplatting.Runtime
             TranslateSelection,
             RotateSelection,
             ScaleSelection,
+            ReprojectSelection,
             ExportData,
             CopySplats,
             DeleteSelectedWithParams,
@@ -1839,6 +1842,28 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.SelectionDelta, scale);
 
             DispatchUtilsAndExecute(cmb, KernelIndices.ScaleSelection, m_SplatCount);
+            UpdateEditCountsAndBounds();
+            editModified = true;
+        }
+
+        // Quest: placeholder plumbing-only op — moves selected splats along the world-space axis
+        // from worldViewpointPos toward/away from each splat's own drag-start position, scaled by
+        // reprojectAmount. Real projection-based apparent-size-preserving resize not implemented yet.
+        public void EditReprojectSelection(Vector3 worldViewpointPos, Matrix4x4 localToWorld, Matrix4x4 worldToLocal, float reprojectAmount)
+        {
+            if (!EnsureEditingBuffers()) return;
+            if (m_GpuEditPosMouseDown == null) return; // should have captured initial state
+
+            using var cmb = new CommandBuffer { name = "SplatReprojectSelection" };
+            SetAssetDataOnCS(cmb, KernelIndices.ReprojectSelection);
+
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.ReprojectSelection, Props.SplatPosMouseDown, m_GpuEditPosMouseDown);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, localToWorld);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, worldToLocal);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.ViewpointPos, worldViewpointPos);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.ReprojectAmount, reprojectAmount);
+
+            DispatchUtilsAndExecute(cmb, KernelIndices.ReprojectSelection, m_SplatCount);
             UpdateEditCountsAndBounds();
             editModified = true;
         }

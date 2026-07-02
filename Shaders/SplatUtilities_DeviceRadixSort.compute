@@ -14,6 +14,7 @@
 #pragma kernel CSTranslateSelection
 #pragma kernel CSRotateSelection
 #pragma kernel CSScaleSelection
+#pragma kernel CSReprojectSelection
 #pragma kernel CSExportData
 #pragma kernel CSCopySplats
 #pragma kernel CSDeleteSelectedWithParams
@@ -714,6 +715,34 @@ void CSScaleSelection (uint3 id : SV_DispatchThreadID)
         pos *= _SelectionDelta;
         pos = mul(_MatrixWorldToObject, float4(pos,1)).xyz;
         pos += _SelectionCenter;
+        _SplatPos.Store3(idx * stride, asuint(pos));
+    }
+}
+
+// Quest: placeholder plumbing-only math — moves the splat along the world-space axis
+// from _ViewpointPos toward/away from its own position, scaled by _ReprojectAmount.
+// Real projection-based apparent-size-preserving resize is not implemented yet.
+float3 _ViewpointPos;
+float _ReprojectAmount;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSReprojectSelection (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+    if (!IsSplatSelected(idx))
+        return;
+
+    uint fmt = _SplatFormat & 0xFF;
+    if (_SplatChunkCount == 0 && fmt == VECTOR_FMT_32F)
+    {
+        uint stride = 12;
+        float3 pos = asfloat(_SplatPosMouseDown.Load3(idx * stride));
+        float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
+        float3 axis = normalize(worldPos - _ViewpointPos);
+        worldPos += axis * _ReprojectAmount;
+        pos = mul(_MatrixWorldToObject, float4(worldPos, 1)).xyz;
         _SplatPos.Store3(idx * stride, asuint(pos));
     }
 }
