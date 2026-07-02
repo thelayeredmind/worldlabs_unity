@@ -65,3 +65,11 @@ Before this commit, CSCalcViewData used `UNITY_MATRIX_VP` — Unity's ambient/gl
 [F] Compile verified clean: unity_get_compilation_errors → 0 errors, isCompiling=false.
 
 [^] Continue performance. Last: reverted CSCalcViewData's centerClipPos to UNITY_MATRIX_VP (from _MatrixVP), undoing the specific line from this session's own commit a8f2625 that broke stereo XR correctness on Quest. Compile clean. Next: user to test on-device (Quest build) — confirm the black-hole/warping effect is gone, AND check whether the original SceneView/GameView cross-talk problem the swap was meant to solve resurfaces (user considers this acceptable risk, editor QoL only, not load-bearing). Confirm: ~ awaiting on-device verification result.
+
+- user: on-device verified and committed. Black-hole/warping effect gone; per-splat frustum cull behavior unaffected by the revert (still discriminating correctly, same as session 1's corridor-drive verification).
+
+[/Activity]
+
+Stereo XR clip-position regression: root-caused to this session's own commit a8f2625 (UNITY_MATRIX_VP → _MatrixVP swap in CSCalcViewData, made for an unrelated editor SceneView/GameView cross-talk reason, broke per-eye correctness since _MatrixVP is uploaded once from a mono Camera). Fixed by reverting that one line; _MatrixVP retained for the frustum-plane cull and other explicit uses. Verified on-device: warping gone, cull effectiveness unaffected. Committed.
+
+[^] Continue performance. Last: stereo XR warping regression fixed, verified on-device, and committed — cull behavior confirmed unaffected. Next: resume the suspended frustum-cull compaction activity (still blocked on choosing CPU-readback-lag vs. indirect-dispatch-conversion for shrinking sort/CalcDistances/CalcViewData dispatch size), or drift to a different open thread. Confirm: none.
