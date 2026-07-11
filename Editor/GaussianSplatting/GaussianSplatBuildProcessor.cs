@@ -84,9 +84,112 @@ namespace GaussianSplatting.Editor
                 }
 
                 s_Snapshots.Add(new AssetSnapshot(assetPath, asset));
+                WriteQualityBackupStorage(assetPath, asset);
                 SwapToSibling(asset, sibling);
                 Debug.Log($"[GaussianSplatBuildProcessor] Swapped {asset.name} → {sibling.name} for build.");
             }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  Quality backup storage — shared by the automatic build-restore path
+        //  and the manual recovery tool below.
+        // ─────────────────────────────────────────────────────────────────────
+
+        // Writes a transient sibling asset (e.g. MyAsset_backup.asset) holding only the source's
+        // current quality-aspect data — the fields SwapToSibling mutates (formats, splat count,
+        // bounds, per-layer data refs). Not a full asset copy: mask/layer-activation state and
+        // everything else stays untouched on the source. A lingering file signals an unresolved
+        // swap if OnPostprocessBuild never runs (build crash/force-quit). Resolved and deleted by
+        // RestoreFromQualityBackupStorage, whether called automatically (build path) or manually
+        // (recovery tool).
+        static string GetQualityBackupStoragePath(string assetPath)
+        {
+            string dir      = Path.GetDirectoryName(assetPath).Replace('\\', '/');
+            string baseName = Path.GetFileNameWithoutExtension(assetPath);
+            return $"{dir}/{baseName}_backup.asset";
+        }
+
+        static void WriteQualityBackupStorage(string assetPath, GaussianSplatAsset source)
+        {
+            string backupPath = GetQualityBackupStoragePath(assetPath);
+
+            var layerInfo = source.layerInfo
+                .Select(kv => new int2(kv.Key, kv.Value))
+                .ToArray();
+
+            var backup = ScriptableObject.CreateInstance<GaussianSplatAsset>();
+            backup.Initialize(source.splatCount, source.posFormat, source.scaleFormat,
+                source.colorFormat, source.shFormat,
+                source.boundsMin, source.boundsMax, source.cameras, layerInfo);
+            backup.name = Path.GetFileNameWithoutExtension(backupPath);
+            backup.SetDataHash(source.dataHash);
+
+            foreach (var la in source.LayerData)
+                backup.SetAssetFiles(la.layer, la.m_ChunkData, la.m_PosData, la.m_OtherData, la.m_ColorData, la.m_SHData);
+            if (source.ClusteredSHData != null)
+                backup.SetClusteredSHAssetFile(source.ClusteredSHData);
+
+            AssetDatabase.CreateAsset(backup, backupPath);
+            AssetDatabase.SaveAssets();
+        }
+
+        // Restores source's quality fields from its QualityBackupStorage sibling (if one exists)
+        // and deletes the backup. Shared by the automatic OnPostprocessBuild path (via
+        // AssetSnapshot.Restore) and the manual "Restore from Quality Backup" recovery tool —
+        // both cases converge on the same on-disk source of truth, since a crashed/force-quit
+        // build leaves no in-memory state to restore from, only the backup asset.
+        static bool RestoreFromQualityBackupStorage(GaussianSplatAsset source, string assetPath)
+        {
+            string backupPath = GetQualityBackupStoragePath(assetPath);
+            var backup = AssetDatabase.LoadAssetAtPath<GaussianSplatAsset>(backupPath);
+            if (backup == null) return false;
+
+            var layerInfo = backup.layerInfo
+                .Select(kv => new int2(kv.Key, kv.Value))
+                .ToArray();
+
+            source.Initialize(backup.splatCount, backup.posFormat, backup.scaleFormat,
+                backup.colorFormat, backup.shFormat,
+                backup.boundsMin, backup.boundsMax, backup.cameras, layerInfo);
+
+            source.ClearLayerData();
+            foreach (var la in backup.LayerData)
+                source.SetAssetFiles(la.layer, la.m_ChunkData, la.m_PosData, la.m_OtherData, la.m_ColorData, la.m_SHData);
+            if (backup.ClusteredSHData != null)
+                source.SetClusteredSHAssetFile(backup.ClusteredSHData);
+
+            EditorUtility.SetDirty(source);
+            AssetDatabase.DeleteAsset(backupPath);
+            AssetDatabase.SaveAssets();
+            return true;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  Manual recovery tool — for when OnPostprocessBuild never ran
+        //  (build crashed / force-quit) and a QualityBackupStorage asset was left behind.
+        // ─────────────────────────────────────────────────────────────────────
+
+        [MenuItem("Assets/Gaussian Splats/Restore from Quality Backup")]
+        static void MenuRestoreFromQualityBackup()
+        {
+            var asset = Selection.activeObject as GaussianSplatAsset;
+            if (asset == null) return;
+
+            string assetPath = AssetDatabase.GetAssetPath(asset);
+            if (RestoreFromQualityBackupStorage(asset, assetPath))
+                Debug.Log($"[GaussianSplatBuildProcessor] Restored {asset.name} from quality backup.");
+            else
+                EditorUtility.DisplayDialog("No Backup Found",
+                    $"No lingering quality backup found for '{asset.name}'. Nothing to restore.", "OK");
+        }
+
+        [MenuItem("Assets/Gaussian Splats/Restore from Quality Backup", true)]
+        static bool MenuRestoreFromQualityBackupValidate()
+        {
+            var asset = Selection.activeObject as GaussianSplatAsset;
+            if (asset == null) return false;
+            string backupPath = GetQualityBackupStoragePath(AssetDatabase.GetAssetPath(asset));
+            return AssetDatabase.LoadAssetAtPath<GaussianSplatAsset>(backupPath) != null;
         }
 
         // Redirects source asset's TextAsset refs and format fields to match the sibling.
@@ -202,50 +305,21 @@ namespace GaussianSplatting.Editor
         //  Snapshot
         // ─────────────────────────────────────────────────────────────────────
 
+        // Only needs to know which asset+path to restore — the actual field data lives in the
+        // QualityBackupStorage asset on disk, not in memory, so the same restore path works
+        // whether triggered here (OnPostprocessBuild) or from the manual recovery tool.
         class AssetSnapshot
         {
             public string AssetPath { get; }
-
             readonly GaussianSplatAsset _asset;
-            readonly GaussianSplatAsset.VectorFormat _posFormat;
-            readonly GaussianSplatAsset.VectorFormat _scaleFormat;
-            readonly GaussianSplatAsset.ColorFormat  _colorFormat;
-            readonly GaussianSplatAsset.SHFormat     _shFormat;
-            readonly int _splatCount;
-            readonly Vector3 _boundsMin, _boundsMax;
-            readonly GaussianSplatAsset.CameraInfo[] _cameras;
-            readonly List<GaussianSplatAsset.LayerAssets> _layerData;
-            readonly TextAsset _clusteredSH;
-            readonly List<int2> _layerInfo;
 
             public AssetSnapshot(string assetPath, GaussianSplatAsset asset)
             {
-                AssetPath    = assetPath;
-                _asset       = asset;
-                _posFormat   = asset.posFormat;
-                _scaleFormat = asset.scaleFormat;
-                _colorFormat = asset.colorFormat;
-                _shFormat    = asset.shFormat;
-                _splatCount  = asset.splatCount;
-                _boundsMin   = asset.boundsMin;
-                _boundsMax   = asset.boundsMax;
-                _cameras     = asset.cameras;
-                _layerData   = new List<GaussianSplatAsset.LayerAssets>(asset.LayerData);
-                _clusteredSH = asset.ClusteredSHData;
-                _layerInfo   = asset.layerInfo.Select(kv => new int2(kv.Key, kv.Value)).ToList();
+                AssetPath = assetPath;
+                _asset    = asset;
             }
 
-            public void Restore()
-            {
-                _asset.Initialize(_splatCount, _posFormat, _scaleFormat, _colorFormat, _shFormat,
-                    _boundsMin, _boundsMax, _cameras, _layerInfo);
-                _asset.ClearLayerData();
-                foreach (var la in _layerData)
-                    _asset.SetAssetFiles(la.layer, la.m_ChunkData, la.m_PosData, la.m_OtherData, la.m_ColorData, la.m_SHData);
-                if (_clusteredSH != null)
-                    _asset.SetClusteredSHAssetFile(_clusteredSH);
-                EditorUtility.SetDirty(_asset);
-            }
+            public void Restore() => RestoreFromQualityBackupStorage(_asset, AssetPath);
         }
     }
 }
