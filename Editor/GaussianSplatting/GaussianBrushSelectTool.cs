@@ -20,6 +20,8 @@ namespace GaussianSplatting.Editor
 
         static float s_RadiusPx    = 80f;
         static float s_RadiusWorld = 2f;
+        static float s_Density     = 1f;
+        static int   s_StrokeSeed  = 0; // fixed for the duration of one mouse-down-to-mouse-up stroke, so held-drag doesn't defeat density thinning by re-rolling every frame
 
         public static float BrushRadiusPx
         {
@@ -31,6 +33,13 @@ namespace GaussianSplatting.Editor
         {
             get => s_RadiusWorld;
             set => s_RadiusWorld = Mathf.Clamp(value, k_WorldMin, k_WorldMax);
+        }
+
+        // [0..1]: fraction of touched splats that actually get (de)selected per stroke — 1 = every touched splat, dithered thinning below that.
+        public static float BrushDensity
+        {
+            get => s_Density;
+            set => s_Density = Mathf.Clamp01(value);
         }
 
         // Called by GaussianToolContext.OnToolGUI when BrushModeActive is true.
@@ -58,6 +67,7 @@ namespace GaussianSplatting.Editor
                     if (evt.button == 0 && !evt.alt && HandleUtility.nearestControl == id)
                     {
                         GUIUtility.hotControl = id;
+                        s_StrokeSeed = UnityEngine.Random.Range(int.MinValue, int.MaxValue);
                         ApplyBrush(gs, evt);
                         evt.Use();
                     }
@@ -95,12 +105,12 @@ namespace GaussianSplatting.Editor
             {
                 Ray ray = HandleUtility.GUIPointToWorldRay(evt.mousePosition);
                 Vector3 center = GetBrushCenter(gs, ray);
-                gs.EditBrushSelectWorld(center, s_RadiusWorld, cam, subtract);
+                gs.EditBrushSelectWorld(center, s_RadiusWorld, cam, subtract, BrushDensity, s_StrokeSeed);
             }
             else
             {
                 Vector2 screenPx = HandleUtility.GUIPointToScreenPixelCoordinate(evt.mousePosition);
-                gs.EditBrushSelect(screenPx, s_RadiusPx, cam, subtract);
+                gs.EditBrushSelect(screenPx, s_RadiusPx, cam, subtract, BrushDensity, s_StrokeSeed);
             }
             GaussianSplatRendererEditor.RepaintAll();
         }

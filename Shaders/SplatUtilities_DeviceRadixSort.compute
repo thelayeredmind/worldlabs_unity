@@ -1007,15 +1007,34 @@ void CSCopySplats (uint3 id : SV_DispatchThreadID)
 }
 
 // Delete selected splats filtered by opacity and distance from selection center.
-// density  [0..1]: at 1 all selected splats are candidates; at 0 nothing is deleted.
-//                  within candidates, high-opacity splats survive, low-opacity splats are deleted.
-// hardness [0..1]: at 1 every selected splat is treated equally (flat cut).
-//                  at 0 effective density fades from full at the selection center to zero at the boundary.
+// density  [0..1]: SHAPE — decides which splats are candidates. At 1 all selected splats are candidates; at 0 nothing is.
+//                  within candidates, high-opacity splats survive, low-opacity splats are affected (or gated by position roll in Position mode).
+// hardness [0..1]: INTENSITY — at 1, candidates get a hard delete (today's behavior). At <1, candidates instead get a
+//                  partial opacity reduction (written to _SplatOpacityMultRW), position-weighted: full Hardness-driven
+//                  reduction at the selection center, fading all the way to invisible at the selection edge.
 float _DeleteDensity;
 float _DeleteHardness;
 float3 _DeleteSelectionCenter;  // world space
 float3 _DeleteSelectionExtents; // world space, always > 0
+int _DeleteUsePosition; // 0 = gate on opacity (default), 1 = gate on a deterministic per-splat random roll (dithering)
 RWByteAddressBuffer _SplatDeletedBitsRW;
+RWStructuredBuffer<float> _SplatOpacityMultRW;
+
+// PCG hash — deterministic per-splat-index random value in [0,1), no seed: same index always rolls the same way.
+float HashIndexToUnitFloat(uint idx)
+{
+    uint state = idx * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    word = (word >> 22u) ^ word;
+    return (float)word / 4294967295.0;
+}
+
+// Same PCG hash, but salted with a per-dispatch seed (XOR'd into the index) — re-rolling the same splat
+// differently across repeated dispatches (e.g. successive brush strokes at the same density).
+float HashIndexToUnitFloatSeeded(uint idx, uint seed)
+{
+    return HashIndexToUnitFloat(idx ^ seed);
+}
 
 [numthreads(GROUP_SIZE,1,1)]
 void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
@@ -1036,26 +1055,48 @@ void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
         return;
 
     SplatData s = LoadSplatData(idx);
-    float opacity = (float)s.opacity;
 
     // Use raw GPU position space — same as LoadSplatPosValue, matching rawCenter/rawExtents from C#.
-    float3 localOffset = abs((float3)s.pos - _DeleteSelectionCenter) / _DeleteSelectionExtents;
-    float t = saturate(max(localOffset.x, max(localOffset.y, localOffset.z)));
+    // Ellipsoid radial distance (not a box max) — follows the selection's actual extents shape,
+    // so bounding-box corners aren't falsely treated as "deep in the selection."
+    float3 localOffset = ((float3)s.pos - _DeleteSelectionCenter) / _DeleteSelectionExtents;
+    float t = saturate(length(localOffset)); // 0 = selection center, 1 = selection edge
 
+    // Density alone decides candidacy (position-based falloff) — Hardness no longer folds into this threshold.
     // Density curve: skewed so slider feels linear in splat-count space.
     float t0 = 1.0 - pow(1.0 - _DeleteDensity, 3.0);
-    float densityCurved = smoothstep(0.0, 1.0, t0);
+    float threshold = smoothstep(0.0, 1.0, t0);
 
-    // Hardness: fraction of selection that is the full-density core.
-    // Inside core (t <= hardness): threshold = densityCurved, full deletion per density.
-    // Outside core: threshold fades to 0 at boundary — fewer splats qualify.
-    float outsideCore = smoothstep(_DeleteHardness, 1.0, t); // 0 inside core, 1 at boundary
-    float outsideCurved = pow(outsideCore, 3.0);             // skew so fade stays full longer
-    float threshold = densityCurved * (1.0 - outsideCurved);
+    bool isCandidate;
+    if (_DeleteUsePosition != 0)
+    {
+        // Position mode: real dithering — each splat independently rolls against the density threshold, ignoring opacity.
+        float roll = HashIndexToUnitFloat(idx);
+        isCandidate = roll < threshold;
+    }
+    else
+    {
+        float opacity = (float)s.opacity;
+        isCandidate = opacity <= threshold;
+    }
 
-    if (opacity <= threshold)
+    if (!isCandidate)
+        return;
+
+    // Hardness decides INTENSITY for candidates: at Hardness=1, hard delete (today's behavior).
+    // At Hardness<1, candidates get a partial opacity reduction instead — position-weighted so
+    // edge-of-selection candidates (t near 1) fade more than center candidates (t near 0) at the same Hardness.
+    if (_DeleteHardness >= 1.0)
     {
         _SplatDeletedBitsRW.InterlockedOr(wordIdx * 4, 1u << bitIdx);
+    }
+    else
+    {
+        // Position-weighted intensity: Hardness=0 means almost no effect (opacity stays ~1 everywhere).
+        // As Hardness rises toward 1, edge candidates (t near 1) fade toward transparent faster than
+        // center candidates (t near 0) — Hardness scales HOW MUCH the position falloff can reduce opacity.
+        float opacityMult = saturate(1.0 - _DeleteHardness * t);
+        _SplatOpacityMultRW[idx] = opacityMult;
     }
 }
 
@@ -1066,10 +1107,14 @@ void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
 // _BrushCenterWorld: sphere center in world space
 // _BrushRadiusWorld: sphere radius in world space
 // _SelectionMode: 1 = add, 0 = subtract (shared by both kernels)
+// _BrushDensity [0..1]: fraction of splats inside the brush that actually get (de)selected — dithered via HashIndexToUnitFloatSeeded, 1 = every touched splat.
+// _BrushSeed: per-dispatch salt so repeated strokes at the same density roll differently each time, instead of always missing/hitting the same splats.
 float2 _BrushCenter;
 float _BrushRadius;
 float3 _BrushCenterWorld;
 float _BrushRadiusWorld;
+float _BrushDensity;
+uint _BrushSeed;
 
 [numthreads(GROUP_SIZE,1,1)]
 void CSBrushSelect (uint3 id : SV_DispatchThreadID)
@@ -1091,6 +1136,16 @@ void CSBrushSelect (uint3 id : SV_DispatchThreadID)
     float2 pixelPos = (clipPos.xy / clipPos.w * float2(0.5, -0.5) + 0.5) * _VecScreenParams.xy;
     float2 delta = pixelPos - _BrushCenter;
     if (dot(delta, delta) > _BrushRadius * _BrushRadius)
+        return;
+
+    // Already deleted — never re-select. Deleted splats keep their index (no compaction), so without this
+    // check a stroke over a region with dead splats burns density budget re-marking permanently-invisible ghosts.
+    uint delWordIdx = idx / 32;
+    uint delBitIdx = idx & 31;
+    if (_SplatDeletedBits.Load(delWordIdx * 4) & (1u << delBitIdx))
+        return;
+
+    if (HashIndexToUnitFloatSeeded(idx, _BrushSeed) >= _BrushDensity)
         return;
 
     uint wordIdx = idx / 32;
@@ -1127,6 +1182,15 @@ void CSBrushSelectWorld (uint3 id : SV_DispatchThreadID)
     float splatDist  = -splatView.z;
     float centerDist = -centerView.z;
     if (splatDist > centerDist + _BrushRadiusWorld)
+        return;
+
+    // Already deleted — never re-select (see CSBrushSelect for why).
+    uint delWordIdx = idx / 32;
+    uint delBitIdx = idx & 31;
+    if (_SplatDeletedBits.Load(delWordIdx * 4) & (1u << delBitIdx))
+        return;
+
+    if (HashIndexToUnitFloatSeeded(idx, _BrushSeed) >= _BrushDensity)
         return;
 
     uint wordIdx = idx / 32;

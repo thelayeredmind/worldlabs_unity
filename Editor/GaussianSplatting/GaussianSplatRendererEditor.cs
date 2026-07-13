@@ -22,6 +22,7 @@ namespace GaussianSplatting.Editor
         const string kPrefExportBake = "nesnausk.GaussianSplatting.ExportBakeTransform";
         const string kPrefDeleteDensity = "nesnausk.GaussianSplatting.DeleteDensity";
         const string kPrefDeleteHardness = "nesnausk.GaussianSplatting.DeleteHardness";
+        const string kPrefDeleteUsePosition = "nesnausk.GaussianSplatting.DeleteUsePosition";
 
         SerializedProperty m_PropAsset;
         SerializedProperty m_PropSplatScale;
@@ -55,6 +56,7 @@ namespace GaussianSplatting.Editor
         bool m_AnyDotHovered;
         float m_DeleteDensity = 1f;
         float m_DeleteHardness = 1f;
+        bool m_DeleteUsePosition = false;
 
         // Reproject
         int m_ReprojectViewpointMode; // 0 = live SceneView camera, 1 = target Transform
@@ -74,7 +76,7 @@ namespace GaussianSplatting.Editor
         public static float DeleteHardness { get; private set; } = 1f;
 
         // Undo stack for GPU state. Each entry is deleted-bits snapshot + selected-bits snapshot to restore after undo.
-        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] deletedSnap, uint[] selectedSnap)> s_DeleteUndoStack = new();
+        static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, uint[] deletedSnap, uint[] selectedSnap, float[] opacityMultSnap)> s_DeleteUndoStack = new();
 
         // Undo stack for Reproject. Each entry is a full position-buffer snapshot taken right before an Apply.
         static readonly System.Collections.Generic.Stack<(GaussianSplatRenderer gs, byte[] posSnap, byte[] otherSnap)> s_ReprojectUndoStack = new();
@@ -100,6 +102,7 @@ namespace GaussianSplatting.Editor
             m_ExportBakeTransform = EditorPrefs.GetBool(kPrefExportBake, false);
             m_DeleteDensity  = EditorPrefs.GetFloat(kPrefDeleteDensity, 1f);
             m_DeleteHardness = EditorPrefs.GetFloat(kPrefDeleteHardness, 1f);
+            m_DeleteUsePosition = EditorPrefs.GetBool(kPrefDeleteUsePosition, false);
 
             m_PropAsset = serializedObject.FindProperty("m_Asset");
             m_PropSplatScale = serializedObject.FindProperty("m_SplatScale");
@@ -597,13 +600,14 @@ namespace GaussianSplatting.Editor
         public static bool PopDeleteUndo()
         {
             if (s_DeleteUndoStack.Count == 0) return false;
-            var (gs, deletedSnap, selectedSnap) = s_DeleteUndoStack.Pop();
+            var (gs, deletedSnap, selectedSnap, opacityMultSnap) = s_DeleteUndoStack.Pop();
             if (gs == null) return false;
             // Ensure the GameObject and renderer are active before touching GPU buffers.
             gs.gameObject.SetActive(true);
             gs.enabled = true;
             gs.RestoreDeletedBits(deletedSnap);
             gs.RestoreSelectedBits(selectedSnap);
+            gs.RestoreOpacityMult(opacityMultSnap);
             Selection.activeGameObject = gs.gameObject;
             ToolManager.SetActiveContext<GaussianToolContext>();
             RepaintAll();
@@ -782,6 +786,12 @@ namespace GaussianSplatting.Editor
                             GaussianBrushSelectTool.BrushRadiusPx, 5f, 500f);
                         if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushRadiusPx = r;
                     }
+
+                    EditorGUI.BeginChangeCheck();
+                    float density = EditorGUILayout.Slider(
+                        new GUIContent("Density", "Fraction of touched splats actually (de)selected per stroke. 1 = every touched splat, lower values dither the selection."),
+                        GaussianBrushSelectTool.BrushDensity, 0f, 1f);
+                    if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushDensity = density;
                 }
             }
 
@@ -966,22 +976,28 @@ namespace GaussianSplatting.Editor
             EditorGUI.BeginChangeCheck();
             m_DeleteDensity  = EditorGUILayout.Slider(new GUIContent("Density",  "How much of the selection is deleted. 1 = all candidates, 0 = nothing. Transparent splats go first."), m_DeleteDensity,  0f, 1f);
             m_DeleteHardness = EditorGUILayout.Slider(new GUIContent("Hardness", "Edge falloff. 1 = uniform cut across selection. 0 = full density at center, fades to zero at the selection boundary."), m_DeleteHardness, 0f, 1f);
+            m_DeleteUsePosition = EditorGUILayout.Toggle(new GUIContent("Position Mode", "Off: gate deletion candidates on opacity (transparent splats go first). On: gate on a deterministic per-splat random roll instead — a real dithering effect, ignoring opacity."), m_DeleteUsePosition);
             DeleteHardness = m_DeleteHardness;
             if (EditorGUI.EndChangeCheck())
             {
                 EditorPrefs.SetFloat(kPrefDeleteDensity,  m_DeleteDensity);
                 EditorPrefs.SetFloat(kPrefDeleteHardness, m_DeleteHardness);
+                EditorPrefs.SetBool(kPrefDeleteUsePosition, m_DeleteUsePosition);
             }
             using (new EditorGUI.DisabledScope(gs.editSelectedSplats == 0))
             {
                 if (GUILayout.Button("Delete Selected"))
                 {
-                    var deletedSnap  = gs.SnapshotDeletedBits();
-                    var selectedSnap = gs.SnapshotSelectedBits();
-                    gs.EditDeleteSelectedWithParams(m_DeleteDensity, m_DeleteHardness);
-                    if (gs.editDeletedSplats > 0)
+                    uint selectedBefore = gs.editSelectedSplats;
+                    var deletedSnap     = gs.SnapshotDeletedBits();
+                    var selectedSnap    = gs.SnapshotSelectedBits();
+                    var opacityMultSnap = gs.SnapshotOpacityMult();
+                    gs.EditDeleteSelectedWithParams(m_DeleteDensity, m_DeleteHardness, m_DeleteUsePosition);
+                    // Hardness < 1 can produce a pure opacity blend with zero hard deletes — push undo
+                    // whenever there was a selection to operate on, not just when editDeletedSplats > 0.
+                    if (selectedBefore > 0)
                     {
-                        s_DeleteUndoStack.Push((gs, deletedSnap, selectedSnap));
+                        s_DeleteUndoStack.Push((gs, deletedSnap, selectedSnap, opacityMultSnap));
                         EditorUtility.SetDirty(gs);
                     }
                     RepaintAll();

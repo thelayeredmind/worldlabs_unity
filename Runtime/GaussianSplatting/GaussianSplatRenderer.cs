@@ -390,6 +390,7 @@ namespace GaussianSplatting.Runtime
         GraphicsBuffer m_GpuEditCountsBounds;
         GraphicsBuffer m_GpuEditSelected;
         GraphicsBuffer m_GpuEditDeleted;
+        GraphicsBuffer m_GpuEditOpacityMult; // per-splat float opacity multiplier, written by Hardness-as-intensity delete blending. 1.0 = untouched.
         GraphicsBuffer m_GpuEditSelectedMouseDown; // selection state at start of operation
         GraphicsBuffer m_GpuEditPosMouseDown; // position state at start of operation
         GraphicsBuffer m_GpuEditOtherMouseDown; // rotation/scale state at start of operation
@@ -468,6 +469,12 @@ namespace GaussianSplatting.Runtime
             public static readonly int DepthBlendOp = Shader.PropertyToID("_DepthBlendOp");
             public static readonly int DeleteDensity = Shader.PropertyToID("_DeleteDensity");
             public static readonly int DeleteHardness = Shader.PropertyToID("_DeleteHardness");
+            public static readonly int DeleteUsePosition = Shader.PropertyToID("_DeleteUsePosition");
+            public static readonly int BrushDensity = Shader.PropertyToID("_BrushDensity");
+            public static readonly int BrushSeed = Shader.PropertyToID("_BrushSeed");
+            public static readonly int SplatOpacityMult = Shader.PropertyToID("_SplatOpacityMult");
+            public static readonly int SplatOpacityMultValid = Shader.PropertyToID("_SplatOpacityMultValid");
+            public static readonly int SplatOpacityMultRW = Shader.PropertyToID("_SplatOpacityMultRW");
             public static readonly int DeleteSelectionCenter = Shader.PropertyToID("_DeleteSelectionCenter");
             public static readonly int DeleteSelectionExtents = Shader.PropertyToID("_DeleteSelectionExtents");
             public static readonly int SplatDeletedBitsRW = Shader.PropertyToID("_SplatDeletedBitsRW");
@@ -1099,6 +1106,8 @@ namespace GaussianSplatting.Runtime
             mat.SetInteger(Props.SplatChunkCount,  m_GpuChunksValid ? m_GpuChunks.count : 0);
             mat.SetBuffer(Props.SplatMaskWeights, m_GpuMaskWeights ?? activePos);
             mat.SetInt(Props.SplatMaskValid, m_GpuMaskWeights != null ? 1 : 0);
+            mat.SetBuffer(Props.SplatOpacityMult, m_GpuEditOpacityMult ?? activePos);
+            mat.SetInt(Props.SplatOpacityMultValid, m_GpuEditOpacityMult != null ? 1 : 0);
         }
 
         static void DisposeBuffer(ref GraphicsBuffer buf)
@@ -1133,6 +1142,7 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuEditOtherMouseDown);
             DisposeBuffer(ref m_GpuEditSelected);
             DisposeBuffer(ref m_GpuEditDeleted);
+            DisposeBuffer(ref m_GpuEditOpacityMult);
             DisposeBuffer(ref m_GpuEditCountsBounds);
             DisposeBuffer(ref m_GpuEditCutouts);
             DisposeBuffer(ref m_GpuMaskWeights);
@@ -1680,9 +1690,13 @@ namespace GaussianSplatting.Runtime
                 m_GpuEditSelectedMouseDown = new GraphicsBuffer(target, size, 4) {name = "GaussianSplatSelectedInit"};
                 m_GpuEditDeleted = new GraphicsBuffer(target, size, 4) {name = "GaussianSplatDeleted"};
                 m_GpuEditCountsBounds = new GraphicsBuffer(target, 3 + 6, 4) {name = "GaussianSplatEditData"}; // selected count, deleted bound, cut count, float3 min, float3 max
+                m_GpuEditOpacityMult = new GraphicsBuffer(GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopySource | GraphicsBuffer.Target.CopyDestination, m_SplatCount, sizeof(float)) {name = "GaussianSplatOpacityMult"};
                 ClearGraphicsBuffer(m_GpuEditSelected);
                 ClearGraphicsBuffer(m_GpuEditSelectedMouseDown);
                 ClearGraphicsBuffer(m_GpuEditDeleted);
+                var onesData = new float[m_SplatCount];
+                for (int i = 0; i < onesData.Length; i++) onesData[i] = 1f;
+                m_GpuEditOpacityMult.SetData(onesData);
             }
             return m_GpuEditSelected != null;
         }
@@ -1745,7 +1759,9 @@ namespace GaussianSplatting.Runtime
         }
 
         // brushCenter: screen pixel coordinates. brushRadius: pixels. cam: the scene view camera.
-        public void EditBrushSelect(Vector2 brushCenter, float brushRadius, Camera cam, bool subtract)
+        // density [0..1]: fraction of splats inside the brush radius that actually get (de)selected per stroke — 1 = every touched splat, dithered thinning below that.
+        // seed: caller-supplied roll salt — should stay FIXED for the duration of one continuous stroke (mouse-down to mouse-up), not regenerated per dispatch, otherwise a held drag re-rolls every frame and converges to selecting everything regardless of density.
+        public void EditBrushSelect(Vector2 brushCenter, float brushRadius, Camera cam, bool subtract, float density = 1f, int seed = 0)
         {
             if (!EnsureEditingBuffers()) return;
 
@@ -1765,12 +1781,16 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeVectorParam(m_CSSplatUtilities, "_BrushCenter", (Vector4)new Vector2(brushCenter.x, brushCenter.y));
             cmb.SetComputeFloatParam(m_CSSplatUtilities, "_BrushRadius", brushRadius);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.BrushDensity, density);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BrushSeed, seed);
             DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelect, m_SplatCount);
             UpdateEditCountsAndBounds();
         }
 
         // worldCenter: sphere center in world space. worldRadius: metres.
-        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, Camera cam, bool subtract)
+        // density [0..1]: fraction of splats inside the brush sphere that actually get (de)selected per stroke — 1 = every touched splat, dithered thinning below that.
+        // seed: caller-supplied roll salt — should stay FIXED for the duration of one continuous stroke (see EditBrushSelect).
+        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, Camera cam, bool subtract, float density = 1f, int seed = 0)
         {
             if (!EnsureEditingBuffers()) return;
 
@@ -1788,6 +1808,8 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeVectorParam(m_CSSplatUtilities, "_BrushCenterWorld", worldCenter);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, "_BrushRadiusWorld", worldRadius);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.BrushDensity, density);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BrushSeed, seed);
             DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelectWorld, m_SplatCount);
             UpdateEditCountsAndBounds();
         }
@@ -1941,6 +1963,23 @@ namespace GaussianSplatting.Runtime
             editModified = true;
         }
 
+        // Returns a CPU snapshot of the per-splat opacity-multiplier buffer (needed for delete undo).
+        public float[] SnapshotOpacityMult()
+        {
+            if (!EnsureEditingBuffers()) return null;
+            var snap = new float[m_GpuEditOpacityMult.count];
+            m_GpuEditOpacityMult.GetData(snap);
+            return snap;
+        }
+
+        // Restores a previously snapshotted opacity-multiplier buffer (used by undo).
+        public void RestoreOpacityMult(float[] snapshot)
+        {
+            if (snapshot == null || m_GpuEditOpacityMult == null) return;
+            m_GpuEditOpacityMult.SetData(snapshot);
+            editModified = true;
+        }
+
         // Restores a previously snapshotted selected-bits buffer (used by undo to reinstate the selection).
         public void RestoreSelectedBits(uint[] snapshot)
         {
@@ -1986,8 +2025,9 @@ namespace GaussianSplatting.Runtime
             return true;
         }
 
-        // Delete selected splats filtered by opacity. density = threshold [0..1], hardness = edge sharpness [0..1].
-        public void EditDeleteSelectedWithParams(float density, float hardness)
+        // Delete selected splats filtered by opacity, or by a position-driven random dither. density = threshold [0..1], hardness = edge sharpness [0..1].
+        // usePositionMode: false = gate on opacity (existing behavior), true = gate on a deterministic per-splat random roll (real dithering), ignoring opacity.
+        public void EditDeleteSelectedWithParams(float density, float hardness, bool usePositionMode = false)
         {
             if (!EnsureEditingBuffers()) return;
 
@@ -1999,10 +2039,12 @@ namespace GaussianSplatting.Runtime
             using var cmb = new CommandBuffer { name = "SplatDeleteWithParams" };
             SetAssetDataOnCS(cmb, KernelIndices.DeleteSelectedWithParams);
             cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.DeleteSelectedWithParams, Props.SplatDeletedBitsRW, m_GpuEditDeleted);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.DeleteSelectedWithParams, Props.SplatOpacityMultRW, m_GpuEditOpacityMult);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteDensity, density);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DeleteHardness, hardness);
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.DeleteSelectionCenter, rawCenter);
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.DeleteSelectionExtents, rawExtents);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.DeleteUsePosition, usePositionMode ? 1 : 0);
             DispatchUtilsAndExecute(cmb, KernelIndices.DeleteSelectedWithParams, m_SplatCount);
 
             EditDeselectAll();

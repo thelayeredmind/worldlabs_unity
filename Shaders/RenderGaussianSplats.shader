@@ -52,6 +52,8 @@ uint _SceneDepthOcclusionEnabled;
 float2 _GaussianRTSize;
 StructuredBuffer<float> _SplatMaskWeights;
 uint _SplatMaskValid;
+StructuredBuffer<float> _SplatOpacityMult; // per-splat multiplier from Hardness-as-intensity delete blending. 1.0 = untouched.
+uint _SplatOpacityMultValid;
 
 Texture2D _CameraDepthTexture;
 SamplerState sampler_point_clamp;
@@ -105,6 +107,9 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 				o.col.a = -1;
 			}
 		}
+
+		if (_SplatOpacityMultValid && o.col.a >= 0)
+			o.col.a *= _SplatOpacityMult[instID];
 
 		if (_SplatMaskValid && o.col.a >= 0)
 		{
@@ -405,6 +410,8 @@ half _AlphaDiscardThreshold;
 float _ProximityDepthRange;
 StructuredBuffer<float> _SplatMaskWeights;
 uint _SplatMaskValid;
+StructuredBuffer<float> _SplatOpacityMult; // per-splat multiplier from Hardness-as-intensity delete blending. 1.0 = untouched.
+uint _SplatOpacityMultValid;
 
 Texture2D<float> _GaussianPrepassDepth;
 
@@ -428,6 +435,9 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 	o.col.g = f16tof32(view.color.x);
 	o.col.b = f16tof32(view.color.y >> 16);
 	o.col.a = f16tof32(view.color.y);
+
+	if (_SplatOpacityMultValid)
+		o.col.a *= _SplatOpacityMult[instID];
 
 	if (_SplatMaskValid)
 		o.col.a *= _SplatMaskWeights[instID];
