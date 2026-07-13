@@ -209,6 +209,12 @@ namespace GaussianSplatting.Runtime
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
                 mpb.SetFloat(GaussianSplatRenderer.Props.AlphaDiscardThreshold, gs.m_AlphaDiscardThreshold);
+                mpb.SetInteger(GaussianSplatRenderer.Props.SplatLinearToGamma, gs.m_SplatLinearToGamma ? 1 : 0);
+                mpb.SetFloat(GaussianSplatRenderer.Props.SplatGammaValue, gs.m_SplatGammaValue);
+                mpb.SetVector(GaussianSplatRenderer.Props.SplatShadowGain, gs.m_SplatShadowGain);
+                mpb.SetVector(GaussianSplatRenderer.Props.SplatMidGain, gs.m_SplatMidGain);
+                mpb.SetVector(GaussianSplatRenderer.Props.SplatHighlightGain, gs.m_SplatHighlightGain);
+                mpb.SetFloat(GaussianSplatRenderer.Props.SplatCurvePivot, gs.m_SplatCurvePivot);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
 
@@ -318,6 +324,19 @@ namespace GaussianSplatting.Runtime
         [Header("Debug Experiments")]
         [Tooltip("GSP-CULL-01: Sort front-to-back and render opaque. Measures overdraw lower bound — output looks wrong by design.")]
         public bool m_OpaqueExperiment;
+
+        [Tooltip("Experiment: apply a linear->gamma curve to splat color at shade time. SH DC coefficients are trained as linear-space values with no gamma correction applied anywhere in this pipeline by default.")]
+        public bool m_SplatLinearToGamma;
+        [Range(0.1f, 4.0f)] [Tooltip("Gamma exponent for the linear->gamma experiment above. 2.2 is standard display gamma; lower values darken less / raise less contrast, higher values darken more / raise more contrast.")]
+        public float m_SplatGammaValue = 2.2f;
+        [Tooltip("Per-channel 3-point curve gain (shadows) applied to splat color before the gamma curve above, while the linear->gamma experiment is enabled. 1,1,1 is neutral.")]
+        public Vector3 m_SplatShadowGain = Vector3.one;
+        [Tooltip("Per-channel 3-point curve gain (midtones).")]
+        public Vector3 m_SplatMidGain = Vector3.one;
+        [Tooltip("Per-channel 3-point curve gain (highlights).")]
+        public Vector3 m_SplatHighlightGain = Vector3.one;
+        [Range(0.05f, 0.95f)] [Tooltip("Value (0-1) where the shadow/midtone/highlight curve pivots. 0.5 is a symmetric split.")]
+        public float m_SplatCurvePivot = 0.5f;
 
         [Tooltip("GSP-CULL-03: Depth proximity transparency. Requires depthProximityTransparency enabled in GaussianSplatURPFeature. " +
                  "Enables Pass 2 (Z-prepass) + Pass 3 (transparent + proximity cull) instead of Pass 0.")]
@@ -432,6 +451,12 @@ namespace GaussianSplatting.Runtime
             public static readonly int SHOnly = Shader.PropertyToID("_SHOnly");
             public static readonly int ContributionCullThreshold = Shader.PropertyToID("_ContributionCullThreshold");
             public static readonly int AlphaDiscardThreshold = Shader.PropertyToID("_AlphaDiscardThreshold");
+            public static readonly int SplatLinearToGamma = Shader.PropertyToID("_SplatLinearToGamma");
+            public static readonly int SplatGammaValue = Shader.PropertyToID("_SplatGammaValue");
+            public static readonly int SplatShadowGain = Shader.PropertyToID("_SplatShadowGain");
+            public static readonly int SplatMidGain = Shader.PropertyToID("_SplatMidGain");
+            public static readonly int SplatHighlightGain = Shader.PropertyToID("_SplatHighlightGain");
+            public static readonly int SplatCurvePivot = Shader.PropertyToID("_SplatCurvePivot");
             public static readonly int DisplayIndex = Shader.PropertyToID("_DisplayIndex");
             public static readonly int DisplayChunks = Shader.PropertyToID("_DisplayChunks");
             public static readonly int GaussianSplatRT = Shader.PropertyToID("_GaussianSplatRT");

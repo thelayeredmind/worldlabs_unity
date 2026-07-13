@@ -48,6 +48,12 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropAlphaDiscardThreshold;
         SerializedProperty m_PropHotspotDebugVisualize;
         SerializedProperty m_PropOpaqueExperiment;
+        SerializedProperty m_PropSplatLinearToGamma;
+        SerializedProperty m_PropSplatGammaValue;
+        SerializedProperty m_PropSplatShadowGain;
+        SerializedProperty m_PropSplatMidGain;
+        SerializedProperty m_PropSplatHighlightGain;
+        SerializedProperty m_PropSplatCurvePivot;
 
         bool m_ResourcesExpanded = false;
         int m_CameraIndex = 0;
@@ -128,6 +134,12 @@ namespace GaussianSplatting.Editor
             m_PropAlphaDiscardThreshold = serializedObject.FindProperty("m_AlphaDiscardThreshold");
             m_PropHotspotDebugVisualize = serializedObject.FindProperty("m_HotspotDebugVisualize");
             m_PropOpaqueExperiment = serializedObject.FindProperty("m_OpaqueExperiment");
+            m_PropSplatLinearToGamma = serializedObject.FindProperty("m_SplatLinearToGamma");
+            m_PropSplatGammaValue = serializedObject.FindProperty("m_SplatGammaValue");
+            m_PropSplatShadowGain = serializedObject.FindProperty("m_SplatShadowGain");
+            m_PropSplatMidGain = serializedObject.FindProperty("m_SplatMidGain");
+            m_PropSplatHighlightGain = serializedObject.FindProperty("m_SplatHighlightGain");
+            m_PropSplatCurvePivot = serializedObject.FindProperty("m_SplatCurvePivot");
             s_AllEditors.Add(this);
             
             // Auto-assign resources if not set
@@ -467,6 +479,16 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.PropertyField(m_PropOpaqueExperiment);
             if (m_PropOpaqueExperiment.boolValue)
                 EditorGUILayout.HelpBox("GSP-CULL-01: Opaque front-to-back mode active. Output looks wrong by design — compare OVR Metrics App GPU Time against normal render for overdraw lower bound.", MessageType.Info);
+            EditorGUILayout.PropertyField(m_PropSplatLinearToGamma);
+            if (m_PropSplatLinearToGamma.boolValue)
+            {
+                EditorGUILayout.PropertyField(m_PropSplatGammaValue);
+                EditorGUILayout.PropertyField(m_PropSplatShadowGain, new GUIContent("Shadow Gain (RGB)"));
+                EditorGUILayout.PropertyField(m_PropSplatMidGain, new GUIContent("Midtone Gain (RGB)"));
+                EditorGUILayout.PropertyField(m_PropSplatHighlightGain, new GUIContent("Highlight Gain (RGB)"));
+                EditorGUILayout.PropertyField(m_PropSplatCurvePivot, new GUIContent("Curve Pivot"));
+                EditorGUILayout.HelpBox("Experiment: applying a linear->gamma curve to splat color at shade time. SH DC coefficients are trained as linear-space values with no gamma correction by default — this tests whether display-gamma correction here reads better. RGB gains apply an independent per-channel shadow/mid/highlight curve before the gamma curve.", MessageType.Info);
+            }
             EditorGUILayout.PropertyField(m_PropRenderMode);
             if (m_PropRenderMode.intValue is (int)GaussianSplatRenderer.RenderMode.DebugPoints or (int)GaussianSplatRenderer.RenderMode.DebugPointIndices)
                 EditorGUILayout.PropertyField(m_PropPointDisplaySize);

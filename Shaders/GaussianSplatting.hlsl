@@ -178,6 +178,40 @@ half3 ShadeSH(SplatSHData splat, half3 dir, int shOrder, bool onlySH)
     return max(res, 0);
 }
 
+// Experiment: SH DC coefficients (col = sh0 * SH_C0 + 0.5) are trained as linear-space
+// values with no gamma assumption baked in — see GaussianUtils.cs SHToColor. This applies
+// a standard linear->gamma curve to splat color at shade time, opt-in per draw call via
+// _SplatLinearToGamma, to test whether treating splat color as scene-linear (and needing
+// display-gamma correction here rather than downstream) reads better than the current
+// pass-through behavior.
+half3 SplatLinearToGamma(half3 c, half gamma)
+{
+    c = max(c, 0);
+    return pow(c, gamma);
+}
+
+// Experiment: single-value 3-point curve (shadow/mid/highlight gain), evaluated per channel.
+// Blends toward shadowGain below the midpoint and toward highlightGain above it, smoothly
+// crossfading through midGain at v == pivot. No LUT/texture — pure code, cheap per-pixel.
+half CurveChannel(half v, half shadowGain, half midGain, half highlightGain, half pivot)
+{
+    half loWeight = 1.0h - smoothstep(0.0h, pivot, v);
+    half hiWeight = smoothstep(pivot, 1.0h, v);
+    half midWeight = saturate(1.0h - loWeight - hiWeight);
+    half gain = shadowGain * loWeight + midGain * midWeight + highlightGain * hiWeight;
+    return v * gain;
+}
+
+// Experiment: independent per-channel 3-point curve, applied before the gamma curve above.
+// shadowGain/midGain/highlightGain are half3 (one gain triple per RGB channel); pivot is shared.
+half3 SplatChannelGain(half3 c, half3 shadowGain, half3 midGain, half3 highlightGain, half pivot)
+{
+    return half3(
+        CurveChannel(c.r, shadowGain.r, midGain.r, highlightGain.r, pivot),
+        CurveChannel(c.g, shadowGain.g, midGain.g, highlightGain.g, pivot),
+        CurveChannel(c.b, shadowGain.b, midGain.b, highlightGain.b, pivot));
+}
+
 static const uint kTexWidth = 2048;
 
 uint3 SplatIndexToPixelIndex(uint idx)

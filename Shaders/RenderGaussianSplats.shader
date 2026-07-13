@@ -57,6 +57,12 @@ uint _SplatOpacityMultValid;
 
 Texture2D _CameraDepthTexture;
 SamplerState sampler_point_clamp;
+uint _SplatLinearToGamma;
+half _SplatGammaValue;
+half3 _SplatShadowGain;
+half3 _SplatMidGain;
+half3 _SplatHighlightGain;
+half _SplatCurvePivot;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
@@ -170,7 +176,13 @@ half4 frag (v2f i) : SV_Target
     if (alpha < _AlphaDiscardThreshold)
         discard;
 
-    half4 res = half4(i.col.rgb * alpha, alpha);
+    half3 col = i.col.rgb;
+    if (_SplatLinearToGamma)
+    {
+        col = SplatChannelGain(col, _SplatShadowGain, _SplatMidGain, _SplatHighlightGain, _SplatCurvePivot);
+        col = SplatLinearToGamma(col, _SplatGammaValue);
+    }
+    half4 res = half4(col * alpha, alpha);
     return res;
 }
 
@@ -414,6 +426,12 @@ StructuredBuffer<float> _SplatOpacityMult; // per-splat multiplier from Hardness
 uint _SplatOpacityMultValid;
 
 Texture2D<float> _GaussianPrepassDepth;
+uint _SplatLinearToGamma;
+half _SplatGammaValue;
+half3 _SplatShadowGain;
+half3 _SplatMidGain;
+half3 _SplatHighlightGain;
+half _SplatCurvePivot;
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
@@ -512,7 +530,13 @@ half4 frag (v2f i) : SV_Target
 	}
 
 	// Tight quads mean alpha is always >= threshold here; no discard needed.
-    return half4(i.col.rgb * alpha, alpha);
+	half3 col = i.col.rgb;
+	if (_SplatLinearToGamma)
+	{
+		col = SplatChannelGain(col, _SplatShadowGain, _SplatMidGain, _SplatHighlightGain, _SplatCurvePivot);
+		col = SplatLinearToGamma(col, _SplatGammaValue);
+	}
+    return half4(col * alpha, alpha);
 }
 
 ENDCG
