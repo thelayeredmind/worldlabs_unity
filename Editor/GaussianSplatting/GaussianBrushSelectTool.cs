@@ -42,6 +42,49 @@ namespace GaussianSplatting.Editor
             set => s_Density = Mathf.Clamp01(value);
         }
 
+        // Reference color sampled by EditPickSplatColor; Color.clear until a pick succeeds.
+        public static Color ReferenceColor { get; set; } = Color.clear;
+
+        // When true, the next click in the Scene view samples a reference color instead of brushing.
+        public static bool PickModeActive { get; set; }
+
+        // When true, brush strokes gate on HSL delta against ReferenceColor instead of density thinning.
+        public static bool ColorModeActive { get; set; }
+
+        static float s_TolHue = 0.05f;
+        static float s_TolSaturation = 0.2f;
+        static float s_TolLightness = 0.2f;
+
+        public static float ToleranceHue
+        {
+            get => s_TolHue;
+            set => s_TolHue = Mathf.Clamp01(value);
+        }
+
+        public static float ToleranceSaturation
+        {
+            get => s_TolSaturation;
+            set => s_TolSaturation = Mathf.Clamp01(value);
+        }
+
+        public static float ToleranceLightness
+        {
+            get => s_TolLightness;
+            set => s_TolLightness = Mathf.Clamp01(value);
+        }
+
+        // Dispatches a screen-space color pick at screenPos and stores the result in ReferenceColor.
+        // Returns true if a splat was hit within pickRadiusPx.
+        public static bool TryPickReferenceColor(GaussianSplatRenderer gs, Camera cam, Vector2 screenPos, float pickRadiusPx = 20f)
+        {
+            if (gs.EditPickSplatColor(screenPos, pickRadiusPx, cam, out Color picked))
+            {
+                ReferenceColor = picked;
+                return true;
+            }
+            return false;
+        }
+
         // Called by GaussianToolContext.OnToolGUI when BrushModeActive is true.
         public static void HandleBrushGUI(GaussianSplatRenderer gs, int id, Event evt, EventType evtType)
         {
@@ -66,6 +109,19 @@ namespace GaussianSplatting.Editor
                 case EventType.MouseDown:
                     if (evt.button == 0 && !evt.alt && HandleUtility.nearestControl == id)
                     {
+                        if (PickModeActive)
+                        {
+                            var cam = SceneView.currentDrawingSceneView?.camera;
+                            if (cam != null)
+                            {
+                                Vector2 screenPx = HandleUtility.GUIPointToScreenPixelCoordinate(evt.mousePosition);
+                                TryPickReferenceColor(gs, cam, screenPx);
+                                GaussianSplatRendererEditor.RepaintAll();
+                            }
+                            evt.Use();
+                            break;
+                        }
+
                         GUIUtility.hotControl = id;
                         s_StrokeSeed = UnityEngine.Random.Range(int.MinValue, int.MaxValue);
                         ApplyBrush(gs, evt);
@@ -101,16 +157,20 @@ namespace GaussianSplatting.Editor
             if (cam == null) return;
             bool subtract = evt.control;
 
+            Vector3 tolHsl = new Vector3(s_TolHue, s_TolSaturation, s_TolLightness);
+
             if (WorldSpaceMode)
             {
                 Ray ray = HandleUtility.GUIPointToWorldRay(evt.mousePosition);
                 Vector3 center = GetBrushCenter(gs, ray);
-                gs.EditBrushSelectWorld(center, s_RadiusWorld, cam, subtract, BrushDensity, s_StrokeSeed);
+                gs.EditBrushSelectWorld(center, s_RadiusWorld, cam, subtract, BrushDensity, s_StrokeSeed,
+                    ColorModeActive, ReferenceColor, tolHsl);
             }
             else
             {
                 Vector2 screenPx = HandleUtility.GUIPointToScreenPixelCoordinate(evt.mousePosition);
-                gs.EditBrushSelect(screenPx, s_RadiusPx, cam, subtract, BrushDensity, s_StrokeSeed);
+                gs.EditBrushSelect(screenPx, s_RadiusPx, cam, subtract, BrushDensity, s_StrokeSeed,
+                    ColorModeActive, ReferenceColor, tolHsl);
             }
             GaussianSplatRendererEditor.RepaintAll();
         }

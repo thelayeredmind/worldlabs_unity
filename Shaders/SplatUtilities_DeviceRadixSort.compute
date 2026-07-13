@@ -20,6 +20,7 @@
 #pragma kernel CSDeleteSelectedWithParams
 #pragma kernel CSBrushSelect
 #pragma kernel CSBrushSelectWorld
+#pragma kernel CSPickSplatColor
 
 // DeviceRadixSort
 #pragma multi_compile __ KEY_UINT KEY_INT KEY_FLOAT
@@ -1109,12 +1110,55 @@ void CSDeleteSelectedWithParams (uint3 id : SV_DispatchThreadID)
 // _SelectionMode: 1 = add, 0 = subtract (shared by both kernels)
 // _BrushDensity [0..1]: fraction of splats inside the brush that actually get (de)selected — dithered via HashIndexToUnitFloatSeeded, 1 = every touched splat.
 // _BrushSeed: per-dispatch salt so repeated strokes at the same density roll differently each time, instead of always missing/hitting the same splats.
+// _BrushColorModeActive: when nonzero, a candidate must pass HSL-delta color matching BEFORE density gets a
+// say — density then dithers WITHIN the color-matched set (AND gate), rather than across the whole stroke.
+// _BrushRefColorHsl: reference color (sampled via CSPickSplatColor) pre-converted to HSL on the C# side.
+// _BrushColorTolHsl: per-channel (H, S, L) tolerance — a candidate must be within tolerance on ALL three to pass.
 float2 _BrushCenter;
 float _BrushRadius;
 float3 _BrushCenterWorld;
 float _BrushRadiusWorld;
 float _BrushDensity;
 uint _BrushSeed;
+uint _BrushColorModeActive;
+float3 _BrushRefColorHsl;
+float3 _BrushColorTolHsl;
+
+// Standard RGB->HSL. H in [0,1) (wrapped), S and L in [0,1].
+float3 RgbToHsl(float3 c)
+{
+    float maxc = max(c.r, max(c.g, c.b));
+    float minc = min(c.r, min(c.g, c.b));
+    float l = (maxc + minc) * 0.5;
+    float d = maxc - minc;
+
+    float h = 0.0;
+    float s = 0.0;
+    if (d > 1e-6)
+    {
+        s = d / (1.0 - abs(2.0 * l - 1.0) + 1e-6);
+        if (maxc == c.r)
+            h = fmod((c.g - c.b) / d, 6.0);
+        else if (maxc == c.g)
+            h = (c.b - c.r) / d + 2.0;
+        else
+            h = (c.r - c.g) / d + 4.0;
+        h /= 6.0;
+        if (h < 0.0) h += 1.0;
+    }
+    return float3(h, s, l);
+}
+
+// True if candidate HSL is within tolerance of the reference on all three channels.
+// Hue wraps circularly (0 and 1 are adjacent), saturation/lightness do not.
+bool ColorMatchesHsl(float3 candidateHsl)
+{
+    float dh = abs(candidateHsl.x - _BrushRefColorHsl.x);
+    dh = min(dh, 1.0 - dh); // circular wrap
+    float ds = abs(candidateHsl.y - _BrushRefColorHsl.y);
+    float dl = abs(candidateHsl.z - _BrushRefColorHsl.z);
+    return dh <= _BrushColorTolHsl.x && ds <= _BrushColorTolHsl.y && dl <= _BrushColorTolHsl.z;
+}
 
 [numthreads(GROUP_SIZE,1,1)]
 void CSBrushSelect (uint3 id : SV_DispatchThreadID)
@@ -1145,6 +1189,15 @@ void CSBrushSelect (uint3 id : SV_DispatchThreadID)
     if (_SplatDeletedBits.Load(delWordIdx * 4) & (1u << delBitIdx))
         return;
 
+    // Color match is a hard gate: candidate must match before density even gets a say.
+    if (_BrushColorModeActive)
+    {
+        float3 hsl = RgbToHsl(LoadSplatColTex(SplatIndexToPixelIndex(idx)).rgb);
+        if (!ColorMatchesHsl(hsl))
+            return;
+    }
+
+    // Density dithers within whatever passed the color gate above (or the whole stroke, if color mode is off).
     if (HashIndexToUnitFloatSeeded(idx, _BrushSeed) >= _BrushDensity)
         return;
 
@@ -1190,6 +1243,15 @@ void CSBrushSelectWorld (uint3 id : SV_DispatchThreadID)
     if (_SplatDeletedBits.Load(delWordIdx * 4) & (1u << delBitIdx))
         return;
 
+    // Color match is a hard gate: candidate must match before density even gets a say.
+    if (_BrushColorModeActive)
+    {
+        float3 hsl = RgbToHsl(LoadSplatColTex(SplatIndexToPixelIndex(idx)).rgb);
+        if (!ColorMatchesHsl(hsl))
+            return;
+    }
+
+    // Density dithers within whatever passed the color gate above (or the whole stroke, if color mode is off).
     if (HashIndexToUnitFloatSeeded(idx, _BrushSeed) >= _BrushDensity)
         return;
 
@@ -1199,4 +1261,62 @@ void CSBrushSelectWorld (uint3 id : SV_DispatchThreadID)
         _SplatSelectedBits.InterlockedOr(wordIdx * 4, 1u << bitIdx);
     else
         _SplatSelectedBits.InterlockedAnd(wordIdx * 4, ~(1u << bitIdx));
+}
+
+// Screen-space color pick: finds the splat nearest to a click pixel (within _PickRadius) and writes its
+// base color (SH DC term from the color texture, not full view-dependent SH) to _PickResultRW.
+// _PickResultRW layout: [0] = packed (distanceBucket << 19 | idx), MUST be initialized to 0xFFFFFFFF by
+// the caller before dispatch so InterlockedMin can find the true nearest; [1..4] = winning splat's RGBA
+// color as asuint-packed floats, written only by the thread that successfully wins the InterlockedMin race
+// (checked by reading back [0] after the atomic and comparing to this thread's own packed value).
+float2 _PickCenter;   // screen pixels
+float _PickRadius;    // screen pixels
+RWByteAddressBuffer _PickResultRW; // byte offsets: 0=packed dist+idx, 4/8/12/16=RGBA (InterlockedMin needs a raw buffer, not RWStructuredBuffer)
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSPickSplatColor (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    float3 pos = LoadSplatPos(idx);
+    if (IsSplatCut(pos))
+        return;
+
+    float3 worldPos = mul(_MatrixObjectToWorld, float4(pos, 1)).xyz;
+    float4 clipPos  = mul(_MatrixVP, float4(worldPos, 1));
+    if (clipPos.w <= 0)
+        return;
+
+    float2 pixelPos = (clipPos.xy / clipPos.w * float2(0.5, -0.5) + 0.5) * _VecScreenParams.xy;
+    float2 delta = pixelPos - _PickCenter;
+    float distSq = dot(delta, delta);
+    if (distSq > _PickRadius * _PickRadius)
+        return;
+
+    // Already deleted — never pick a color from a splat that's gone.
+    uint delWordIdxP = idx / 32;
+    uint delBitIdxP = idx & 31;
+    if (_SplatDeletedBits.Load(delWordIdxP * 4) & (1u << delBitIdxP))
+        return;
+
+    // Quantize distSq into the top 13 bits (far hits beyond the quantization range clamp to the max
+    // bucket — only loses fine ordering among hits already outside a sane _PickRadius), index in low 19 bits.
+    uint distBucket = (uint)min(distSq * 16.0, 8191.0);
+    uint packed = (distBucket << 19) | (idx & 0x7FFFF);
+
+    uint prevMin;
+    _PickResultRW.InterlockedMin(0, packed, prevMin);
+    // If this thread's value is the new minimum (prevMin was larger), it won the race — write color.
+    // Rare double-write races (two threads both see themselves as winner within the same dispatch) are
+    // acceptable here: only ever between splats at effectively the same pixel distance, picking either is fine.
+    if (packed < prevMin)
+    {
+        half4 col = LoadSplatColTex(SplatIndexToPixelIndex(idx));
+        _PickResultRW.Store(4,  asuint((float)col.r));
+        _PickResultRW.Store(8,  asuint((float)col.g));
+        _PickResultRW.Store(12, asuint((float)col.b));
+        _PickResultRW.Store(16, asuint((float)col.a));
+    }
 }

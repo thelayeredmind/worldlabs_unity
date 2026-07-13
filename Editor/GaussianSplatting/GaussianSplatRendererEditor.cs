@@ -789,9 +789,51 @@ namespace GaussianSplatting.Editor
 
                     EditorGUI.BeginChangeCheck();
                     float density = EditorGUILayout.Slider(
-                        new GUIContent("Density", "Fraction of touched splats actually (de)selected per stroke. 1 = every touched splat, lower values dither the selection."),
+                        new GUIContent("Density", "Fraction of touched splats actually (de)selected per stroke. 1 = every touched splat, lower values dither the selection. When Color Mode is active, density dithers WITHIN the color-matched candidates rather than the whole stroke."),
                         GaussianBrushSelectTool.BrushDensity, 0f, 1f);
                     if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.BrushDensity = density;
+
+                    EditorGUILayout.Space(2f);
+
+                    EditorGUI.BeginChangeCheck();
+                    bool wantColorMode = EditorGUILayout.ToggleLeft(
+                        new GUIContent("Color Mode", "Gate brush selection by HSL delta from the sampled reference color. Density still applies on top, thinning within the color-matched candidates."),
+                        GaussianBrushSelectTool.ColorModeActive);
+                    if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.ColorModeActive = wantColorMode;
+
+                    if (GaussianBrushSelectTool.ColorModeActive)
+                    {
+                        GUILayout.BeginHorizontal();
+                        bool pickActive = GUILayout.Toggle(
+                            GaussianBrushSelectTool.PickModeActive, "Pick Color", EditorStyles.miniButtonLeft, GUILayout.ExpandWidth(false));
+                        if (pickActive != GaussianBrushSelectTool.PickModeActive)
+                        {
+                            GaussianBrushSelectTool.PickModeActive = pickActive;
+                            SceneView.RepaintAll();
+                        }
+                        EditorGUI.BeginChangeCheck();
+                        Color refColor = EditorGUILayout.ColorField(GaussianBrushSelectTool.ReferenceColor);
+                        if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.ReferenceColor = refColor;
+                        GUILayout.EndHorizontal();
+
+                        EditorGUI.BeginChangeCheck();
+                        float tolHue = EditorGUILayout.Slider(
+                            new GUIContent("Hue Tolerance", "Max hue distance (circular) from the reference color to still match."),
+                            GaussianBrushSelectTool.ToleranceHue, 0f, 1f);
+                        if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.ToleranceHue = tolHue;
+
+                        EditorGUI.BeginChangeCheck();
+                        float tolSat = EditorGUILayout.Slider(
+                            new GUIContent("Saturation Tolerance", "Max saturation distance from the reference color to still match."),
+                            GaussianBrushSelectTool.ToleranceSaturation, 0f, 1f);
+                        if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.ToleranceSaturation = tolSat;
+
+                        EditorGUI.BeginChangeCheck();
+                        float tolLight = EditorGUILayout.Slider(
+                            new GUIContent("Lightness Tolerance", "Max lightness distance from the reference color to still match."),
+                            GaussianBrushSelectTool.ToleranceLightness, 0f, 1f);
+                        if (EditorGUI.EndChangeCheck()) GaussianBrushSelectTool.ToleranceLightness = tolLight;
+                    }
                 }
             }
 

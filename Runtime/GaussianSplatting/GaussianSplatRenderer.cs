@@ -472,9 +472,15 @@ namespace GaussianSplatting.Runtime
             public static readonly int DeleteUsePosition = Shader.PropertyToID("_DeleteUsePosition");
             public static readonly int BrushDensity = Shader.PropertyToID("_BrushDensity");
             public static readonly int BrushSeed = Shader.PropertyToID("_BrushSeed");
+            public static readonly int BrushColorModeActive = Shader.PropertyToID("_BrushColorModeActive");
+            public static readonly int BrushRefColorHsl = Shader.PropertyToID("_BrushRefColorHsl");
+            public static readonly int BrushColorTolHsl = Shader.PropertyToID("_BrushColorTolHsl");
             public static readonly int SplatOpacityMult = Shader.PropertyToID("_SplatOpacityMult");
             public static readonly int SplatOpacityMultValid = Shader.PropertyToID("_SplatOpacityMultValid");
             public static readonly int SplatOpacityMultRW = Shader.PropertyToID("_SplatOpacityMultRW");
+            public static readonly int PickCenter = Shader.PropertyToID("_PickCenter");
+            public static readonly int PickRadius = Shader.PropertyToID("_PickRadius");
+            public static readonly int PickResultRW = Shader.PropertyToID("_PickResultRW");
             public static readonly int DeleteSelectionCenter = Shader.PropertyToID("_DeleteSelectionCenter");
             public static readonly int DeleteSelectionExtents = Shader.PropertyToID("_DeleteSelectionExtents");
             public static readonly int SplatDeletedBitsRW = Shader.PropertyToID("_SplatDeletedBitsRW");
@@ -514,6 +520,7 @@ namespace GaussianSplatting.Runtime
             DeleteSelectedWithParams,
             BrushSelect,
             BrushSelectWorld,
+            PickSplatColor,
         }
 
         public bool HasValidRuntimeData => m_RuntimeData != null && m_RuntimeData.splatCount > 0;
@@ -1758,10 +1765,37 @@ namespace GaussianSplatting.Runtime
             UpdateEditCountsAndBounds();
         }
 
+        // Converts an RGB color to HSL (H, S, L each in [0,1]) — matches the compute shader's RgbToHsl exactly,
+        // so C#-side reference/tolerance values compare correctly against GPU-side per-splat HSL.
+        static Vector3 RgbToHsl(Color c)
+        {
+            float maxc = Mathf.Max(c.r, Mathf.Max(c.g, c.b));
+            float minc = Mathf.Min(c.r, Mathf.Min(c.g, c.b));
+            float l = (maxc + minc) * 0.5f;
+            float d = maxc - minc;
+
+            float h = 0f, s = 0f;
+            if (d > 1e-6f)
+            {
+                s = d / (1f - Mathf.Abs(2f * l - 1f) + 1e-6f);
+                if (maxc == c.r)
+                    h = ((c.g - c.b) / d) % 6f;
+                else if (maxc == c.g)
+                    h = (c.b - c.r) / d + 2f;
+                else
+                    h = (c.r - c.g) / d + 4f;
+                h /= 6f;
+                if (h < 0f) h += 1f;
+            }
+            return new Vector3(h, s, l);
+        }
+
         // brushCenter: screen pixel coordinates. brushRadius: pixels. cam: the scene view camera.
         // density [0..1]: fraction of splats inside the brush radius that actually get (de)selected per stroke — 1 = every touched splat, dithered thinning below that.
         // seed: caller-supplied roll salt — should stay FIXED for the duration of one continuous stroke (mouse-down to mouse-up), not regenerated per dispatch, otherwise a held drag re-rolls every frame and converges to selecting everything regardless of density.
-        public void EditBrushSelect(Vector2 brushCenter, float brushRadius, Camera cam, bool subtract, float density = 1f, int seed = 0)
+        // colorMode: when true, adds an HSL-delta gate (against refColor/tolHsl, Hue/Saturation/Lightness tolerances) that a splat must pass BEFORE density gets a say — density still dithers within the color-matched candidates.
+        public void EditBrushSelect(Vector2 brushCenter, float brushRadius, Camera cam, bool subtract, float density = 1f, int seed = 0,
+            bool colorMode = false, Color refColor = default, Vector3 tolHsl = default)
         {
             if (!EnsureEditingBuffers()) return;
 
@@ -1783,6 +1817,9 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.BrushDensity, density);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BrushSeed, seed);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BrushColorModeActive, colorMode ? 1 : 0);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.BrushRefColorHsl, RgbToHsl(refColor));
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.BrushColorTolHsl, tolHsl);
             DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelect, m_SplatCount);
             UpdateEditCountsAndBounds();
         }
@@ -1790,7 +1827,9 @@ namespace GaussianSplatting.Runtime
         // worldCenter: sphere center in world space. worldRadius: metres.
         // density [0..1]: fraction of splats inside the brush sphere that actually get (de)selected per stroke — 1 = every touched splat, dithered thinning below that.
         // seed: caller-supplied roll salt — should stay FIXED for the duration of one continuous stroke (see EditBrushSelect).
-        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, Camera cam, bool subtract, float density = 1f, int seed = 0)
+        // colorMode: see EditBrushSelect — same semantics, HSL-delta gate applied before density thinning.
+        public void EditBrushSelectWorld(Vector3 worldCenter, float worldRadius, Camera cam, bool subtract, float density = 1f, int seed = 0,
+            bool colorMode = false, Color refColor = default, Vector3 tolHsl = default)
         {
             if (!EnsureEditingBuffers()) return;
 
@@ -1810,8 +1849,53 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SelectionMode, subtract ? 0 : 1);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.BrushDensity, density);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BrushSeed, seed);
+            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.BrushColorModeActive, colorMode ? 1 : 0);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.BrushRefColorHsl, RgbToHsl(refColor));
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.BrushColorTolHsl, tolHsl);
             DispatchUtilsAndExecute(cmb, KernelIndices.BrushSelectWorld, m_SplatCount);
             UpdateEditCountsAndBounds();
+        }
+
+        // Screen-space color pick: finds the splat nearest to screenPos (within pickRadiusPx) and returns its
+        // base color (SH DC term, not full view-dependent SH). Returns false if nothing was hit within radius.
+        public bool EditPickSplatColor(Vector2 screenPos, float pickRadiusPx, Camera cam, out Color color)
+        {
+            color = Color.clear;
+            if (!EnsureEditingBuffers()) return false;
+            if (cam == null) return false;
+
+            var tr = transform;
+            Matrix4x4 matO2W = tr.localToWorldMatrix;
+            Matrix4x4 matW2O = tr.worldToLocalMatrix;
+            Matrix4x4 matView = cam.worldToCameraMatrix;
+            Matrix4x4 matProj = GL.GetGPUProjectionMatrix(cam.projectionMatrix, true);
+            Vector4 screenPar = new Vector4(cam.pixelWidth, cam.pixelHeight, 0, 0);
+
+            using var pickResult = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopyDestination, 5, sizeof(uint));
+            pickResult.SetData(new uint[] { 0xFFFFFFFFu, 0, 0, 0, 0 });
+
+            using var cmb = new CommandBuffer { name = "SplatPickColor" };
+            SetAssetDataOnCS(cmb, KernelIndices.PickSplatColor);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, matO2W);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, matW2O);
+            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixVP, matProj * matView);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecScreenParams, screenPar);
+            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.PickCenter, (Vector4)screenPos);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.PickRadius, pickRadiusPx);
+            cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.PickSplatColor, Props.PickResultRW, pickResult);
+            DispatchUtilsAndExecute(cmb, KernelIndices.PickSplatColor, m_SplatCount);
+
+            var resultData = new uint[5];
+            pickResult.GetData(resultData);
+            if (resultData[0] == 0xFFFFFFFFu)
+                return false; // nothing hit within pickRadiusPx
+
+            color = new Color(
+                System.BitConverter.Int32BitsToSingle((int)resultData[1]),
+                System.BitConverter.Int32BitsToSingle((int)resultData[2]),
+                System.BitConverter.Int32BitsToSingle((int)resultData[3]),
+                System.BitConverter.Int32BitsToSingle((int)resultData[4]));
+            return true;
         }
 
         public void EditTranslateSelection(Vector3 localSpacePosDelta)
