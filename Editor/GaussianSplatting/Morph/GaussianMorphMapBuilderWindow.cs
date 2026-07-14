@@ -25,6 +25,10 @@ namespace GaussianSplatting.Editor
         [SerializeField] string m_OutputFolder = "Assets/GaussianAssets";
         [SerializeField] float  m_ColorWeight  = 0.5f;
 
+        [SerializeField] GaussianMorphMap m_SampleMap;
+        [SerializeField] int m_SampleCount = 20;
+        string m_SampleReport;
+
         string m_Status;
         float  m_Progress;
         bool   m_Building;
@@ -127,6 +131,34 @@ namespace GaussianSplatting.Editor
                 EditorGUILayout.Space(4);
                 EditorGUILayout.HelpBox(m_Status, m_Building ? MessageType.Info : MessageType.None);
             }
+
+            EditorGUILayout.Space(12);
+            EditorGUILayout.LabelField("Match Quality Sample", EditorStyles.boldLabel);
+            m_SampleMap   = (GaussianMorphMap)EditorGUILayout.ObjectField("Map",     m_SampleMap,   typeof(GaussianMorphMap),   false);
+            m_SampleCount = EditorGUILayout.IntField("Sample count", m_SampleCount);
+
+            using (new EditorGUI.DisabledScope(m_SampleMap == null || m_AssetLeft == null || m_AssetRight == null))
+            {
+                if (GUILayout.Button("Sample Match Quality"))
+                    RunSampleMatchQuality();
+            }
+
+            if (!string.IsNullOrEmpty(m_SampleReport))
+            {
+                EditorGUILayout.Space(4);
+                EditorGUILayout.TextArea(m_SampleReport, GUILayout.MinHeight(120));
+            }
+        }
+
+        void RunSampleMatchQuality()
+        {
+            var samples = GaussianMorphMapBuilder.SampleMatchQuality(m_SampleMap, m_AssetLeft, m_AssetRight, m_SampleCount);
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"{samples.Length} samples (posDelta, colorDelta):");
+            foreach (var s in samples)
+                sb.AppendLine($"pair {s.pairIndex,6}  L{s.leftIndex} -> R{s.rightIndex}   pos={s.posDelta:F4}   color={s.colorDelta:F4}");
+            m_SampleReport = sb.ToString();
+            Debug.Log(m_SampleReport);
         }
 
         void StartBuild()

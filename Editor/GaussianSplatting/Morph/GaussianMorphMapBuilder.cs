@@ -179,6 +179,58 @@ namespace GaussianSplatting.Editor
             remainingR = Array.Empty<int>();
         }
 
+        // ── Match quality sampling ────────────────────────────────────────────
+
+        public struct MatchSample
+        {
+            public int   pairIndex;
+            public int   leftIndex;
+            public int   rightIndex;
+            public float posDelta;
+            public float colorDelta;
+        }
+
+        /// <summary>
+        /// Samples a random subset of a built map's matched pairs and reports, per sample,
+        /// the world-space position delta and color delta between the two matched splats.
+        /// A cross-cluster swap shows up as a large position delta paired with a near-zero
+        /// color delta; a large position delta with a large color delta is a legitimate
+        /// long-range match at high color weight. Not exhaustive by design — at 100k-2M+
+        /// splats, a small random sample is enough to tell whether matching looks sane.
+        /// </summary>
+        public static MatchSample[] SampleMatchQuality(GaussianMorphMap map, GaussianSplatAsset left, GaussianSplatAsset right,
+            int sampleCount = 20, int seed = 0)
+        {
+            int n = map.matchedPairs?.Length ?? 0;
+            if (n == 0)
+                return Array.Empty<MatchSample>();
+
+            var posL = DecodeSplatPositions(left);
+            var posR = DecodeSplatPositions(right);
+            var colL = DecodeSplatColors(left);
+            var colR = DecodeSplatColors(right);
+
+            var rng = new System.Random(seed);
+            int count = Mathf.Min(sampleCount, n);
+            var chosen = Enumerable.Range(0, n).OrderBy(_ => rng.Next()).Take(count);
+
+            var samples = new List<MatchSample>(count);
+            foreach (int pairIdx in chosen)
+            {
+                var pair = map.matchedPairs[pairIdx];
+                samples.Add(new MatchSample
+                {
+                    pairIndex  = pairIdx,
+                    leftIndex  = pair.x,
+                    rightIndex = pair.y,
+                    posDelta   = Vector3.Distance(posL[pair.x], posR[pair.y]),
+                    colorDelta = Vector4.Distance(colL[pair.x], colR[pair.y]),
+                });
+            }
+
+            return samples.ToArray();
+        }
+
         // ── Duplicate resolution ──────────────────────────────────────────────
 
         /// <summary>
