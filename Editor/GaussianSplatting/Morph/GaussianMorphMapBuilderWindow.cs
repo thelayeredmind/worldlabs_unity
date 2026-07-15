@@ -162,6 +162,12 @@ namespace GaussianSplatting.Editor
                     RunTopDuplicatedRight();
             }
 
+            using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
+            {
+                if (GUILayout.Button("Verify Top-K Matches Kernel"))
+                    RunVerifyTopKMatches();
+            }
+
             if (!string.IsNullOrEmpty(m_SampleReport))
             {
                 EditorGUILayout.Space(4);
@@ -218,6 +224,47 @@ namespace GaussianSplatting.Editor
                               $"R count: {report.countR}\n" +
                               $"Distinct R chosen: {report.distinctRChosen}\n" +
                               $"Distinct ratio (distinctR / min(L,R)): {report.distinctRatio:F4}";
+            Debug.Log(m_SampleReport);
+        }
+
+        void RunVerifyTopKMatches()
+        {
+            // Sanity check for the new FindTopKMatches kernel (sparse-Sinkhorn foundation): the
+            // top-1 candidate it returns per L splat must exactly match FindBestMatch's existing
+            // single-argmin output, since both compute the identical min-max blended distance —
+            // only the number of retained candidates differs. A mismatch here would mean the top-K
+            // insertion logic diverges from the proven single-argmin path.
+            Vector3[] posL, posR;
+            Vector4[] colL, colR;
+            try
+            {
+                posL = GaussianMorphMapBuilder.DecodeSplatPositions(m_AssetLeft);
+                posR = GaussianMorphMapBuilder.DecodeSplatPositions(m_AssetRight);
+                colL = GaussianMorphMapBuilder.DecodeSplatColors(m_AssetLeft);
+                colR = GaussianMorphMapBuilder.DecodeSplatColors(m_AssetRight);
+            }
+            catch (Exception e)
+            {
+                m_SampleReport = $"Decode error: {e.Message}";
+                Debug.LogException(e);
+                return;
+            }
+
+            DispatchCorrespondenceShader(posL, colL, posR, colR, 1f - m_ColorWeight, m_ColorWeight,
+                out var bestIndex, out var bestDist, out _);
+            DispatchTopKMatches(posL, colL, posR, colR, 1f - m_ColorWeight, m_ColorWeight,
+                out var topKIndex, out var topKDist);
+
+            int nL = posL.Length;
+            int mismatches = 0;
+            for (int i = 0; i < nL; i++)
+            {
+                if (topKIndex[i * kTopK] != bestIndex[i])
+                    mismatches++;
+            }
+
+            m_SampleReport = $"Verified {nL} splats: top-1 of top-{kTopK} vs single-argmin — " +
+                              $"{mismatches} mismatches ({(mismatches == 0 ? "PASS" : "FAIL")}).";
             Debug.Log(m_SampleReport);
         }
 
@@ -338,17 +385,21 @@ namespace GaussianSplatting.Editor
             int nL = posL.Length;
             int nR = posR.Length;
 
-            // Normalise positions into [0,1] across both clouds
-            GetBounds(posL, posR, out var bMin, out var bMax);
-            float scale = Mathf.Max(Mathf.Max(bMax.x - bMin.x, bMax.y - bMin.y), bMax.z - bMin.z);
-            scale = Mathf.Max(scale, 1e-6f);
+            // Normalise each cloud into [0,1] against its OWN bounds, independently — see GetBounds'
+            // header comment for why a shared/combined box is wrong here.
+            GetBounds(posL, out var bMinL, out var bMaxL);
+            GetBounds(posR, out var bMinR, out var bMaxR);
+            float scaleL = Mathf.Max(Mathf.Max(bMaxL.x - bMinL.x, bMaxL.y - bMinL.y), bMaxL.z - bMinL.z);
+            float scaleR = Mathf.Max(Mathf.Max(bMaxR.x - bMinR.x, bMaxR.y - bMinR.y), bMaxR.z - bMinR.z);
+            scaleL = Mathf.Max(scaleL, 1e-6f);
+            scaleR = Mathf.Max(scaleR, 1e-6f);
 
             var splatsLData = new Vector4[nL];
             var splatsRData = new Vector4[nR];
             for (int i = 0; i < nL; i++)
-                splatsLData[i] = new Vector4((posL[i].x - bMin.x) / scale, (posL[i].y - bMin.y) / scale, (posL[i].z - bMin.z) / scale, 0);
+                splatsLData[i] = new Vector4((posL[i].x - bMinL.x) / scaleL, (posL[i].y - bMinL.y) / scaleL, (posL[i].z - bMinL.z) / scaleL, 0);
             for (int j = 0; j < nR; j++)
-                splatsRData[j] = new Vector4((posR[j].x - bMin.x) / scale, (posR[j].y - bMin.y) / scale, (posR[j].z - bMin.z) / scale, 0);
+                splatsRData[j] = new Vector4((posR[j].x - bMinR.x) / scaleR, (posR[j].y - bMinR.y) / scaleR, (posR[j].z - bMinR.z) / scaleR, 0);
 
             var bufSplatsL = new ComputeBuffer(nL, 16);
             var bufSplatsR = new ComputeBuffer(nR, 16);
@@ -396,12 +447,95 @@ namespace GaussianSplatting.Editor
             }
         }
 
-        static void GetBounds(Vector3[] a, Vector3[] b, out Vector3 min, out Vector3 max)
+        const int kTopK = 32;
+
+        // Sparse candidate-list gather for the Sinkhorn matcher: FindBestMatch's single argmin
+        // commits each L splat to one winner before any global consistency pass can run, which is
+        // what let independent greedy argmin mass-converge onto a small R subset (9.2% distinct
+        // ratio measured on a real 294912-splat asset). This mirrors DispatchCorrespondenceShader's
+        // setup exactly, just targeting FindTopKMatches and returning kTopK candidates per L splat
+        // instead of one.
+        static void DispatchTopKMatches(
+            Vector3[] posL, Vector4[] colL,
+            Vector3[] posR, Vector4[] colR,
+            float posWeight, float colWeight,
+            out int[] topKIndex, out float[] topKDist)
+        {
+            var shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(kShaderPath);
+            if (shader == null)
+                throw new Exception($"SplatCorrespondence.compute not found at {kShaderPath}");
+
+            int nL = posL.Length;
+            int nR = posR.Length;
+
+            GetBounds(posL, out var bMinL, out var bMaxL);
+            GetBounds(posR, out var bMinR, out var bMaxR);
+            float scaleL = Mathf.Max(Mathf.Max(bMaxL.x - bMinL.x, bMaxL.y - bMinL.y), bMaxL.z - bMinL.z);
+            float scaleR = Mathf.Max(Mathf.Max(bMaxR.x - bMinR.x, bMaxR.y - bMinR.y), bMaxR.z - bMinR.z);
+            scaleL = Mathf.Max(scaleL, 1e-6f);
+            scaleR = Mathf.Max(scaleR, 1e-6f);
+
+            var splatsLData = new Vector4[nL];
+            var splatsRData = new Vector4[nR];
+            for (int i = 0; i < nL; i++)
+                splatsLData[i] = new Vector4((posL[i].x - bMinL.x) / scaleL, (posL[i].y - bMinL.y) / scaleL, (posL[i].z - bMinL.z) / scaleL, 0);
+            for (int j = 0; j < nR; j++)
+                splatsRData[j] = new Vector4((posR[j].x - bMinR.x) / scaleR, (posR[j].y - bMinR.y) / scaleR, (posR[j].z - bMinR.z) / scaleR, 0);
+
+            var bufSplatsL = new ComputeBuffer(nL, 16);
+            var bufSplatsR = new ComputeBuffer(nR, 16);
+            var bufColsL   = new ComputeBuffer(nL, 16);
+            var bufColsR   = new ComputeBuffer(nR, 16);
+            var bufTopKIdx  = new ComputeBuffer(nL * kTopK, 4);
+            var bufTopKDist = new ComputeBuffer(nL * kTopK, 4);
+
+            try
+            {
+                bufSplatsL.SetData(splatsLData);
+                bufSplatsR.SetData(splatsRData);
+                bufColsL.SetData(colL);
+                bufColsR.SetData(colR);
+
+                int kernel = shader.FindKernel("FindTopKMatches");
+                shader.SetBuffer(kernel, "_SplatsL",   bufSplatsL);
+                shader.SetBuffer(kernel, "_ColorsL",   bufColsL);
+                shader.SetBuffer(kernel, "_SplatsR",   bufSplatsR);
+                shader.SetBuffer(kernel, "_ColorsR",   bufColsR);
+                shader.SetBuffer(kernel, "_TopKIndex", bufTopKIdx);
+                shader.SetBuffer(kernel, "_TopKDist",  bufTopKDist);
+                shader.SetInt  ("_CountL",    nL);
+                shader.SetInt  ("_CountR",    nR);
+                shader.SetFloat("_PosWeight", posWeight);
+                shader.SetFloat("_ColWeight", colWeight);
+
+                shader.Dispatch(kernel, (nL + 63) / 64, 1, 1);
+
+                topKIndex = new int[nL * kTopK];
+                topKDist  = new float[nL * kTopK];
+                bufTopKIdx.GetData(topKIndex);
+                bufTopKDist.GetData(topKDist);
+            }
+            finally
+            {
+                bufSplatsL.Dispose(); bufSplatsR.Dispose();
+                bufColsL.Dispose();   bufColsR.Dispose();
+                bufTopKIdx.Dispose(); bufTopKDist.Dispose();
+            }
+        }
+
+        // Each cloud is normalised against its OWN bounds, independently — not a shared/combined
+        // box. A shared box lets absolute physical scale dominate: a small structure's splats would
+        // all compress into one tiny corner of the joint [0,1]3 space relative to a much larger
+        // structure, losing each cloud's own "top-left corner of ITS OWN extent" positional meaning.
+        // Independent per-cloud normalisation preserves that — a splat at the small cloud's
+        // top-left corner and a splat at the big cloud's top-left corner both land near (0,0,0) in
+        // their own normalised space, which is the actual correspondence semantics wanted (position
+        // relative to the splat's own object, not raw combined-scene scale).
+        static void GetBounds(Vector3[] a, out Vector3 min, out Vector3 max)
         {
             min = new Vector3(float.MaxValue,  float.MaxValue,  float.MaxValue);
             max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
             foreach (var p in a) { min = Vector3.Min(min, p); max = Vector3.Max(max, p); }
-            foreach (var p in b) { min = Vector3.Min(min, p); max = Vector3.Max(max, p); }
         }
 
         // ── Asset save ────────────────────────────────────────────────────────

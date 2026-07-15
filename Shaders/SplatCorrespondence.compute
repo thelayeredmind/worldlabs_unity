@@ -99,3 +99,89 @@ void FindBestMatch(uint3 id : SV_DispatchThreadID)
     _BestMatchDist[i]    = bestDist;
     _BestMatchRawDist[i] = bestRawDist;
 }
+
+// Top-K candidate list per L splat: same 2-pass min-max blended distance as FindBestMatch, but
+// keeps the best TOP_K candidates instead of collapsing to a single winner. Used by diagnostics
+// (Verify Top-K Matches Kernel) and available as a building block for future matching strategies
+// that need more than one candidate per L splat.
+#pragma kernel FindTopKMatches
+
+#define TOP_K 32
+
+RWStructuredBuffer<int>   _TopKIndex; // size CountL * TOP_K, per-splat candidates ordered best-first
+RWStructuredBuffer<float> _TopKDist;  // size CountL * TOP_K, min-max squashed blended distance, same semantics as _BestMatchDist
+
+[numthreads(64, 1, 1)]
+void FindTopKMatches(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if ((int)i >= _CountL) return;
+
+    float3 pl = _SplatsL[i].xyz;
+    float4 cl = _ColorsL[i];
+
+    float minPos = 1e30f, maxPos = 0;
+    float minCol = 1e30f, maxCol = 0;
+
+    for (int j = 0; j < _CountR; j++)
+    {
+        float3 dp = pl - _SplatsR[j].xyz;
+        float4 dc = cl - _ColorsR[j];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
+
+        minPos = min(minPos, dPos); maxPos = max(maxPos, dPos);
+        minCol = min(minCol, dCol); maxCol = max(maxCol, dCol);
+    }
+
+    float rangePos = max(maxPos - minPos, 1e-12f);
+    float rangeCol = max(maxCol - minCol, 1e-12f);
+
+    // Fixed-size sorted insert: topDist[0..count) ascending, topIdx parallel. Linear insertion is
+    // fine here — TOP_K is small (32) relative to the O(CountR) outer loop it's nested inside.
+    float topDist[TOP_K];
+    int   topIdx[TOP_K];
+    int   count = 0;
+
+    for (int k = 0; k < _CountR; k++)
+    {
+        float3 dp = pl - _SplatsR[k].xyz;
+        float4 dc = cl - _ColorsR[k];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
+
+        float nPos = (dPos - minPos) / rangePos;
+        float nCol = (dCol - minCol) / rangeCol;
+        float dist = _PosWeight * nPos + _ColWeight * nCol;
+
+        if (count < TOP_K || dist < topDist[TOP_K - 1])
+        {
+            int insertAt = min(count, TOP_K - 1);
+            while (insertAt > 0 && topDist[insertAt - 1] > dist)
+            {
+                topDist[insertAt] = topDist[insertAt - 1];
+                topIdx[insertAt]  = topIdx[insertAt - 1];
+                insertAt--;
+            }
+            topDist[insertAt] = dist;
+            topIdx[insertAt]  = k;
+            count = min(count + 1, TOP_K);
+        }
+    }
+
+    for (int s = 0; s < TOP_K; s++)
+    {
+        uint outBase = i * TOP_K + s;
+        if (s < count)
+        {
+            _TopKIndex[outBase] = topIdx[s];
+            _TopKDist[outBase]  = topDist[s];
+        }
+        else
+        {
+            // CountR < TOP_K: pad with an invalid sentinel so consumers can detect short lists.
+            _TopKIndex[outBase] = -1;
+            _TopKDist[outBase]  = 1e30f;
+        }
+    }
+}
