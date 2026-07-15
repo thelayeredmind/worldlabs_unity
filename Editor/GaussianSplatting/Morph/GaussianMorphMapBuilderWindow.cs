@@ -43,6 +43,7 @@ namespace GaussianSplatting.Editor
         float                m_GpuPosWeight, m_GpuColWeight;
         int[]                m_GpuResultIndex;
         float[]              m_GpuResultDist;
+        float[]              m_GpuResultRawDist;
         Exception            m_GpuException;
         ManualResetEventSlim m_GpuDone;
 
@@ -53,8 +54,8 @@ namespace GaussianSplatting.Editor
 
         static void OpenWindow(GaussianSplatAsset left, GaussianSplatAsset right)
         {
-            var w = GetWindowWithRect<GaussianMorphMapBuilderWindow>(new Rect(50, 50, 400, 260), false, "Morph Map Builder", true);
-            w.minSize = new Vector2(360, 240);
+            var w = GetWindowWithRect<GaussianMorphMapBuilderWindow>(new Rect(50, 50, 480, 640), false, "Morph Map Builder", true);
+            w.minSize = new Vector2(360, 480);
             w.m_AssetLeft  = left;
             w.m_AssetRight = right;
             w.Show();
@@ -73,7 +74,7 @@ namespace GaussianSplatting.Editor
             if (m_GpuDispatchPending)
             {
                 m_GpuDispatchPending = false;
-                try   { DispatchCorrespondenceShader(m_GpuPosL, m_GpuColL, m_GpuPosR, m_GpuColR, m_GpuPosWeight, m_GpuColWeight, out m_GpuResultIndex, out m_GpuResultDist); }
+                try   { DispatchCorrespondenceShader(m_GpuPosL, m_GpuColL, m_GpuPosR, m_GpuColR, m_GpuPosWeight, m_GpuColWeight, out m_GpuResultIndex, out m_GpuResultDist, out m_GpuResultRawDist); }
                 catch (Exception e) { m_GpuException = e; }
                 finally { m_GpuDone.Set(); }
             }
@@ -143,6 +144,24 @@ namespace GaussianSplatting.Editor
                     RunSampleMatchQuality();
             }
 
+            using (new EditorGUI.DisabledScope(m_SampleMap == null))
+            {
+                if (GUILayout.Button("Analyze Duplicates"))
+                    RunAnalyzeDuplicates();
+            }
+
+            using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
+            {
+                if (GUILayout.Button("Analyze Candidate Collisions"))
+                    RunAnalyzeCandidateCollisions();
+            }
+
+            using (new EditorGUI.DisabledScope(m_SampleMap == null || m_AssetRight == null))
+            {
+                if (GUILayout.Button("Top Duplicated R Splats"))
+                    RunTopDuplicatedRight();
+            }
+
             if (!string.IsNullOrEmpty(m_SampleReport))
             {
                 EditorGUILayout.Space(4);
@@ -159,6 +178,65 @@ namespace GaussianSplatting.Editor
                 sb.AppendLine($"pair {s.pairIndex,6}  L{s.leftIndex} -> R{s.rightIndex}   pos={s.posDelta:F4}   color={s.colorDelta:F4}");
             m_SampleReport = sb.ToString();
             Debug.Log(m_SampleReport);
+        }
+
+        void RunAnalyzeDuplicates()
+        {
+            var report = GaussianMorphMapBuilder.AnalyzeDuplicates(m_SampleMap);
+            m_SampleReport = $"Duplicate L indices: {report.duplicateLeftIndices}\n" +
+                              $"Duplicate R indices: {report.duplicateRightIndices}\n" +
+                              $"Largest fan-out: {report.largestFanOut}\n" +
+                              $"Excess pairs (extra output splats): {report.excessPairs}\n" +
+                              $"Total matched pairs: {m_SampleMap.MatchedCount}";
+            Debug.Log(m_SampleReport);
+        }
+
+        void RunAnalyzeCandidateCollisions()
+        {
+            // Runs synchronously on the main thread — calls DispatchCorrespondenceShader directly
+            // rather than going through MainThreadDispatcher, whose FindBestMatches blocks waiting
+            // for OnEditorUpdate to service it; OnEditorUpdate can't run while OnGUI is on the stack.
+            Vector3[] posL, posR;
+            Vector4[] colL, colR;
+            try
+            {
+                posL = GaussianMorphMapBuilder.DecodeSplatPositions(m_AssetLeft);
+                posR = GaussianMorphMapBuilder.DecodeSplatPositions(m_AssetRight);
+                colL = GaussianMorphMapBuilder.DecodeSplatColors(m_AssetLeft);
+                colR = GaussianMorphMapBuilder.DecodeSplatColors(m_AssetRight);
+            }
+            catch (Exception e)
+            {
+                m_SampleReport = $"Decode error: {e.Message}";
+                Debug.LogException(e);
+                return;
+            }
+
+            var dispatcher = new SyncDispatcher();
+            var report = GaussianMorphMapBuilder.AnalyzeCandidateCollisions(posL, posR, colL, colR, dispatcher, m_ColorWeight);
+            m_SampleReport = $"L count: {report.countL}\n" +
+                              $"R count: {report.countR}\n" +
+                              $"Distinct R chosen: {report.distinctRChosen}\n" +
+                              $"Distinct ratio (distinctR / min(L,R)): {report.distinctRatio:F4}";
+            Debug.Log(m_SampleReport);
+        }
+
+        void RunTopDuplicatedRight()
+        {
+            var top = GaussianMorphMapBuilder.TopDuplicatedRight(m_SampleMap, m_AssetRight, 20);
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Top {top.Length} most-duplicated R splats (fanOut, pos, color):");
+            foreach (var t in top)
+                sb.AppendLine($"R{t.rightIndex,7}  fanOut={t.fanOutCount,5}  pos=({t.position.x:F2},{t.position.y:F2},{t.position.z:F2})  color=({t.color.x:F3},{t.color.y:F3},{t.color.z:F3},{t.color.w:F3})");
+            m_SampleReport = sb.ToString();
+            Debug.Log(m_SampleReport);
+        }
+
+        class SyncDispatcher : GaussianMorphMapBuilder.ICorrespondenceDispatcher
+        {
+            public void FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist, out float[] bestRawDist)
+                => DispatchCorrespondenceShader(posL, colL, posR, colR, posWeight, colWeight, out bestIndex, out bestDist, out bestRawDist);
         }
 
         void StartBuild()
@@ -223,7 +301,7 @@ namespace GaussianSplatting.Editor
             public MainThreadDispatcher(GaussianMorphMapBuilderWindow w) => m_Window = w;
 
             public void FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
-                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist)
+                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist, out float[] bestRawDist)
             {
                 var w = m_Window;
                 w.m_GpuPosL      = posL;
@@ -241,8 +319,9 @@ namespace GaussianSplatting.Editor
                 if (w.m_GpuException != null)
                     throw new Exception("GPU dispatch failed", w.m_GpuException);
 
-                bestIndex = w.m_GpuResultIndex;
-                bestDist  = w.m_GpuResultDist;
+                bestIndex   = w.m_GpuResultIndex;
+                bestDist    = w.m_GpuResultDist;
+                bestRawDist = w.m_GpuResultRawDist;
             }
         }
 
@@ -250,7 +329,7 @@ namespace GaussianSplatting.Editor
             Vector3[] posL, Vector4[] colL,
             Vector3[] posR, Vector4[] colR,
             float posWeight, float colWeight,
-            out int[] bestIndex, out float[] bestDist)
+            out int[] bestIndex, out float[] bestDist, out float[] bestRawDist)
         {
             var shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(kShaderPath);
             if (shader == null)
@@ -277,6 +356,7 @@ namespace GaussianSplatting.Editor
             var bufColsR   = new ComputeBuffer(nR, 16);
             var bufMatch   = new ComputeBuffer(nL, 4);
             var bufDist    = new ComputeBuffer(nL, 4);
+            var bufRawDist = new ComputeBuffer(nL, 4);
 
             try
             {
@@ -286,12 +366,13 @@ namespace GaussianSplatting.Editor
                 bufColsR.SetData(colR);
 
                 int kernel = shader.FindKernel("FindBestMatch");
-                shader.SetBuffer(kernel, "_SplatsL",        bufSplatsL);
-                shader.SetBuffer(kernel, "_ColorsL",        bufColsL);
-                shader.SetBuffer(kernel, "_SplatsR",        bufSplatsR);
-                shader.SetBuffer(kernel, "_ColorsR",        bufColsR);
-                shader.SetBuffer(kernel, "_BestMatchIndex", bufMatch);
-                shader.SetBuffer(kernel, "_BestMatchDist",  bufDist);
+                shader.SetBuffer(kernel, "_SplatsL",         bufSplatsL);
+                shader.SetBuffer(kernel, "_ColorsL",         bufColsL);
+                shader.SetBuffer(kernel, "_SplatsR",         bufSplatsR);
+                shader.SetBuffer(kernel, "_ColorsR",         bufColsR);
+                shader.SetBuffer(kernel, "_BestMatchIndex",  bufMatch);
+                shader.SetBuffer(kernel, "_BestMatchDist",   bufDist);
+                shader.SetBuffer(kernel, "_BestMatchRawDist", bufRawDist);
                 shader.SetInt  ("_CountL",    nL);
                 shader.SetInt  ("_CountR",    nR);
                 shader.SetFloat("_PosWeight", posWeight);
@@ -299,16 +380,19 @@ namespace GaussianSplatting.Editor
 
                 shader.Dispatch(kernel, (nL + 63) / 64, 1, 1);
 
-                bestIndex = new int[nL];
-                bestDist  = new float[nL];
+                bestIndex   = new int[nL];
+                bestDist    = new float[nL];
+                bestRawDist = new float[nL];
                 bufMatch.GetData(bestIndex);
                 bufDist.GetData(bestDist);
+                bufRawDist.GetData(bestRawDist);
             }
             finally
             {
                 bufSplatsL.Dispose(); bufSplatsR.Dispose();
                 bufColsL.Dispose();   bufColsR.Dispose();
                 bufMatch.Dispose();   bufDist.Dispose();
+                bufRawDist.Dispose();
             }
         }
 

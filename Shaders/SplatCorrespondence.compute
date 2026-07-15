@@ -2,6 +2,23 @@
 // Nearest-neighbor correspondence search for GaussianMorphMapBuilder.
 // One thread per splat in L — finds the closest splat in R by weighted pos+color distance.
 // Duplicate resolution (one-to-one constraint) is handled on CPU after readback.
+//
+// Raw position and color distances live on uncalibrated, non-comparable scales (position is
+// normalised to [0,1] over the combined bounding box; color is raw RGBA). Summing them directly
+// means colWeight/posWeight don't behave as a true blend — a splat's tiny position spread within
+// its own correct cluster can be dwarfed by color's much larger contested range, so even a small
+// colWeight can outvote a strongly-favoured position match (cross-cluster "swaps" for same-colored
+// but spatially distant splats). Each L splat instead min-max squashes its own pos/color distances
+// to [0,1] against its own candidate pool (per-splat min/max, not a global constant) before
+// weighting, so posWeight=colWeight=0.5 is a genuine equal blend for THIS splat's actual spread of
+// candidates. Min-max (not z-score) specifically because it's a monotonic affine transform of the
+// raw distance — it can never change which candidate is closest, only rescale the gap. Z-score was
+// tried first and rejected: it normalises relative to the pool MEAN rather than the query point, so
+// a candidate that's merely "central"/average across the whole R set can systematically look best
+// for a huge number of unrelated L splats — measured at 9.2% distinct-candidate ratio on a real
+// 294912-splat asset (94908 L splats meant fewer than that many distinct R destinations, mass
+// convergence onto ~27k R splats), which cascaded into the many-to-one remainder resolver picking
+// up the >200k splats the round loop could never actually resolve.
 
 #pragma kernel FindBestMatch
 
@@ -10,8 +27,12 @@ StructuredBuffer<float4> _ColorsL;   // rgba color
 StructuredBuffer<float4> _SplatsR;
 StructuredBuffer<float4> _ColorsR;
 
-RWStructuredBuffer<int>   _BestMatchIndex;  // output: per L splat, best R index
-RWStructuredBuffer<float> _BestMatchDist;   // output: per L splat, best distance
+RWStructuredBuffer<int>   _BestMatchIndex;   // output: per L splat, best R index
+RWStructuredBuffer<float> _BestMatchDist;    // output: per L splat, best distance (min-max squashed blend) — for candidate SELECTION only
+RWStructuredBuffer<float> _BestMatchRawDist; // output: per L splat, raw (non-normalised) squared distance to the chosen candidate —
+                                              // normalised values are relative to each splat's own candidate pool and are NOT comparable
+                                              // across different L splats; cross-splat collision arbitration (ResolveOneToOne) must use
+                                              // this raw value instead, or "closest pair wins" becomes meaningless noise.
 
 int   _CountL;
 int   _CountR;
@@ -27,25 +48,54 @@ void FindBestMatch(uint3 id : SV_DispatchThreadID)
     float3 pl = _SplatsL[i].xyz;
     float4 cl = _ColorsL[i];
 
-    float bestDist = 1e30f;
-    int   bestJ    = 0;
+    // Pass 1: find min/max raw pos/color distance over this splat's full R pool.
+    float minPos = 1e30f, maxPos = 0;
+    float minCol = 1e30f, maxCol = 0;
 
     for (int j = 0; j < _CountR; j++)
     {
-        float3 pr = _SplatsR[j].xyz;
-        float4 cr = _ColorsR[j];
+        float3 dp = pl - _SplatsR[j].xyz;
+        float4 dc = cl - _ColorsR[j];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
 
-        float3 dp = pl - pr;
-        float4 dc = cl - cr;
-        float dist = _PosWeight * dot(dp, dp) + _ColWeight * dot(dc, dc);
+        minPos = min(minPos, dPos); maxPos = max(maxPos, dPos);
+        minCol = min(minCol, dCol); maxCol = max(maxCol, dCol);
+    }
+
+    // max(..., 1e-12) guards a degenerate pool (every candidate equidistant on this axis) from a
+    // div-by-zero; such a splat has no discriminating signal on that axis either way.
+    float rangePos = max(maxPos - minPos, 1e-12f);
+    float rangeCol = max(maxCol - minCol, 1e-12f);
+
+    // Pass 2: recompute distances, min-max squash each to [0,1] against this splat's own pool
+    // range, weight-blend. Monotonic in the raw distance, so argmin here always matches argmin of
+    // the raw distance for a FIXED weight split on a single axis — unlike z-score, this can't let a
+    // pool-average-adjacent candidate outrank the true nearest neighbor.
+    float bestDist    = 1e30f;
+    float bestRawDist = 0;
+    int   bestJ       = 0;
+
+    for (int k = 0; k < _CountR; k++)
+    {
+        float3 dp = pl - _SplatsR[k].xyz;
+        float4 dc = cl - _ColorsR[k];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
+
+        float nPos = (dPos - minPos) / rangePos;
+        float nCol = (dCol - minCol) / rangeCol;
+        float dist = _PosWeight * nPos + _ColWeight * nCol;
 
         if (dist < bestDist)
         {
-            bestDist = dist;
-            bestJ    = j;
+            bestDist    = dist;
+            bestRawDist = _PosWeight * dPos + _ColWeight * dCol;
+            bestJ       = k;
         }
     }
 
-    _BestMatchIndex[i] = bestJ;
-    _BestMatchDist[i]  = bestDist;
+    _BestMatchIndex[i]   = bestJ;
+    _BestMatchDist[i]    = bestDist;
+    _BestMatchRawDist[i] = bestRawDist;
 }

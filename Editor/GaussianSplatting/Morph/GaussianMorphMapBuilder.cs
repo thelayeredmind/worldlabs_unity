@@ -36,9 +36,13 @@ namespace GaussianSplatting.Editor
             /// <summary>
             /// Upload positions and colors for both sides, dispatch the search, return best-match indices
             /// and distances per L splat. Must be called on the main thread.
+            /// bestDist is a per-splat-relative z-scored blend — use it only to see which candidate a
+            /// splat picked, never to compare match quality across different L splats (their z-scores
+            /// aren't on the same scale). bestRawDist is the raw, non-normalised distance to that same
+            /// chosen candidate, comparable across splats — use it for cross-splat collision arbitration.
             /// </summary>
             void FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
-                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist);
+                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist, out float[] bestRawDist);
         }
 
         // ── Public entry point ────────────────────────────────────────────────
@@ -95,10 +99,10 @@ namespace GaussianSplatting.Editor
                 }
 
                 dispatcher.FindBestMatches(subPosL, subColL, subPosR, subColR, posWeight, colorWeight,
-                    out int[] bestMatch, out float[] bestDist);
+                    out int[] bestMatch, out float[] bestDist, out float[] bestRawDist);
                 ct.ThrowIfCancellationRequested();
 
-                ResolveOneToOne(bestMatch, bestDist, subPosL.Length, subPosR.Length,
+                ResolveOneToOne(bestMatch, bestRawDist, subPosL.Length, subPosR.Length,
                     out var roundPairs, out var roundUL, out var roundUR);
 
                 if (roundPairs.Length == 0)
@@ -159,7 +163,7 @@ namespace GaussianSplatting.Editor
                 var subPosL = remainingL.Select(i => posL[i]).ToArray();
                 var subColL = remainingL.Select(i => colL[i]).ToArray();
                 dispatcher.FindBestMatches(subPosL, subColL, posR, colR, posWeight, colWeight,
-                    out int[] bestMatch, out _);
+                    out int[] bestMatch, out _, out _);
                 for (int i = 0; i < remainingL.Length; i++)
                     pairs.Add(new int2(remainingL[i], bestMatch[i]));
             }
@@ -170,13 +174,51 @@ namespace GaussianSplatting.Editor
                 var subPosR = remainingR.Select(j => posR[j]).ToArray();
                 var subColR = remainingR.Select(j => colR[j]).ToArray();
                 dispatcher.FindBestMatches(subPosR, subColR, posL, colL, posWeight, colWeight,
-                    out int[] bestMatch, out _);
+                    out int[] bestMatch, out _, out _);
                 for (int j = 0; j < remainingR.Length; j++)
                     pairs.Add(new int2(bestMatch[j], remainingR[j]));
             }
 
             remainingL = Array.Empty<int>();
             remainingR = Array.Empty<int>();
+        }
+
+        // ── Candidate-selection collision diagnostics ─────────────────────────
+
+        public struct CandidateCollisionReport
+        {
+            public int countL;
+            public int countR;
+            public int distinctRChosen;   // how many distinct R indices appear across all L splats' raw best-match choice
+            public float distinctRatio;   // distinctRChosen / min(countL, countR) — 1.0 = no collisions possible, near-0 = mass convergence
+        }
+
+        /// <summary>
+        /// Dispatches a single, unarbitrated FindBestMatches pass over the FULL L/R sets (no
+        /// round-loop subsetting) and counts how many distinct R indices are chosen across all
+        /// L splats' raw best-match pick. A low distinctRatio means many L splats are independently
+        /// converging on the same handful of R candidates as their "best" match — if so, no
+        /// collision-arbitration rule can fix the round loop's resolution rate, since only one
+        /// L splat can win each contested R splat per round regardless of which distance decides it.
+        /// </summary>
+        public static CandidateCollisionReport AnalyzeCandidateCollisions(
+            Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
+            ICorrespondenceDispatcher dispatcher, float colorWeight)
+        {
+            float posWeight = 1f - colorWeight;
+            dispatcher.FindBestMatches(posL, colL, posR, colR, posWeight, colorWeight,
+                out int[] bestIndex, out _, out _);
+
+            var distinctR = new HashSet<int>(bestIndex);
+            int denom = Mathf.Min(posL.Length, posR.Length);
+
+            return new CandidateCollisionReport
+            {
+                countL          = posL.Length,
+                countR          = posR.Length,
+                distinctRChosen = distinctR.Count,
+                distinctRatio   = denom > 0 ? (float)distinctR.Count / denom : 0f,
+            };
         }
 
         // ── Match quality sampling ────────────────────────────────────────────
@@ -229,6 +271,108 @@ namespace GaussianSplatting.Editor
             }
 
             return samples.ToArray();
+        }
+
+        // ── Duplicate-match diagnostics ───────────────────────────────────────
+
+        public struct DuplicateReport
+        {
+            public int duplicateLeftIndices;
+            public int duplicateRightIndices;
+            public int largestFanOut;
+            public int excessPairs; // pairs beyond the first occurrence of any duplicated index — extra output splats SplatMorph.compute would produce
+        }
+
+        /// <summary>
+        /// Counts how many distinct L/R indices appear in more than one matchedPairs entry.
+        /// ResolveRemainderOnGpu deliberately allows many-to-one matches (convergence over
+        /// uniqueness) — but SplatMorph.compute is one-thread-per-pairs-entry, so a duplicated
+        /// L index produces multiple output splats all reading the same source position/color
+        /// while interpolating toward different R destinations, which can visually read as
+        /// splats tearing/splitting apart during playback.
+        /// </summary>
+        public static DuplicateReport AnalyzeDuplicates(GaussianMorphMap map)
+        {
+            var pairs = map.matchedPairs ?? Array.Empty<int2>();
+            var leftCounts  = new Dictionary<int, int>();
+            var rightCounts = new Dictionary<int, int>();
+
+            foreach (var p in pairs)
+            {
+                leftCounts.TryGetValue(p.x, out int lc);
+                leftCounts[p.x] = lc + 1;
+                rightCounts.TryGetValue(p.y, out int rc);
+                rightCounts[p.y] = rc + 1;
+            }
+
+            int dupL = 0, dupR = 0, largestFanOut = 0, excess = 0;
+            foreach (var kv in leftCounts)
+            {
+                if (kv.Value > 1)
+                {
+                    dupL++;
+                    excess += kv.Value - 1;
+                    largestFanOut = Mathf.Max(largestFanOut, kv.Value);
+                }
+            }
+            foreach (var kv in rightCounts)
+            {
+                if (kv.Value > 1)
+                {
+                    dupR++;
+                    largestFanOut = Mathf.Max(largestFanOut, kv.Value);
+                }
+            }
+
+            return new DuplicateReport
+            {
+                duplicateLeftIndices  = dupL,
+                duplicateRightIndices = dupR,
+                largestFanOut         = largestFanOut,
+                excessPairs           = excess,
+            };
+        }
+
+        public struct TopDuplicate
+        {
+            public int rightIndex;
+            public int fanOutCount;
+            public Vector3 position;
+            public Vector4 color;
+        }
+
+        /// <summary>
+        /// Reports the N most-duplicated R indices (by how many matchedPairs entries claim them),
+        /// with their decoded position/color. Used to distinguish genuine data redundancy (the
+        /// "popular" splats cluster spatially/chromatically — e.g. a flat wall, a repeated
+        /// architectural element that legitimately has many true nearest neighbors on the other
+        /// side) from a structural search artifact (popular splats scattered with varied color,
+        /// which would NOT be explained by redundant geometry).
+        /// </summary>
+        public static TopDuplicate[] TopDuplicatedRight(GaussianMorphMap map, GaussianSplatAsset right, int topN = 20)
+        {
+            var pairs = map.matchedPairs ?? Array.Empty<int2>();
+            var rightCounts = new Dictionary<int, int>();
+            foreach (var p in pairs)
+            {
+                rightCounts.TryGetValue(p.y, out int c);
+                rightCounts[p.y] = c + 1;
+            }
+
+            var posR = DecodeSplatPositions(right);
+            var colR = DecodeSplatColors(right);
+
+            return rightCounts
+                .OrderByDescending(kv => kv.Value)
+                .Take(topN)
+                .Select(kv => new TopDuplicate
+                {
+                    rightIndex  = kv.Key,
+                    fanOutCount = kv.Value,
+                    position    = posR[kv.Key],
+                    color       = colR[kv.Key],
+                })
+                .ToArray();
         }
 
         // ── Duplicate resolution ──────────────────────────────────────────────
