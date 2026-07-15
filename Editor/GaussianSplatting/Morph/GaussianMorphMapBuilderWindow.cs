@@ -27,6 +27,7 @@ namespace GaussianSplatting.Editor
         [SerializeField] float  m_ColorWeight  = 0.5f;
         [SerializeField] bool   m_UseSpatialProbes;
         [SerializeField] bool   m_UseRemainderFallback = true;
+        [SerializeField] bool   m_UseGaleShapley;
 
         [SerializeField] GaussianMorphMap m_SampleMap;
         [SerializeField] int m_SampleCount = 20;
@@ -105,6 +106,32 @@ namespace GaussianSplatting.Editor
                 finally { m_GpuDone.Set(); }
             }
 
+            if (m_GaleShapleyNoisePending)
+            {
+                m_GaleShapleyNoisePending = false;
+                try
+                {
+                    m_GaleShapleyNoiseResult = DispatchGaleShapleyNoiseCount(
+                        m_GaleShapleyPosL, m_GaleShapleyColL, m_GaleShapleyPosR, m_GaleShapleyColR,
+                        m_GaleShapleyPosWeight, m_GaleShapleyColWeight, m_GaleShapleyThreshold);
+                }
+                catch (Exception e) { m_GaleShapleyException = e; }
+                finally { m_GpuDone.Set(); }
+            }
+
+            if (m_GaleShapleyBestPending)
+            {
+                m_GaleShapleyBestPending = false;
+                try
+                {
+                    m_GaleShapleyBestResult = DispatchGaleShapleyBestRemaining(
+                        m_GaleShapleyPosL, m_GaleShapleyColL, m_GaleShapleyPosR, m_GaleShapleyColR,
+                        m_GaleShapleyActiveR, m_GaleShapleyPosWeight, m_GaleShapleyColWeight);
+                }
+                catch (Exception e) { m_GaleShapleyException = e; }
+                finally { m_GpuDone.Set(); }
+            }
+
             bool cancelled = EditorUtility.DisplayCancelableProgressBar("Building Morph Map", m_Status, m_Progress);
             if (cancelled) m_Cts?.Cancel();
 
@@ -142,6 +169,11 @@ namespace GaussianSplatting.Editor
                 m_UseRemainderFallback = EditorGUILayout.Toggle(
                     new GUIContent("Use remainder fallback (round-based only)", "When off, the round-based build reports its OWN unpadded match quality instead of silently filling gaps with an unconstrained full-cloud nearest-neighbor search — a diagnostic to see ground-truth match quality without the fallback's influence. Always off for spatial probes."),
                     m_UseRemainderFallback);
+
+            EditorGUILayout.Space(4);
+            m_UseGaleShapley = EditorGUILayout.Toggle(
+                new GUIContent("Use GS-Matching (Gale-Shapley, experimental)", "Mutual-best stable matching (Yu et al., arXiv:2412.04855) instead of independent-argmin greedy — both L and R must agree each round before a pair is confirmed, which structurally prevents hubness/mass-convergence. Falls back to plain nearest-neighbor for anything unmatched after the round cap."),
+                m_UseGaleShapley);
 
             EditorGUILayout.Space(4);
             using (new EditorGUILayout.HorizontalScope())
@@ -365,12 +397,14 @@ namespace GaussianSplatting.Editor
             bool useSpatialProbes = m_UseSpatialProbes;
             float probeAccuracy = m_ProbeAccuracy;
             bool useRemainderFallback = m_UseRemainderFallback;
+            bool useGaleShapley = m_UseGaleShapley;
             var ct = m_Cts.Token;
 
             var dispatcher = new MainThreadDispatcher(this);
             var probeDispatcher = new MainThreadProbeDispatcher(this);
             var gridStrategy = new GaussianMorphMapBuilder.RegularSpatialGridStrategy(probeDispatcher);
             var resolutionStrategy = new GaussianMorphMapBuilder.GpuGreedyProbeResolutionStrategy(probeDispatcher);
+            var galeShapleyDispatcher = new MainThreadGaleShapleyDispatcher(this);
             var prog = new Progress<float>(t => { m_Progress = t; m_Status = $"{(int)(t * 100)}%…"; });
 
             m_BuildTask = Task.Run(() =>
@@ -383,6 +417,12 @@ namespace GaussianSplatting.Editor
                         m_Status = "Partitioning into probes and resolving…";
                         result = GaussianMorphMapBuilder.BuildViaProbes(posL, posR, colL, colR,
                             gridStrategy, resolutionStrategy, probeAccuracy, colorWeight, prog);
+                    }
+                    else if (useGaleShapley)
+                    {
+                        m_Status = "Running GS-Matching (mutual-best stable matching)…";
+                        result = GaussianMorphMapBuilder.BuildViaGaleShapley(posL, posR, colL, colR,
+                            galeShapleyDispatcher, colorWeight, prog, ct);
                     }
                     else
                     {
@@ -459,6 +499,67 @@ namespace GaussianSplatting.Editor
         int           m_BucketProbeCount;
         float         m_BucketPosWeight, m_BucketColWeight;
         int[]         m_BucketMatchedR;
+
+        // ── GS-Matching (Gale-Shapley) GPU dispatcher ───────────────────────
+
+        class MainThreadGaleShapleyDispatcher : GaussianMorphMapBuilder.IGaleShapleyDispatcher
+        {
+            readonly GaussianMorphMapBuilderWindow m_Window;
+            public MainThreadGaleShapleyDispatcher(GaussianMorphMapBuilderWindow w) => m_Window = w;
+
+            public int[] CountNoise(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, float distanceThreshold)
+            {
+                var w = m_Window;
+                w.m_GaleShapleyPosL      = posL;
+                w.m_GaleShapleyColL      = colL;
+                w.m_GaleShapleyPosR      = posR;
+                w.m_GaleShapleyColR      = colR;
+                w.m_GaleShapleyPosWeight = posWeight;
+                w.m_GaleShapleyColWeight = colWeight;
+                w.m_GaleShapleyThreshold = distanceThreshold;
+                w.m_GaleShapleyException = null;
+                w.m_GpuDone.Reset();
+                w.m_GaleShapleyNoisePending = true;
+                w.m_GpuDone.Wait();
+                if (w.m_GaleShapleyException != null)
+                    throw new Exception("GS-Matching noise-count dispatch failed", w.m_GaleShapleyException);
+                return w.m_GaleShapleyNoiseResult;
+            }
+
+            public int[] FindBestRemaining(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                int[] activeR, float posWeight, float colWeight)
+            {
+                var w = m_Window;
+                w.m_GaleShapleyPosL      = posL;
+                w.m_GaleShapleyColL      = colL;
+                w.m_GaleShapleyPosR      = posR;
+                w.m_GaleShapleyColR      = colR;
+                w.m_GaleShapleyActiveR   = activeR;
+                w.m_GaleShapleyPosWeight = posWeight;
+                w.m_GaleShapleyColWeight = colWeight;
+                w.m_GaleShapleyException = null;
+                w.m_GpuDone.Reset();
+                w.m_GaleShapleyBestPending = true;
+                w.m_GpuDone.Wait();
+                if (w.m_GaleShapleyException != null)
+                    throw new Exception("GS-Matching best-remaining dispatch failed", w.m_GaleShapleyException);
+                return w.m_GaleShapleyBestResult;
+            }
+        }
+
+        // Marshalling state for GS-Matching GPU dispatch — same flag+ManualResetEventSlim pump as
+        // the other dispatchers, serviced from OnEditorUpdate. Shared field set between the two
+        // dispatch kinds (noise-count / best-remaining) since only one is ever in flight at a time.
+        volatile bool m_GaleShapleyNoisePending;
+        volatile bool m_GaleShapleyBestPending;
+        Vector3[]     m_GaleShapleyPosL, m_GaleShapleyPosR;
+        Vector4[]     m_GaleShapleyColL, m_GaleShapleyColR;
+        int[]         m_GaleShapleyActiveR;
+        float         m_GaleShapleyPosWeight, m_GaleShapleyColWeight, m_GaleShapleyThreshold;
+        int[]         m_GaleShapleyNoiseResult;
+        int[]         m_GaleShapleyBestResult;
+        Exception     m_GaleShapleyException;
 
         // ── GPU dispatcher ────────────────────────────────────────────────────
 
@@ -565,6 +666,142 @@ namespace GaussianSplatting.Editor
                 bufMatch.Dispose();   bufDist.Dispose();
                 bufRawDist.Dispose();
             }
+        }
+
+        // ── GS-Matching (Gale-Shapley) GPU dispatch ─────────────────────────
+        // Self-contained: targets SplatGaleShapley.compute, a separate shader asset from
+        // SplatCorrespondence.compute — does not share kernels, buffers, or layout with any other
+        // matching method in this file.
+
+        const string kGaleShapleyShaderPath = "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatGaleShapley.compute";
+
+        static int[] DispatchGaleShapleyNoiseCount(
+            Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+            float posWeight, float colWeight, float distanceThreshold)
+        {
+            var shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(kGaleShapleyShaderPath);
+            if (shader == null)
+                throw new Exception($"SplatGaleShapley.compute not found at {kGaleShapleyShaderPath}");
+
+            int nL = posL.Length;
+            int nR = posR.Length;
+
+            BuildNormalisedSplatBuffers(posL, colL, posR, colR,
+                out var bufSplatsL, out var bufColsL, out var bufSplatsR, out var bufColsR);
+            var bufNoiseCount = new ComputeBuffer(Mathf.Max(nL, 1), 4);
+
+            try
+            {
+                int kernel = shader.FindKernel("CountCandidatesBelowThreshold");
+                shader.SetBuffer(kernel, "_SplatsL", bufSplatsL);
+                shader.SetBuffer(kernel, "_ColorsL", bufColsL);
+                shader.SetBuffer(kernel, "_SplatsR", bufSplatsR);
+                shader.SetBuffer(kernel, "_ColorsR", bufColsR);
+                shader.SetBuffer(kernel, "_NoiseCount", bufNoiseCount);
+                shader.SetInt  ("_CountL", nL);
+                shader.SetInt  ("_CountR", nR);
+                shader.SetFloat("_PosWeight", posWeight);
+                shader.SetFloat("_ColWeight", colWeight);
+                shader.SetFloat("_DistanceThreshold", distanceThreshold);
+
+                shader.Dispatch(kernel, (Mathf.Max(nL, 1) + 63) / 64, 1, 1);
+
+                var result = new int[nL];
+                bufNoiseCount.GetData(result);
+                return result;
+            }
+            finally
+            {
+                bufSplatsL.Dispose(); bufSplatsR.Dispose();
+                bufColsL.Dispose();   bufColsR.Dispose();
+                bufNoiseCount.Dispose();
+            }
+        }
+
+        static int[] DispatchGaleShapleyBestRemaining(
+            Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+            int[] activeR, float posWeight, float colWeight)
+        {
+            var shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(kGaleShapleyShaderPath);
+            if (shader == null)
+                throw new Exception($"SplatGaleShapley.compute not found at {kGaleShapleyShaderPath}");
+
+            int nL = posL.Length;
+            int nR = posR.Length;
+
+            BuildNormalisedSplatBuffers(posL, colL, posR, colR,
+                out var bufSplatsL, out var bufColsL, out var bufSplatsR, out var bufColsR);
+            var bufActiveR  = new ComputeBuffer(Mathf.Max(nR, 1), 4);
+            var bufBestIdx  = new ComputeBuffer(Mathf.Max(nL, 1), 4);
+
+            try
+            {
+                bufActiveR.SetData(nR > 0 ? activeR : new[] { 0 });
+
+                int kernel = shader.FindKernel("BestRemaining");
+                shader.SetBuffer(kernel, "_SplatsL", bufSplatsL);
+                shader.SetBuffer(kernel, "_ColorsL", bufColsL);
+                shader.SetBuffer(kernel, "_SplatsR", bufSplatsR);
+                shader.SetBuffer(kernel, "_ColorsR", bufColsR);
+                shader.SetBuffer(kernel, "_ActiveR", bufActiveR);
+                shader.SetBuffer(kernel, "_BestIndex", bufBestIdx);
+                shader.SetInt  ("_CountL", nL);
+                shader.SetInt  ("_CountR", nR);
+                shader.SetFloat("_PosWeight", posWeight);
+                shader.SetFloat("_ColWeight", colWeight);
+
+                shader.Dispatch(kernel, (Mathf.Max(nL, 1) + 63) / 64, 1, 1);
+
+                var result = new int[nL];
+                bufBestIdx.GetData(result);
+                return result;
+            }
+            finally
+            {
+                bufSplatsL.Dispose(); bufSplatsR.Dispose();
+                bufColsL.Dispose();   bufColsR.Dispose();
+                bufActiveR.Dispose(); bufBestIdx.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Shared setup for both GS-Matching dispatch calls: normalises each cloud into [0,1]
+        /// against its OWN bounds (same convention as DispatchCorrespondenceShader/GetBounds — see
+        /// its header comment for why a shared/combined box across two differently scaled/
+        /// positioned objects would be wrong) and uploads position/color buffers. Caller owns
+        /// disposal of all four returned buffers.
+        /// </summary>
+        static void BuildNormalisedSplatBuffers(
+            Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+            out ComputeBuffer bufSplatsL, out ComputeBuffer bufColsL,
+            out ComputeBuffer bufSplatsR, out ComputeBuffer bufColsR)
+        {
+            int nL = posL.Length;
+            int nR = posR.Length;
+
+            GetBounds(posL, out var bMinL, out var bMaxL);
+            GetBounds(posR, out var bMinR, out var bMaxR);
+            float scaleL = Mathf.Max(Mathf.Max(bMaxL.x - bMinL.x, bMaxL.y - bMinL.y), bMaxL.z - bMinL.z);
+            float scaleR = Mathf.Max(Mathf.Max(bMaxR.x - bMinR.x, bMaxR.y - bMinR.y), bMaxR.z - bMinR.z);
+            scaleL = Mathf.Max(scaleL, 1e-6f);
+            scaleR = Mathf.Max(scaleR, 1e-6f);
+
+            var splatsLData = new Vector4[Mathf.Max(nL, 1)];
+            var splatsRData = new Vector4[Mathf.Max(nR, 1)];
+            for (int i = 0; i < nL; i++)
+                splatsLData[i] = new Vector4((posL[i].x - bMinL.x) / scaleL, (posL[i].y - bMinL.y) / scaleL, (posL[i].z - bMinL.z) / scaleL, 0);
+            for (int j = 0; j < nR; j++)
+                splatsRData[j] = new Vector4((posR[j].x - bMinR.x) / scaleR, (posR[j].y - bMinR.y) / scaleR, (posR[j].z - bMinR.z) / scaleR, 0);
+
+            bufSplatsL = new ComputeBuffer(Mathf.Max(nL, 1), 16);
+            bufSplatsR = new ComputeBuffer(Mathf.Max(nR, 1), 16);
+            bufColsL   = new ComputeBuffer(Mathf.Max(nL, 1), 16);
+            bufColsR   = new ComputeBuffer(Mathf.Max(nR, 1), 16);
+
+            bufSplatsL.SetData(splatsLData);
+            bufSplatsR.SetData(splatsRData);
+            bufColsL.SetData(nL > 0 ? colL : new Vector4[1]);
+            bufColsR.SetData(nR > 0 ? colR : new Vector4[1]);
         }
 
         const int kTopK = 32;

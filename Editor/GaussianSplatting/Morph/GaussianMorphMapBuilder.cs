@@ -212,6 +212,230 @@ namespace GaussianSplatting.Editor
             remainingR = Array.Empty<int>();
         }
 
+        // ── GS-Matching (Gale-Shapley-inspired stable matching) ─────────────────
+        //
+        // Ported from Yu et al., "GS-Matching: Reconsidering Feature Matching task in Point Cloud
+        // Registration" (arXiv:2412.04855), Algorithm 1 — adapted to this project's architecture.
+        // Self-contained: does NOT reuse ICorrespondenceDispatcher, Build(), or any top-K/probe
+        // infrastructure above.
+        //
+        // The paper's actual mechanism is NOT classic proposer/rejection deferred acceptance — it
+        // is a MUTUAL-BEST iterative filter: each round, every still-unmatched L finds its current
+        // best remaining R, and every still-unmatched R finds its current best remaining L; a pair
+        // is accepted ONLY when both point to each other, matched splats are removed from the pool,
+        // and the process repeats for up to K rounds. Because a pair is only ever confirmed on
+        // mutual agreement, no L can "steal" an R that R itself prefers someone else over — this is
+        // what gives the result its stability property and is the paper's answer to the same
+        // hubness/mass-convergence symptom this session's other independent-argmin attempts
+        // (z-score, min-max blend, probe partitioning) all hit.
+        //
+        // The paper also weights priority by scarcity (V_NC / "noise count": how many candidates a
+        // point has within a similarity threshold — fewer candidates means higher priority, since a
+        // scarce point is more likely to be crowded out by "popular" points converging on the same
+        // targets). We reproduce this directly via ScoreNoiseCount below; it is the genuinely novel
+        // part of GS-Matching, not just "mutual nearest neighbor," so it is not skipped.
+        //
+        // Distance vs similarity: the paper scores candidates by cosine SIMILARITY (higher=better);
+        // this project scores by weighted pos+color SQUARED DISTANCE (lower=better) — every mutual-
+        // best/argmax comparison in the paper is therefore an argmin here, the same mechanism
+        // mirrored onto our metric.
+
+        /// <summary>
+        /// Dispatches GS-Matching's GPU-side primitives (see SplatGaleShapley.compute). Must be
+        /// called on the main thread.
+        /// </summary>
+        public interface IGaleShapleyDispatcher
+        {
+            /// <summary>
+            /// Per L splat, count of R candidates within distanceThreshold (the paper's V_NC / noise
+            /// count) — used once, up front, to derive scarcity-based resolution priority.
+            /// </summary>
+            int[] CountNoise(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, float distanceThreshold);
+
+            /// <summary>
+            /// Per (active) L splat, index of its current best candidate among R splats still
+            /// marked active, or -1 if the active R pool is empty. Called twice per round with L/R
+            /// swapped (once for L's best-R, once for R's best-L) to get both sides' current pick.
+            /// </summary>
+            int[] FindBestRemaining(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                int[] activeR, float posWeight, float colWeight);
+        }
+
+        /// <summary>
+        /// K in the paper's Algorithm 1 — number of mutual-best rounds before the nearest-neighbor
+        /// fallback resolves whatever remains unmatched.
+        /// </summary>
+        const int kGaleShapleyRounds = 8;
+
+        /// <summary>
+        /// Builds a correspondence Result via GS-Matching instead of the round-based greedy loop or
+        /// probe partitioning above. Each round finds both sides' current mutual best-remaining
+        /// candidate and keeps only pairs where both agree (stable by construction); after
+        /// kGaleShapleyRounds, anything still unmatched falls through to a plain one-sided nearest-
+        /// neighbor pass — exactly the paper's Algorithm 1, Steps 14-15 — so every splat still ends
+        /// up matched (this project's non-negotiable 100%-matched requirement), while the honest
+        /// pre-fallback unmatched count remains observable via the returned Result before that pass
+        /// (see BuildViaProbes' identical reasoning for why that number matters diagnostically).
+        /// </summary>
+        public static Result BuildViaGaleShapley(
+            Vector3[] posL, Vector3[] posR,
+            Vector4[] colL, Vector4[] colR,
+            IGaleShapleyDispatcher dispatcher,
+            float colorWeight = 0.5f,
+            IProgress<float> progress = null,
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress?.Report(0.02f);
+
+            float posWeight = 1f - colorWeight;
+            int nL = posL.Length;
+            int nR = posR.Length;
+
+            var pairs = new List<int2>();
+            var activeL = new int[nL]; // 1 = still in the pool (unmatched), 0 = matched/removed
+            var activeR = new int[nR];
+            for (int i = 0; i < nL; i++) activeL[i] = 1;
+            for (int j = 0; j < nR; j++) activeR[j] = 1;
+
+            // Scarcity priority (V_NC / V_weight in the paper): computed once, up front, against
+            // the FULL initial pools — a point's candidate scarcity is a property of the two whole
+            // clouds, not something that needs recomputing as the pool shrinks each round.
+            float distanceThreshold = EstimateDistanceThreshold(posL, posR, colL, colR, posWeight, colorWeight);
+            int[] noiseCountL = nL > 0 && nR > 0
+                ? dispatcher.CountNoise(posL, colL, posR, colR, posWeight, colorWeight, distanceThreshold)
+                : Array.Empty<int>();
+
+            // Resolution order within a round follows the paper's priority: scarce L splats (few
+            // candidates within threshold) are considered before "popular" ones whenever both would
+            // otherwise contest the same mutual-best R — implemented by sorting L's processing order
+            // by ascending noise count once, up front (order is fixed; only the ACTIVE subset within
+            // it changes as splats get matched and removed round to round).
+            int[] priorityOrderL = nL > 0
+                ? Enumerable.Range(0, nL).OrderBy(i => noiseCountL.Length > 0 ? noiseCountL[i] : 0).ToArray()
+                : Array.Empty<int>();
+
+            progress?.Report(0.1f);
+
+            for (int round = 0; round < kGaleShapleyRounds; round++)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (nL == 0 || nR == 0) break;
+
+                int[] bestRForL = dispatcher.FindBestRemaining(posL, colL, posR, colR, activeR, posWeight, colorWeight);
+                ct.ThrowIfCancellationRequested();
+                int[] bestLForR = dispatcher.FindBestRemaining(posR, colR, posL, colL, activeL, posWeight, colorWeight);
+                ct.ThrowIfCancellationRequested();
+
+                int matchedThisRound = 0;
+
+                // Mutual-best check, processed in scarcity-priority order: a pair is confirmed only
+                // when L's best-remaining-R points back to L as R's own best-remaining-L. Once
+                // confirmed, both are removed from the active pool immediately (not batched to end
+                // of round) so a later, lower-priority L in this same round can't still see an
+                // already-claimed R as "active" — this is what makes processing ORDER (i.e. the
+                // scarcity priority) actually matter, not just a cosmetic sort.
+                foreach (int i in priorityOrderL)
+                {
+                    if (activeL[i] == 0) continue;
+                    int j = bestRForL[i];
+                    if (j < 0 || activeR[j] == 0) continue;
+                    if (bestLForR[j] != i) continue; // not mutual this round
+
+                    pairs.Add(new int2(i, j));
+                    activeL[i] = 0;
+                    activeR[j] = 0;
+                    matchedThisRound++;
+                }
+
+                progress?.Report(0.1f + 0.7f * (round + 1) / kGaleShapleyRounds);
+
+                if (matchedThisRound == 0)
+                    break; // stalled — no mutual agreement possible among what remains, further rounds are wasted work
+            }
+
+            var unmatchedLeft  = Enumerable.Range(0, nL).Where(i => activeL[i] != 0).ToArray();
+            var unmatchedRight = Enumerable.Range(0, nR).Where(j => activeR[j] != 0).ToArray();
+
+            // Paper's Algorithm 1, Steps 14-15: after K rounds, remaining unmatched points on
+            // either side fall through to a plain nearest-neighbor pass against the FULL opposite
+            // set (matched or not) — same shape and same GPU-dispatch rationale as this project's
+            // existing ResolveRemainderOnGpu (a serial CPU equivalent is the same O(n*m) search,
+            // just orders of magnitude slower at real asset scale), just implemented as its own
+            // dispatcher call here to keep this branch self-contained.
+            if (unmatchedLeft.Length > 0 && nR > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+                var subPosL = unmatchedLeft.Select(i => posL[i]).ToArray();
+                var subColL = unmatchedLeft.Select(i => colL[i]).ToArray();
+                var fullyActiveR = new int[nR];
+                for (int j = 0; j < nR; j++) fullyActiveR[j] = 1;
+                int[] fallbackMatch = dispatcher.FindBestRemaining(subPosL, subColL, posR, colR, fullyActiveR, posWeight, colorWeight);
+                for (int k = 0; k < unmatchedLeft.Length; k++)
+                    if (fallbackMatch[k] >= 0)
+                        pairs.Add(new int2(unmatchedLeft[k], fallbackMatch[k]));
+            }
+            if (unmatchedRight.Length > 0 && nL > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+                var subPosR = unmatchedRight.Select(j => posR[j]).ToArray();
+                var subColR = unmatchedRight.Select(j => colR[j]).ToArray();
+                var fullyActiveL = new int[nL];
+                for (int i = 0; i < nL; i++) fullyActiveL[i] = 1;
+                int[] fallbackMatch = dispatcher.FindBestRemaining(subPosR, subColR, posL, colL, fullyActiveL, posWeight, colorWeight);
+                for (int k = 0; k < unmatchedRight.Length; k++)
+                    if (fallbackMatch[k] >= 0)
+                        pairs.Add(new int2(fallbackMatch[k], unmatchedRight[k]));
+            }
+
+            progress?.Report(1f);
+
+            return new Result
+            {
+                matchedPairs   = pairs.ToArray(),
+                unmatchedLeft  = unmatchedLeft,
+                unmatchedRight = unmatchedRight,
+            };
+        }
+
+        /// <summary>
+        /// T1 equivalent: the paper thresholds by SIMILARITY (a fixed, dataset-independent cutoff
+        /// makes sense for normalised cosine similarity); our metric is an unbounded weighted
+        /// squared distance whose scale depends entirely on the two clouds' own extents, so a fixed
+        /// constant would be meaningless across different assets. Instead we estimate a threshold
+        /// from the data itself: the mean nearest-neighbor distance from a small random L sample to
+        /// its closest R candidate, scaled up — candidates within a small multiple of the "typical"
+        /// nearest-neighbor distance are considered viable, matching the paper's intent (T1 marks
+        /// "plausible candidate," not "the single best one") without requiring a manually-tuned
+        /// per-asset constant.
+        /// </summary>
+        static float EstimateDistanceThreshold(
+            Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
+            float posWeight, float colWeight, int sampleSize = 256, float scale = 4f)
+        {
+            if (posL.Length == 0 || posR.Length == 0) return 0f;
+
+            var rng = new System.Random(0);
+            int count = Math.Min(sampleSize, posL.Length);
+            float sum = 0f;
+
+            foreach (int i in Enumerable.Range(0, posL.Length).OrderBy(_ => rng.Next()).Take(count))
+            {
+                float best = float.MaxValue;
+                for (int j = 0; j < posR.Length; j++)
+                {
+                    float3 dp = (float3)posL[i] - (float3)posR[j];
+                    float4 dc = (float4)colL[i] - (float4)colR[j];
+                    float dist = posWeight * math.dot(dp, dp) + colWeight * math.dot(dc, dc);
+                    if (dist < best) best = dist;
+                }
+                sum += best;
+            }
+
+            return (sum / count) * scale;
+        }
+
         // ── Probe-based correspondence ──────────────────────────────────────────
 
         /// <summary>

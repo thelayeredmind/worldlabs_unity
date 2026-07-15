@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: MIT
+// GS-Matching (Gale-Shapley-inspired stable matching for point correspondence) — Yu et al.,
+// "GS-Matching: Reconsidering Feature Matching task in Point Cloud Registration" (arXiv:2412.04855).
+// Self-contained: does not reuse SplatCorrespondence.compute's kernels or preference-list layout.
+//
+// Adapted from the paper's Algorithm 1 to this project's architecture:
+//   - The paper scores candidate pairs by cosine SIMILARITY between feature descriptors (higher =
+//     better); we score by weighted pos+color SQUARED DISTANCE (lower = better) — every comparison
+//     below is therefore an argmin, the mirror of the paper's argmax, over the same mutual-best
+//     mechanism.
+//   - The paper's "noise count" (V_NC = how many candidates exceed a similarity threshold T1) and
+//     resulting priority-by-scarcity are reproduced directly below (CountCandidatesBelowThreshold),
+//     since it is the genuinely distinctive part of GS-Matching, not just "mutual nearest neighbor."
+//   - Each round: every UNMATCHED L finds its current best UNMATCHED R (BestRemaining), and every
+//     UNMATCHED R finds its current best UNMATCHED L, symmetric dispatch of the same kernel with L/R
+//     swapped. A pair is accepted only when both point to each other (checked on CPU after readback
+//     — O(unmatched-this-round), never O(n*m)). Matched splats are removed from the pool for the
+//     next round by simply excluding them via a per-splat "still active" mask.
+
+#pragma kernel CountCandidatesBelowThreshold
+#pragma kernel BestRemaining
+
+StructuredBuffer<float4> _SplatsL;   // xyz = position, normalised [0,1] against L's OWN bounds
+StructuredBuffer<float4> _ColorsL;
+StructuredBuffer<float4> _SplatsR;   // xyz = position, normalised [0,1] against R's OWN bounds
+StructuredBuffer<float4> _ColorsR;
+
+StructuredBuffer<int> _ActiveR;      // size CountR — 1 if this R splat is still unmatched/in the pool, 0 if already matched/removed
+
+int   _CountL;
+int   _CountR;
+float _PosWeight;
+float _ColWeight;
+
+// ── Step 1: noise count (V_NC) — how many R candidates fall within threshold T1 of this L splat.
+// Mirrors the paper's S_bin/V_NC construction exactly, just distance-thresholded instead of
+// similarity-thresholded. Used once, up front, to derive a scarcity-based priority: an L splat
+// with FEW viable candidates is more likely to be squeezed out by more "popular" L splats
+// converging on the same handful of R splats (this project's own hubness symptom, and precisely
+// what the paper's priority mechanism exists to counteract) — so scarce L splats should get
+// resolved/considered first.
+float _DistanceThreshold; // T1 equivalent, in the same weighted-squared-distance units as below
+
+RWStructuredBuffer<int> _NoiseCount; // output: per L splat, count of R candidates within _DistanceThreshold
+
+[numthreads(64, 1, 1)]
+void CountCandidatesBelowThreshold(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if ((int)i >= _CountL) return;
+
+    float3 pl = _SplatsL[i].xyz;
+    float4 cl = _ColorsL[i];
+
+    int count = 0;
+    for (int j = 0; j < _CountR; j++)
+    {
+        float3 dp = pl - _SplatsR[j].xyz;
+        float4 dc = cl - _ColorsR[j];
+        float dist = _PosWeight * dot(dp, dp) + _ColWeight * dot(dc, dc);
+        if (dist <= _DistanceThreshold)
+            count++;
+    }
+    _NoiseCount[i] = count;
+}
+
+// ── Step 2: per-round mutual-best search. One thread per L splat (dispatched again with L/R
+// swapped to get R's own best-L), finds the closest still-ACTIVE candidate on the other side.
+// Splats already matched in a previous round are skipped entirely by the CPU-side active mask
+// passed via _ActiveR (this kernel is always called with "L"=proposing side, "R"=candidate side —
+// the window's dispatcher swaps which real buffer is bound to which slot for the reverse pass).
+
+RWStructuredBuffer<int> _BestIndex; // output: per (active) L splat, index of its current best active R candidate, or -1 if none remain
+
+[numthreads(64, 1, 1)]
+void BestRemaining(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if ((int)i >= _CountL) return;
+
+    float3 pl = _SplatsL[i].xyz;
+    float4 cl = _ColorsL[i];
+
+    float bestDist = 1e30f;
+    int   bestJ    = -1;
+
+    for (int j = 0; j < _CountR; j++)
+    {
+        if (_ActiveR[j] == 0) continue; // already matched/removed this round — not a valid candidate
+
+        float3 dp = pl - _SplatsR[j].xyz;
+        float4 dc = cl - _ColorsR[j];
+        float dist = _PosWeight * dot(dp, dp) + _ColWeight * dot(dc, dc);
+
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            bestJ    = j;
+        }
+    }
+
+    _BestIndex[i] = bestJ;
+}
