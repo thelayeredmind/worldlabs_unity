@@ -302,9 +302,9 @@ namespace GaussianSplatting.Runtime
         // Set via LoadFromRuntimeData(); mutually exclusive with m_Asset.
         RuntimeSplatData m_RuntimeData;
 
-        [Range(0.1f, 2.0f)] [Tooltip("Additional scaling factor for the splats")]
+        [Range(0.0f, 2.0f)] [Tooltip("Additional scaling factor for the splats")]
         public float m_SplatScale = 1.0f;
-        [Range(0.05f, 20.0f)]
+        [Range(0.0f, 20.0f)]
         [Tooltip("Additional scaling factor for opacity")]
         public float m_OpacityScale = 1.0f;
         [Range(0, 3)] [Tooltip("Spherical Harmonics order to use")]
@@ -394,6 +394,23 @@ namespace GaussianSplatting.Runtime
         internal GraphicsBuffer m_GpuIndexBuffer;
         internal GraphicsBuffer m_GpuVisibleIndices;
         float m_LastCullCounterLogTime;
+#if UNITY_EDITOR
+        // Editor-only cull survivor readback for the Scene-view splat count overlay
+        // (GaussianSplatDebugOverlayWindow). Only reads back m_GpuVisibleIndices (already allocated
+        // unconditionally in CalcViewData) while s_DebugCountersEnabled is on -- no extra buffer needed.
+        internal static bool s_DebugCountersEnabled;
+        internal uint m_LastPostCullCount;
+
+        /// Editor-only: toggles the per-frame cull-survivor readback used by the Scene view splat count overlay.
+        public static bool DebugCountersEnabled
+        {
+            get => s_DebugCountersEnabled;
+            set => s_DebugCountersEnabled = value;
+        }
+        /// Editor-only: input splat count and post-cull-compute survivor count from the most recent frame
+        /// this renderer was drawn, valid only while DebugCountersEnabled is true.
+        public (int input, uint postCull) DebugSplatCounts => (splatCount, m_LastPostCullCount);
+#endif
         internal GraphicsBuffer m_GpuIndirectArgs;
         internal Camera m_centerEyeCamera;
         internal Matrix4x4 m_centerCamMatrix;
@@ -1320,6 +1337,19 @@ namespace GaussianSplatting.Runtime
                     Debug.Log($"[CullCounter] {logName}: splatCount={logSplatCount} survivorCounter={counter} cut={cutPercent:F1}%");
                 });
             }
+
+#if UNITY_EDITOR
+            // Editor-only: feed the Scene-view splat count overlay (GaussianSplatDebugOverlayWindow) while active.
+            // Reuses the cull survivor counter already dispatched above -- no extra buffer needed.
+            if (s_DebugCountersEnabled)
+            {
+                UnityEngine.Rendering.AsyncGPUReadback.Request(m_GpuVisibleIndices, req =>
+                {
+                    if (req.hasError) return;
+                    m_LastPostCullCount = req.GetData<uint>()[0];
+                });
+            }
+#endif
         }
 
         void UpdateEffectLayerBuffer(CommandBuffer cmb)

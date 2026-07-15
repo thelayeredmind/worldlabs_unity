@@ -36,9 +36,35 @@ namespace GaussianSplatting.Editor
             /// <summary>
             /// Upload positions and colors for both sides, dispatch the search, return best-match indices
             /// and distances per L splat. Must be called on the main thread.
+            /// bestDist is a per-splat-relative z-scored blend — use it only to see which candidate a
+            /// splat picked, never to compare match quality across different L splats (their z-scores
+            /// aren't on the same scale). bestRawDist is the raw, non-normalised distance to that same
+            /// chosen candidate, comparable across splats — use it for cross-splat collision arbitration.
             /// </summary>
             void FindBestMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
-                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist);
+                float posWeight, float colWeight, out int[] bestIndex, out float[] bestDist, out float[] bestRawDist);
+        }
+
+        /// <summary>
+        /// Abstracts the GPU dispatch used by probe-based correspondence (<see cref="IProbeGridStrategy"/>
+        /// and <see cref="IProbeResolutionStrategy"/> implementations). Same main-thread-only
+        /// constraint as <see cref="ICorrespondenceDispatcher"/> — the window provides the real
+        /// implementation, marshalling background-Task calls to the main thread.
+        /// </summary>
+        public interface IProbeDispatcher
+        {
+            int[] AssignToSpatialProbes(Vector3[] pos, int cellsPerAxis);
+
+            /// <summary>
+            /// Resolves every probe's L/R bucket in one dispatch. bucketPosL/colL/posR/colR are
+            /// already reordered so each probe's splats are contiguous (CSR layout); bucketStartL/R
+            /// are size probeCount+1 offsets into those arrays. Returns, per L bucket slot, the
+            /// ORIGINAL R splat index it matched to, or -1 if unmatched (empty/single-side probe).
+            /// </summary>
+            int[] ResolveProbeBuckets(
+                Vector4[] bucketPosL, Vector4[] bucketColL, int[] bucketStartL,
+                Vector4[] bucketPosR, Vector4[] bucketColR, int[] bucketStartR, int[] bucketOrigIndexR,
+                int probeCount, float posWeight, float colWeight);
         }
 
         // ── Public entry point ────────────────────────────────────────────────
@@ -61,7 +87,8 @@ namespace GaussianSplatting.Editor
             ICorrespondenceDispatcher dispatcher,
             float colorWeight = 0.5f,
             IProgress<float> progress = null,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            bool useRemainderFallback = true)
         {
             ct.ThrowIfCancellationRequested();
             progress?.Report(0.05f);
@@ -95,10 +122,10 @@ namespace GaussianSplatting.Editor
                 }
 
                 dispatcher.FindBestMatches(subPosL, subColL, subPosR, subColR, posWeight, colorWeight,
-                    out int[] bestMatch, out float[] bestDist);
+                    out int[] bestMatch, out float[] bestDist, out float[] bestRawDist);
                 ct.ThrowIfCancellationRequested();
 
-                ResolveOneToOne(bestMatch, bestDist, subPosL.Length, subPosR.Length,
+                ResolveOneToOne(bestMatch, bestRawDist, subPosL.Length, subPosR.Length,
                     out var roundPairs, out var roundUL, out var roundUR);
 
                 if (roundPairs.Length == 0)
@@ -124,8 +151,14 @@ namespace GaussianSplatting.Editor
             // same O(n*m) distance search as SplatCorrespondence.compute's FindBestMatch kernel,
             // just serial instead of massively parallel, and grinds for minutes at real asset
             // scale (100k-2M+ splats) instead of completing promptly.
-            ResolveRemainderOnGpu(posL, posR, colL, colR, dispatcher, posWeight, colorWeight,
-                ref remainingL, ref remainingR, pairs, ct);
+            //
+            // useRemainderFallback=false skips this — a diagnostic mode to see the round loop's
+            // OWN match quality unpadded (this fallback is an unconstrained full-cloud search with
+            // no locality constraint; it can be doing most of the real matching work and silently
+            // masking a poor round-loop result behind a clean "few unmatched" status).
+            if (useRemainderFallback)
+                ResolveRemainderOnGpu(posL, posR, colL, colR, dispatcher, posWeight, colorWeight,
+                    ref remainingL, ref remainingR, pairs, ct);
 
             progress?.Report(1f);
 
@@ -159,7 +192,7 @@ namespace GaussianSplatting.Editor
                 var subPosL = remainingL.Select(i => posL[i]).ToArray();
                 var subColL = remainingL.Select(i => colL[i]).ToArray();
                 dispatcher.FindBestMatches(subPosL, subColL, posR, colR, posWeight, colWeight,
-                    out int[] bestMatch, out _);
+                    out int[] bestMatch, out _, out _);
                 for (int i = 0; i < remainingL.Length; i++)
                     pairs.Add(new int2(remainingL[i], bestMatch[i]));
             }
@@ -170,13 +203,425 @@ namespace GaussianSplatting.Editor
                 var subPosR = remainingR.Select(j => posR[j]).ToArray();
                 var subColR = remainingR.Select(j => colR[j]).ToArray();
                 dispatcher.FindBestMatches(subPosR, subColR, posL, colL, posWeight, colWeight,
-                    out int[] bestMatch, out _);
+                    out int[] bestMatch, out _, out _);
                 for (int j = 0; j < remainingR.Length; j++)
                     pairs.Add(new int2(bestMatch[j], remainingR[j]));
             }
 
             remainingL = Array.Empty<int>();
             remainingR = Array.Empty<int>();
+        }
+
+        // ── Probe-based correspondence ──────────────────────────────────────────
+
+        /// <summary>
+        /// Assigns every splat in one cloud to a probe index (grid cell, cluster centroid, whatever
+        /// the strategy uses). Called once per side (L and R independently) by BuildViaProbes.
+        /// Implementations decide probe PLACEMENT — e.g. today's regular position-only grid
+        /// (<see cref="RegularSpatialGridStrategy"/>); future strategies (farthest-point sampling,
+        /// k-means centroids, HSL color-space grid) implement this same contract so BuildViaProbes
+        /// and the surrounding build pipeline never need to change when the placement method does.
+        /// </summary>
+        public interface IProbeGridStrategy
+        {
+            /// <summary>
+            /// probeCountTarget is a hint, not a guarantee — implementations may need a different
+            /// actual probe universe size (e.g. a regular grid's cellsPerAxis^3 after cube-root
+            /// rounding rarely equals the target exactly). actualProbeCount reports the true upper
+            /// bound of indices this call can return, which callers MUST use for downstream sizing
+            /// (bucketing, per-probe arrays) instead of the original target.
+            /// </summary>
+            int[] AssignToProbes(Vector3[] pos, Vector4[] col, int probeCountTarget, out int actualProbeCount);
+        }
+
+        /// <summary>
+        /// Resolves which L splat matches which R splat within each shared probe, given both
+        /// clouds' full data and their per-splat probe assignments. Implementations decide the
+        /// RESOLUTION algorithm — e.g. today's GPU greedy nearest-first
+        /// (<see cref="GpuGreedyProbeResolutionStrategy"/>); future strategies (a smarter in-bucket
+        /// assignment, etc) implement this same contract so BuildViaProbes never needs to change
+        /// when the resolution method does. Splats in probes occupied by only one side (or neither)
+        /// must be returned as unmatched, not resolved — BuildViaProbes routes those through the
+        /// existing remainder fallback so every splat still ends up matched.
+        /// </summary>
+        public interface IProbeResolutionStrategy
+        {
+            void Resolve(
+                Vector3[] posL, Vector4[] colL, int[] probeIndexL,
+                Vector3[] posR, Vector4[] colR, int[] probeIndexR,
+                int probeCount, float posWeight, float colWeight,
+                out int2[] pairs, out int[] unmatchedLeft, out int[] unmatchedRight);
+        }
+
+        /// <summary>
+        /// Builds a correspondence Result via probe partitioning instead of the round-based greedy
+        /// loop above — splits the global correspondence search into many small, cheap, local
+        /// sub-problems instead of one full CountL x CountR search or a global assignment solve
+        /// (Sinkhorn was tried for the latter and abandoned — real numerical instability at this
+        /// scale, see git history). Pure orchestration: derives probeCount from probeAccuracy, calls
+        /// gridStrategy once per side, calls resolutionStrategy once, then routes whatever it leaves
+        /// unmatched through the existing GPU remainder fallback so every splat still ends up
+        /// matched (duplicates allowed for genuine leftovers, matching Build()'s existing guarantee).
+        /// Grid placement and bucket resolution are both swappable strategies — this method has no
+        /// algorithm-specific logic of its own.
+        /// </summary>
+        public static Result BuildViaProbes(
+            Vector3[] posL, Vector3[] posR,
+            Vector4[] colL, Vector4[] colR,
+            IProbeGridStrategy gridStrategy,
+            IProbeResolutionStrategy resolutionStrategy,
+            float probeAccuracy,
+            float colorWeight,
+            IProgress<float> progress = null)
+        {
+            float posWeight = 1f - colorWeight;
+
+            progress?.Report(0.05f);
+            int probeCountTarget = Math.Max(1, (int)Math.Round(probeAccuracy * Math.Max(posL.Length, posR.Length)));
+
+            // Both sides must share ONE probe-index universe (a splat's probe index from L must mean
+            // the same cell as the same index from R) — call the strategy once per side but with the
+            // SAME target, then use whichever actual count it reports (a deterministic function of
+            // the target alone for today's regular grid, so both calls agree; a future strategy that
+            // can't guarantee that would need its own reconciliation, not assumed here).
+            var probeIndexL = gridStrategy.AssignToProbes(posL, colL, probeCountTarget, out int actualProbeCountL);
+            progress?.Report(0.3f);
+            var probeIndexR = gridStrategy.AssignToProbes(posR, colR, probeCountTarget, out int actualProbeCountR);
+            progress?.Report(0.5f);
+            int actualProbeCount = Math.Max(actualProbeCountL, actualProbeCountR);
+
+            // Resolution must compare splats in the SAME normalised space grid placement used — each
+            // cloud independently normalised to [0,1]^3 against its OWN bounds (see GetBounds'
+            // rationale: relative position within each object's own extent is the correspondence
+            // signal, not raw world-space distance, which is meaningless across two differently
+            // scaled/positioned objects). Passing raw posL/posR here was a real bug: grid ASSIGNMENT
+            // correctly bucketed splats by relative position, but resolution then measured distance
+            // in raw world coordinates, corrupting every within-bucket pick.
+            var normPosL = NormalizePositions(posL);
+            var normPosR = NormalizePositions(posR);
+
+            resolutionStrategy.Resolve(normPosL, colL, probeIndexL, normPosR, colR, probeIndexR,
+                actualProbeCount, posWeight, colWeight: colorWeight,
+                out var pairs, out var unmatchedLeft, out var unmatchedRight);
+            progress?.Report(1f);
+
+            // Deliberately NOT routed through ResolveRemainderOnGpu — that fallback is an
+            // unconstrained full-cloud nearest-neighbor search, the exact no-locality mechanism
+            // probe partitioning exists to avoid. Silently patching gaps with it would mask the
+            // probe algorithm's real match quality (a clean "0 unmatched" status could hide gaps
+            // the remainder step quietly filled with long-range guesses). unmatchedLeft/
+            // unmatchedRight are reported honestly here so probe-only match quality is directly
+            // observable; re-introduce a fallback deliberately later if genuine leftovers need
+            // somewhere to go for playback, not as a way to avoid looking at this number.
+            return new Result
+            {
+                matchedPairs   = pairs,
+                unmatchedLeft  = unmatchedLeft,
+                unmatchedRight = unmatchedRight,
+            };
+        }
+
+        /// <summary>
+        /// Normalises one cloud's positions into [0,1]^3 against its OWN bounds, independently of
+        /// the other cloud — same convention used throughout this file and SplatCorrespondence.compute
+        /// (relative position within each object's own extent is the correspondence signal, not raw
+        /// world-space distance, which is meaningless across two differently scaled/positioned
+        /// objects — see GetBounds' rationale in GaussianMorphMapBuilderWindow.cs).
+        /// </summary>
+        static Vector3[] NormalizePositions(Vector3[] pos)
+        {
+            var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+            foreach (var p in pos) { min = Vector3.Min(min, p); max = Vector3.Max(max, p); }
+
+            float scale = Math.Max(Math.Max(max.x - min.x, max.y - min.y), max.z - min.z);
+            scale = Math.Max(scale, 1e-6f);
+
+            var result = new Vector3[pos.Length];
+            for (int i = 0; i < pos.Length; i++)
+                result[i] = new Vector3((pos[i].x - min.x) / scale, (pos[i].y - min.y) / scale, (pos[i].z - min.z) / scale);
+            return result;
+        }
+
+        /// <summary>
+        /// Default <see cref="IProbeGridStrategy"/>: a regular grid over POSITION ONLY (color takes
+        /// no part in probe placement) — cellsPerAxis = round(probeCount^(1/3)), each cloud's own
+        /// independently-normalised [0,1]^3 space. Dispatched on GPU via <see cref="IProbeDispatcher"/>
+        /// (see SplatCorrespondence.compute's AssignToSpatialProbes kernel).
+        /// </summary>
+        public class RegularSpatialGridStrategy : IProbeGridStrategy
+        {
+            readonly IProbeDispatcher m_Dispatcher;
+            public RegularSpatialGridStrategy(IProbeDispatcher dispatcher) => m_Dispatcher = dispatcher;
+
+            public int[] AssignToProbes(Vector3[] pos, Vector4[] col, int probeCountTarget, out int actualProbeCount)
+            {
+                int cellsPerAxis = Math.Max(1, (int)Math.Round(Math.Pow(probeCountTarget, 1.0 / 3.0)));
+                actualProbeCount = cellsPerAxis * cellsPerAxis * cellsPerAxis;
+                return m_Dispatcher.AssignToSpatialProbes(pos, cellsPerAxis);
+            }
+        }
+
+        /// <summary>
+        /// Default <see cref="IProbeResolutionStrategy"/>: greedy nearest-first within each probe's
+        /// bucket, dispatched on GPU (one thread per probe — see SplatCorrespondence.compute's
+        /// ResolveProbeBuckets kernel). Builds a CSR-style layout (per-probe contiguous splat runs)
+        /// on CPU first — cheap, no distance math, just bucketing indices by probe — then hands the
+        /// reordered arrays to the dispatcher for the actual O(bucketL*bucketR) search per probe.
+        /// </summary>
+        public class GpuGreedyProbeResolutionStrategy : IProbeResolutionStrategy
+        {
+            readonly IProbeDispatcher m_Dispatcher;
+            public GpuGreedyProbeResolutionStrategy(IProbeDispatcher dispatcher) => m_Dispatcher = dispatcher;
+
+            public void Resolve(
+                Vector3[] posL, Vector4[] colL, int[] probeIndexL,
+                Vector3[] posR, Vector4[] colR, int[] probeIndexR,
+                int probeCount, float posWeight, float colWeight,
+                out int2[] pairs, out int[] unmatchedLeft, out int[] unmatchedRight)
+            {
+                BuildCsr(posL, colL, probeIndexL, probeCount,
+                    out var bucketPosL, out var bucketColL, out var bucketStartL, out var origIndexL);
+                BuildCsr(posR, colR, probeIndexR, probeCount,
+                    out var bucketPosR, out var bucketColR, out var bucketStartR, out var origIndexR);
+
+                var matchedR = m_Dispatcher.ResolveProbeBuckets(
+                    bucketPosL, bucketColL, bucketStartL,
+                    bucketPosR, bucketColR, bucketStartR, origIndexR,
+                    probeCount, posWeight, colWeight);
+
+                var pairList = new List<int2>();
+                var matchedLFlag = new bool[posL.Length];
+                var matchedRFlag = new bool[posR.Length];
+                for (int slot = 0; slot < matchedR.Length; slot++)
+                {
+                    if (matchedR[slot] < 0) continue;
+                    int origL = origIndexL[slot];
+                    pairList.Add(new int2(origL, matchedR[slot]));
+                    matchedLFlag[origL] = true;
+                    matchedRFlag[matchedR[slot]] = true;
+                }
+
+                pairs          = pairList.ToArray();
+                unmatchedLeft  = Enumerable.Range(0, posL.Length).Where(i => !matchedLFlag[i]).ToArray();
+                unmatchedRight = Enumerable.Range(0, posR.Length).Where(j => !matchedRFlag[j]).ToArray();
+            }
+
+            static void BuildCsr(
+                Vector3[] pos, Vector4[] col, int[] probeIndex, int probeCount,
+                out Vector4[] bucketPos, out Vector4[] bucketCol, out int[] bucketStart, out int[] origIndex)
+            {
+                var countPerProbe = new int[probeCount];
+                foreach (var p in probeIndex) countPerProbe[p]++;
+
+                bucketStart = new int[probeCount + 1];
+                for (int p = 0; p < probeCount; p++)
+                    bucketStart[p + 1] = bucketStart[p] + countPerProbe[p];
+
+                bucketPos = new Vector4[pos.Length];
+                bucketCol = new Vector4[pos.Length];
+                origIndex = new int[pos.Length];
+                var cursor = (int[])bucketStart.Clone();
+                for (int i = 0; i < pos.Length; i++)
+                {
+                    int slot = cursor[probeIndex[i]]++;
+                    bucketPos[slot] = pos[i];
+                    bucketCol[slot] = col[i];
+                    origIndex[slot] = i;
+                }
+            }
+        }
+
+        // ── Candidate-selection collision diagnostics ─────────────────────────
+
+        public struct CandidateCollisionReport
+        {
+            public int countL;
+            public int countR;
+            public int distinctRChosen;   // how many distinct R indices appear across all L splats' raw best-match choice
+            public float distinctRatio;   // distinctRChosen / min(countL, countR) — 1.0 = no collisions possible, near-0 = mass convergence
+        }
+
+        /// <summary>
+        /// Dispatches a single, unarbitrated FindBestMatches pass over the FULL L/R sets (no
+        /// round-loop subsetting) and counts how many distinct R indices are chosen across all
+        /// L splats' raw best-match pick. A low distinctRatio means many L splats are independently
+        /// converging on the same handful of R candidates as their "best" match — if so, no
+        /// collision-arbitration rule can fix the round loop's resolution rate, since only one
+        /// L splat can win each contested R splat per round regardless of which distance decides it.
+        /// </summary>
+        public static CandidateCollisionReport AnalyzeCandidateCollisions(
+            Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
+            ICorrespondenceDispatcher dispatcher, float colorWeight)
+        {
+            float posWeight = 1f - colorWeight;
+            dispatcher.FindBestMatches(posL, colL, posR, colR, posWeight, colorWeight,
+                out int[] bestIndex, out _, out _);
+
+            var distinctR = new HashSet<int>(bestIndex);
+            int denom = Mathf.Min(posL.Length, posR.Length);
+
+            return new CandidateCollisionReport
+            {
+                countL          = posL.Length,
+                countR          = posR.Length,
+                distinctRChosen = distinctR.Count,
+                distinctRatio   = denom > 0 ? (float)distinctR.Count / denom : 0f,
+            };
+        }
+
+        // ── Match quality sampling ────────────────────────────────────────────
+
+        public struct MatchSample
+        {
+            public int   pairIndex;
+            public int   leftIndex;
+            public int   rightIndex;
+            public float posDelta;
+            public float colorDelta;
+        }
+
+        /// <summary>
+        /// Samples a random subset of a built map's matched pairs and reports, per sample,
+        /// the world-space position delta and color delta between the two matched splats.
+        /// A cross-cluster swap shows up as a large position delta paired with a near-zero
+        /// color delta; a large position delta with a large color delta is a legitimate
+        /// long-range match at high color weight. Not exhaustive by design — at 100k-2M+
+        /// splats, a small random sample is enough to tell whether matching looks sane.
+        /// </summary>
+        public static MatchSample[] SampleMatchQuality(GaussianMorphMap map, GaussianSplatAsset left, GaussianSplatAsset right,
+            int sampleCount = 20, int seed = 0)
+        {
+            int n = map.matchedPairs?.Length ?? 0;
+            if (n == 0)
+                return Array.Empty<MatchSample>();
+
+            var posL = DecodeSplatPositions(left);
+            var posR = DecodeSplatPositions(right);
+            var colL = DecodeSplatColors(left);
+            var colR = DecodeSplatColors(right);
+
+            var rng = new System.Random(seed);
+            int count = Mathf.Min(sampleCount, n);
+            var chosen = Enumerable.Range(0, n).OrderBy(_ => rng.Next()).Take(count);
+
+            var samples = new List<MatchSample>(count);
+            foreach (int pairIdx in chosen)
+            {
+                var pair = map.matchedPairs[pairIdx];
+                samples.Add(new MatchSample
+                {
+                    pairIndex  = pairIdx,
+                    leftIndex  = pair.x,
+                    rightIndex = pair.y,
+                    posDelta   = Vector3.Distance(posL[pair.x], posR[pair.y]),
+                    colorDelta = Vector4.Distance(colL[pair.x], colR[pair.y]),
+                });
+            }
+
+            return samples.ToArray();
+        }
+
+        // ── Duplicate-match diagnostics ───────────────────────────────────────
+
+        public struct DuplicateReport
+        {
+            public int duplicateLeftIndices;
+            public int duplicateRightIndices;
+            public int largestFanOut;
+            public int excessPairs; // pairs beyond the first occurrence of any duplicated index — extra output splats SplatMorph.compute would produce
+        }
+
+        /// <summary>
+        /// Counts how many distinct L/R indices appear in more than one matchedPairs entry.
+        /// ResolveRemainderOnGpu deliberately allows many-to-one matches (convergence over
+        /// uniqueness) — but SplatMorph.compute is one-thread-per-pairs-entry, so a duplicated
+        /// L index produces multiple output splats all reading the same source position/color
+        /// while interpolating toward different R destinations, which can visually read as
+        /// splats tearing/splitting apart during playback.
+        /// </summary>
+        public static DuplicateReport AnalyzeDuplicates(GaussianMorphMap map)
+        {
+            var pairs = map.matchedPairs ?? Array.Empty<int2>();
+            var leftCounts  = new Dictionary<int, int>();
+            var rightCounts = new Dictionary<int, int>();
+
+            foreach (var p in pairs)
+            {
+                leftCounts.TryGetValue(p.x, out int lc);
+                leftCounts[p.x] = lc + 1;
+                rightCounts.TryGetValue(p.y, out int rc);
+                rightCounts[p.y] = rc + 1;
+            }
+
+            int dupL = 0, dupR = 0, largestFanOut = 0, excess = 0;
+            foreach (var kv in leftCounts)
+            {
+                if (kv.Value > 1)
+                {
+                    dupL++;
+                    excess += kv.Value - 1;
+                    largestFanOut = Mathf.Max(largestFanOut, kv.Value);
+                }
+            }
+            foreach (var kv in rightCounts)
+            {
+                if (kv.Value > 1)
+                {
+                    dupR++;
+                    largestFanOut = Mathf.Max(largestFanOut, kv.Value);
+                }
+            }
+
+            return new DuplicateReport
+            {
+                duplicateLeftIndices  = dupL,
+                duplicateRightIndices = dupR,
+                largestFanOut         = largestFanOut,
+                excessPairs           = excess,
+            };
+        }
+
+        public struct TopDuplicate
+        {
+            public int rightIndex;
+            public int fanOutCount;
+            public Vector3 position;
+            public Vector4 color;
+        }
+
+        /// <summary>
+        /// Reports the N most-duplicated R indices (by how many matchedPairs entries claim them),
+        /// with their decoded position/color. Used to distinguish genuine data redundancy (the
+        /// "popular" splats cluster spatially/chromatically — e.g. a flat wall, a repeated
+        /// architectural element that legitimately has many true nearest neighbors on the other
+        /// side) from a structural search artifact (popular splats scattered with varied color,
+        /// which would NOT be explained by redundant geometry).
+        /// </summary>
+        public static TopDuplicate[] TopDuplicatedRight(GaussianMorphMap map, GaussianSplatAsset right, int topN = 20)
+        {
+            var pairs = map.matchedPairs ?? Array.Empty<int2>();
+            var rightCounts = new Dictionary<int, int>();
+            foreach (var p in pairs)
+            {
+                rightCounts.TryGetValue(p.y, out int c);
+                rightCounts[p.y] = c + 1;
+            }
+
+            var posR = DecodeSplatPositions(right);
+            var colR = DecodeSplatColors(right);
+
+            return rightCounts
+                .OrderByDescending(kv => kv.Value)
+                .Take(topN)
+                .Select(kv => new TopDuplicate
+                {
+                    rightIndex  = kv.Key,
+                    fanOutCount = kv.Value,
+                    position    = posR[kv.Key],
+                    color       = colR[kv.Key],
+                })
+                .ToArray();
         }
 
         // ── Duplicate resolution ──────────────────────────────────────────────

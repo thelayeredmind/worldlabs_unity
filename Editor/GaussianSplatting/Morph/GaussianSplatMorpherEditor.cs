@@ -13,9 +13,7 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_AssetRight;
         SerializedProperty m_MorphMap;
         SerializedProperty m_T;
-        SerializedProperty m_AutoPlay;
-        SerializedProperty m_Duration;
-        SerializedProperty m_Loop;
+        SerializedProperty m_DebugTintUnmatched;
 
         void OnEnable()
         {
@@ -23,9 +21,7 @@ namespace GaussianSplatting.Editor
             m_AssetRight = serializedObject.FindProperty("m_AssetRight");
             m_MorphMap   = serializedObject.FindProperty("m_MorphMap");
             m_T          = serializedObject.FindProperty("m_T");
-            m_AutoPlay   = serializedObject.FindProperty("m_AutoPlay");
-            m_Duration   = serializedObject.FindProperty("m_Duration");
-            m_Loop       = serializedObject.FindProperty("m_Loop");
+            m_DebugTintUnmatched = serializedObject.FindProperty("m_DebugTintUnmatched");
         }
 
         public override void OnInspectorGUI()
@@ -67,10 +63,14 @@ namespace GaussianSplatting.Editor
 
             // ── MorphMap ─────────────────────────────────────────────────────
 
+            EditorGUI.BeginChangeCheck();
             EditorGUILayout.PropertyField(m_MorphMap);
+            bool morphMapFieldChanged = EditorGUI.EndChangeCheck();
 
-            // Auto-locate when assets change or map is missing
-            if (assetsChanged || (m_MorphMap.objectReferenceValue == null))
+            // Auto-locate only when the assets themselves changed — NOT just because the field is
+            // null, since an empty MorphMap is now a valid deliberate choice (all-unmatched/pure-fade
+            // baseline). Re-locating on every repaint would silently overwrite that choice.
+            if (assetsChanged)
             {
                 serializedObject.ApplyModifiedPropertiesWithoutUndo();
                 var found = GaussianSplatMorpher.FindMorphMap(morpher.assetLeft, morpher.assetRight);
@@ -79,14 +79,27 @@ namespace GaussianSplatting.Editor
                     m_MorphMap.objectReferenceValue = found;
                     serializedObject.ApplyModifiedProperties();
                     EditorUtility.SetDirty(target);
+                    morphMapFieldChanged = true;
                 }
             }
 
             if (m_MorphMap.objectReferenceValue == null && morpher.assetLeft != null && morpher.assetRight != null)
             {
                 EditorGUILayout.HelpBox(
-                    "No MorphMap found for these assets. Use Tools → Gaussian Splats → Build Morph Map to create one.",
-                    MessageType.Warning);
+                    "No MorphMap found for these assets — all splats will be treated as unmatched " +
+                    "(pure fade, no lerp). Use Tools → Gaussian Splats → Build Morph Map to create one.",
+                    MessageType.Info);
+            }
+
+            // Reassigning the MorphMap field only updates the serialized reference — none of the
+            // derived GPU state (matched/unmatched counts, index buffers) is rebuilt from it
+            // automatically. Without this, the morpher keeps running on the PREVIOUS map's buffers
+            // after you pick a different one in the inspector, silently comparing the wrong data.
+            if (morphMapFieldChanged)
+            {
+                serializedObject.ApplyModifiedProperties();
+                morpher.SetAssets(morpher.assetLeft, morpher.assetRight, morpher.morphMap);
+                serializedObject.Update();
             }
 
             // ── Interpolation ────────────────────────────────────────────────
@@ -94,19 +107,7 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.Space(6);
             EditorGUILayout.LabelField("Interpolation", EditorStyles.boldLabel);
             EditorGUILayout.PropertyField(m_T, new GUIContent("t  (0 = Left, 1 = Right)"));
-
-            // ── Auto-play ────────────────────────────────────────────────────
-
-            EditorGUILayout.Space(6);
-            EditorGUILayout.LabelField("Auto-play (optional)", EditorStyles.boldLabel);
-            EditorGUILayout.PropertyField(m_AutoPlay, new GUIContent("Enable"));
-            if (m_AutoPlay.boolValue)
-            {
-                EditorGUI.indentLevel++;
-                EditorGUILayout.PropertyField(m_Duration, new GUIContent("Duration (s)"));
-                EditorGUILayout.PropertyField(m_Loop,     new GUIContent("Loop"));
-                EditorGUI.indentLevel--;
-            }
+            EditorGUILayout.PropertyField(m_DebugTintUnmatched, new GUIContent("Debug Tint Unmatched", "Tint unmatched splats solid red (fading out) / blue (fading in) to visually isolate the fade path from matched-pair interpolation."));
 
             serializedObject.ApplyModifiedProperties();
         }

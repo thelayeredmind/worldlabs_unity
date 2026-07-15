@@ -2,6 +2,23 @@
 // Nearest-neighbor correspondence search for GaussianMorphMapBuilder.
 // One thread per splat in L — finds the closest splat in R by weighted pos+color distance.
 // Duplicate resolution (one-to-one constraint) is handled on CPU after readback.
+//
+// Raw position and color distances live on uncalibrated, non-comparable scales (position is
+// normalised to [0,1] over the combined bounding box; color is raw RGBA). Summing them directly
+// means colWeight/posWeight don't behave as a true blend — a splat's tiny position spread within
+// its own correct cluster can be dwarfed by color's much larger contested range, so even a small
+// colWeight can outvote a strongly-favoured position match (cross-cluster "swaps" for same-colored
+// but spatially distant splats). Each L splat instead min-max squashes its own pos/color distances
+// to [0,1] against its own candidate pool (per-splat min/max, not a global constant) before
+// weighting, so posWeight=colWeight=0.5 is a genuine equal blend for THIS splat's actual spread of
+// candidates. Min-max (not z-score) specifically because it's a monotonic affine transform of the
+// raw distance — it can never change which candidate is closest, only rescale the gap. Z-score was
+// tried first and rejected: it normalises relative to the pool MEAN rather than the query point, so
+// a candidate that's merely "central"/average across the whole R set can systematically look best
+// for a huge number of unrelated L splats — measured at 9.2% distinct-candidate ratio on a real
+// 294912-splat asset (94908 L splats meant fewer than that many distinct R destinations, mass
+// convergence onto ~27k R splats), which cascaded into the many-to-one remainder resolver picking
+// up the >200k splats the round loop could never actually resolve.
 
 #pragma kernel FindBestMatch
 
@@ -10,8 +27,12 @@ StructuredBuffer<float4> _ColorsL;   // rgba color
 StructuredBuffer<float4> _SplatsR;
 StructuredBuffer<float4> _ColorsR;
 
-RWStructuredBuffer<int>   _BestMatchIndex;  // output: per L splat, best R index
-RWStructuredBuffer<float> _BestMatchDist;   // output: per L splat, best distance
+RWStructuredBuffer<int>   _BestMatchIndex;   // output: per L splat, best R index
+RWStructuredBuffer<float> _BestMatchDist;    // output: per L splat, best distance (min-max squashed blend) — for candidate SELECTION only
+RWStructuredBuffer<float> _BestMatchRawDist; // output: per L splat, raw (non-normalised) squared distance to the chosen candidate —
+                                              // normalised values are relative to each splat's own candidate pool and are NOT comparable
+                                              // across different L splats; cross-splat collision arbitration (ResolveOneToOne) must use
+                                              // this raw value instead, or "closest pair wins" becomes meaningless noise.
 
 int   _CountL;
 int   _CountR;
@@ -27,25 +48,261 @@ void FindBestMatch(uint3 id : SV_DispatchThreadID)
     float3 pl = _SplatsL[i].xyz;
     float4 cl = _ColorsL[i];
 
-    float bestDist = 1e30f;
-    int   bestJ    = 0;
+    // Pass 1: find min/max raw pos/color distance over this splat's full R pool.
+    float minPos = 1e30f, maxPos = 0;
+    float minCol = 1e30f, maxCol = 0;
 
     for (int j = 0; j < _CountR; j++)
     {
-        float3 pr = _SplatsR[j].xyz;
-        float4 cr = _ColorsR[j];
+        float3 dp = pl - _SplatsR[j].xyz;
+        float4 dc = cl - _ColorsR[j];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
 
-        float3 dp = pl - pr;
-        float4 dc = cl - cr;
-        float dist = _PosWeight * dot(dp, dp) + _ColWeight * dot(dc, dc);
+        minPos = min(minPos, dPos); maxPos = max(maxPos, dPos);
+        minCol = min(minCol, dCol); maxCol = max(maxCol, dCol);
+    }
+
+    // max(..., 1e-12) guards a degenerate pool (every candidate equidistant on this axis) from a
+    // div-by-zero; such a splat has no discriminating signal on that axis either way.
+    float rangePos = max(maxPos - minPos, 1e-12f);
+    float rangeCol = max(maxCol - minCol, 1e-12f);
+
+    // Pass 2: recompute distances, min-max squash each to [0,1] against this splat's own pool
+    // range, weight-blend. Monotonic in the raw distance, so argmin here always matches argmin of
+    // the raw distance for a FIXED weight split on a single axis — unlike z-score, this can't let a
+    // pool-average-adjacent candidate outrank the true nearest neighbor.
+    float bestDist    = 1e30f;
+    float bestRawDist = 0;
+    int   bestJ       = 0;
+
+    for (int k = 0; k < _CountR; k++)
+    {
+        float3 dp = pl - _SplatsR[k].xyz;
+        float4 dc = cl - _ColorsR[k];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
+
+        float nPos = (dPos - minPos) / rangePos;
+        float nCol = (dCol - minCol) / rangeCol;
+        float dist = _PosWeight * nPos + _ColWeight * nCol;
 
         if (dist < bestDist)
         {
-            bestDist = dist;
-            bestJ    = j;
+            bestDist    = dist;
+            bestRawDist = _PosWeight * dPos + _ColWeight * dCol;
+            bestJ       = k;
         }
     }
 
-    _BestMatchIndex[i] = bestJ;
-    _BestMatchDist[i]  = bestDist;
+    _BestMatchIndex[i]   = bestJ;
+    _BestMatchDist[i]    = bestDist;
+    _BestMatchRawDist[i] = bestRawDist;
+}
+
+// Top-K candidate list per L splat: same 2-pass min-max blended distance as FindBestMatch, but
+// keeps the best TOP_K candidates instead of collapsing to a single winner. Used by diagnostics
+// (Verify Top-K Matches Kernel) and available as a building block for future matching strategies
+// that need more than one candidate per L splat.
+#pragma kernel FindTopKMatches
+
+#define TOP_K 32
+
+RWStructuredBuffer<int>   _TopKIndex; // size CountL * TOP_K, per-splat candidates ordered best-first
+RWStructuredBuffer<float> _TopKDist;  // size CountL * TOP_K, min-max squashed blended distance, same semantics as _BestMatchDist
+
+[numthreads(64, 1, 1)]
+void FindTopKMatches(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if ((int)i >= _CountL) return;
+
+    float3 pl = _SplatsL[i].xyz;
+    float4 cl = _ColorsL[i];
+
+    float minPos = 1e30f, maxPos = 0;
+    float minCol = 1e30f, maxCol = 0;
+
+    for (int j = 0; j < _CountR; j++)
+    {
+        float3 dp = pl - _SplatsR[j].xyz;
+        float4 dc = cl - _ColorsR[j];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
+
+        minPos = min(minPos, dPos); maxPos = max(maxPos, dPos);
+        minCol = min(minCol, dCol); maxCol = max(maxCol, dCol);
+    }
+
+    float rangePos = max(maxPos - minPos, 1e-12f);
+    float rangeCol = max(maxCol - minCol, 1e-12f);
+
+    // Fixed-size sorted insert: topDist[0..count) ascending, topIdx parallel. Linear insertion is
+    // fine here — TOP_K is small (32) relative to the O(CountR) outer loop it's nested inside.
+    float topDist[TOP_K];
+    int   topIdx[TOP_K];
+    int   count = 0;
+
+    for (int k = 0; k < _CountR; k++)
+    {
+        float3 dp = pl - _SplatsR[k].xyz;
+        float4 dc = cl - _ColorsR[k];
+        float dPos = dot(dp, dp);
+        float dCol = dot(dc, dc);
+
+        float nPos = (dPos - minPos) / rangePos;
+        float nCol = (dCol - minCol) / rangeCol;
+        float dist = _PosWeight * nPos + _ColWeight * nCol;
+
+        if (count < TOP_K || dist < topDist[TOP_K - 1])
+        {
+            int insertAt = min(count, TOP_K - 1);
+            while (insertAt > 0 && topDist[insertAt - 1] > dist)
+            {
+                topDist[insertAt] = topDist[insertAt - 1];
+                topIdx[insertAt]  = topIdx[insertAt - 1];
+                insertAt--;
+            }
+            topDist[insertAt] = dist;
+            topIdx[insertAt]  = k;
+            count = min(count + 1, TOP_K);
+        }
+    }
+
+    for (int s = 0; s < TOP_K; s++)
+    {
+        uint outBase = i * TOP_K + s;
+        if (s < count)
+        {
+            _TopKIndex[outBase] = topIdx[s];
+            _TopKDist[outBase]  = topDist[s];
+        }
+        else
+        {
+            // CountR < TOP_K: pad with an invalid sentinel so consumers can detect short lists.
+            _TopKIndex[outBase] = -1;
+            _TopKDist[outBase]  = 1e30f;
+        }
+    }
+}
+
+// Spatial probe partitioning: splits the global correspondence search into many small, cheap,
+// local sub-problems instead of one full CountL x CountR search or a global assignment solve
+// (Sinkhorn was tried for the latter and abandoned — real numerical instability at this scale,
+// see git history). Both clouds independently assign each of their splats to the nearest cell of
+// a SHARED regular grid (cellsPerAxis^3 cells) built over POSITION ONLY — color takes no part in
+// probe placement in this mode. Splats land in a probe purely by spatial proximity; resolving
+// WHICH L splat matches WHICH R splat within a shared probe (using the existing posWeight/
+// colWeight blended distance) is a separate, later step operating on each probe's typically-small
+// bucket instead of the whole cloud. A probe naturally accumulates however many splats from either
+// side land closest to it — no forced 1:1, no special-casing for empty or oversubscribed probes.
+//
+// Positions here are ALREADY normalised into [0,1]^3 independently per cloud (see
+// GaussianMorphMapBuilderWindow's per-cloud GetBounds/scale) — this kernel only buckets that
+// normalised space, so it does not itself see or care about each cloud's real physical scale.
+#pragma kernel AssignToSpatialProbes
+
+int _CellsPerAxis;
+
+RWStructuredBuffer<int> _ProbeIndex; // output: per splat (L or R, whichever buffer is bound as _Splats), flattened probe cell index
+
+StructuredBuffer<float4> _Splats; // xyz = normalised [0,1] position for whichever cloud is being probed this dispatch
+
+[numthreads(64, 1, 1)]
+void AssignToSpatialProbes(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if ((int)i >= _CountL) return; // _CountL reused as "count of the cloud being dispatched this call"
+
+    float3 p = saturate(_Splats[i].xyz);
+    int cx = min((int)(p.x * _CellsPerAxis), _CellsPerAxis - 1);
+    int cy = min((int)(p.y * _CellsPerAxis), _CellsPerAxis - 1);
+    int cz = min((int)(p.z * _CellsPerAxis), _CellsPerAxis - 1);
+
+    _ProbeIndex[i] = (cz * _CellsPerAxis + cy) * _CellsPerAxis + cx;
+}
+
+// Per-probe bucket resolution: one thread per probe (not per splat), each thread greedily
+// resolving its own probe's small local L/R bucket by the same min-max blended distance
+// FindBestMatch uses — just scoped to a handful of candidates instead of the whole cloud. Runs on
+// GPU because a serial CPU loop across potentially tens of thousands of probes (even with small
+// per-probe buckets) is still the same class of "serial O(n) work at real asset scale" this
+// project avoids for correspondence search (see CLAUDE.md). CPU builds a CSR-style layout
+// (per-probe start offset + splat index list, sorted by probe index) beforehand — that part is
+// cheap (no distance math, just bucketing indices) and stays on CPU; only the O(bucketL*bucketR)
+// distance search per probe runs here.
+#pragma kernel ResolveProbeBuckets
+
+StructuredBuffer<float4> _BucketPosL; // splat positions (normalised) reordered so each probe's L splats are contiguous
+StructuredBuffer<float4> _BucketColL;
+StructuredBuffer<float4> _BucketPosR;
+StructuredBuffer<float4> _BucketColR;
+StructuredBuffer<int>    _BucketStartL; // size ProbeCount+1 — CSR offsets into _BucketPosL/_BucketColL for probe p
+StructuredBuffer<int>    _BucketStartR; // size ProbeCount+1 — same for R
+StructuredBuffer<int>    _BucketOrigIndexL; // original L splat index for each reordered slot (for output)
+StructuredBuffer<int>    _BucketOrigIndexR; // original R splat index for each reordered slot
+
+RWStructuredBuffer<int> _BucketMatchedR; // output, size = _BucketPosL length (one per L slot): matched ORIGINAL R index, or -1 if unmatched
+RWStructuredBuffer<int> _BucketRClaimed; // scratch, size = _BucketPosR length (one per R slot): 0 = available, 1 = claimed within this probe
+
+int _ProbeCount;
+
+[numthreads(64, 1, 1)]
+void ResolveProbeBuckets(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if ((int)p >= _ProbeCount) return;
+
+    int lStart = _BucketStartL[p], lEnd = _BucketStartL[p + 1];
+    int rStart = _BucketStartR[p], rEnd = _BucketStartR[p + 1];
+
+    for (int li = lStart; li < lEnd; li++)
+        _BucketMatchedR[li] = -1;
+
+    if (lStart == lEnd || rStart == rEnd) return; // no splats on one or both sides — leftover, resolved by caller's remainder fallback
+
+    // Greedy nearest-first within this probe's small bucket: for each L splat (in bucket order),
+    // min-max squash its distances against the still-AVAILABLE R candidates, pick the best, claim
+    // it. Bucket sizes are small at real per-probe occupancy (tens, not thousands), so an O(bucket)
+    // linear scan per L splat is cheap.
+    for (int li2 = lStart; li2 < lEnd; li2++)
+    {
+        float3 pl = _BucketPosL[li2].xyz;
+        float4 cl = _BucketColL[li2];
+
+        float minPos = 1e30f, maxPos = 0;
+        float minCol = 1e30f, maxCol = 0;
+        for (int r = rStart; r < rEnd; r++)
+        {
+            if (_BucketRClaimed[r] != 0) continue;
+            float3 dp = pl - _BucketPosR[r].xyz;
+            float4 dc = cl - _BucketColR[r];
+            float dPos = dot(dp, dp);
+            float dCol = dot(dc, dc);
+            minPos = min(minPos, dPos); maxPos = max(maxPos, dPos);
+            minCol = min(minCol, dCol); maxCol = max(maxCol, dCol);
+        }
+
+        float rangePos = max(maxPos - minPos, 1e-12f);
+        float rangeCol = max(maxCol - minCol, 1e-12f);
+
+        float bestDist = 1e30f;
+        int   bestR    = -1;
+        for (int r2 = rStart; r2 < rEnd; r2++)
+        {
+            if (_BucketRClaimed[r2] != 0) continue;
+            float3 dp = pl - _BucketPosR[r2].xyz;
+            float4 dc = cl - _BucketColR[r2];
+            float nPos = (dot(dp, dp) - minPos) / rangePos;
+            float nCol = (dot(dc, dc) - minCol) / rangeCol;
+            float dist = _PosWeight * nPos + _ColWeight * nCol;
+            if (dist < bestDist) { bestDist = dist; bestR = r2; }
+        }
+
+        if (bestR >= 0)
+        {
+            _BucketMatchedR[li2] = _BucketOrigIndexR[bestR];
+            _BucketRClaimed[bestR] = 1;
+        }
+    }
 }

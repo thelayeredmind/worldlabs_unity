@@ -32,11 +32,8 @@ namespace GaussianSplatting.Runtime
 
         [SerializeField] ComputeShader m_MorphShader;
 
-        [Header("Auto-play (optional)")]
-        [Tooltip("Automatically animate t from 0 to 1 at runtime.")]
-        [SerializeField] bool m_AutoPlay;
-        [SerializeField, Min(0.01f)] float m_Duration = 2f;
-        [SerializeField] bool m_Loop = true;
+        [Tooltip("Tint unmatched splats solid red (fading out from Left) / blue (fading in from Right) instead of their real color, to visually isolate the fade-in/fade-out path from matched-pair interpolation when judging correspondence quality.")]
+        [SerializeField] bool m_DebugTintUnmatched;
 
         // ── Public API ────────────────────────────────────────────────────────
 
@@ -86,7 +83,7 @@ namespace GaussianSplatting.Runtime
 
             if (m_Renderer == null) return; // disabled — OnEnable will Setup() when next enabled
 
-            if (m_AssetLeft == null || m_AssetRight == null || m_MorphMap == null)
+            if (m_AssetLeft == null || m_AssetRight == null)
             {
                 m_Renderer.SetExternalBuffers(null, null, null, null, null, false, 0, 0);
                 m_Renderer.m_Asset = m_CapturedAsset;
@@ -144,12 +141,14 @@ namespace GaussianSplatting.Runtime
 
         void OnEnable()
         {
-            if (m_AssetLeft == null || m_AssetRight == null || m_MorphMap == null)
+            if (m_AssetLeft == null || m_AssetRight == null)
             {
-                Debug.LogWarning("GaussianSplatMorpher: assets or MorphMap not assigned.", this);
+                Debug.LogWarning("GaussianSplatMorpher: AssetLeft/AssetRight not assigned.", this);
                 enabled = false;
                 return;
             }
+            // m_MorphMap == null is valid — BuildIndexBuffer() treats it as "everything unmatched"
+            // (pure fade, no lerp), useful as a raw baseline when judging correspondence quality.
 
             m_Renderer      = GetComponent<GaussianSplatRenderer>();
             m_CapturedAsset = m_Renderer.m_Asset;
@@ -211,16 +210,6 @@ namespace GaussianSplatting.Runtime
 
         void Update()
         {
-            if (m_AutoPlay)
-            {
-                m_T += Time.deltaTime / m_Duration;
-                if (m_T >= 1f)
-                {
-                    m_T = m_Loop ? 0f : 1f;
-                    if (!m_Loop) m_AutoPlay = false;
-                }
-            }
-
             BindBuffersForT();
         }
 
@@ -386,6 +375,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
                 m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
                 m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsA = (m_UnmatchedLeftCount + 63) / 64;
                 m_MorphShader.Dispatch(kA, groupsA, 1, 1);
             }
@@ -414,6 +404,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
                 m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
                 m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsB = (m_UnmatchedRightCount + 63) / 64;
                 m_MorphShader.Dispatch(kB, groupsB, 1, 1);
             }
@@ -547,6 +538,12 @@ namespace GaussianSplatting.Runtime
 
         void BuildIndexBuffer()
         {
+            if (m_MorphMap == null)
+            {
+                BuildIndexBufferAllUnmatched();
+                return;
+            }
+
             bool swapped = MapIsSwapped();
             var pairs = m_MorphMap.matchedPairs;
             m_MatchedCount = pairs.Length;
@@ -582,6 +579,35 @@ namespace GaussianSplatting.Runtime
                     { name = "MorphUnmatchedRight" };
                 m_BufUnmatchedRight.SetData(uR);
             }
+        }
+
+        /// <summary>
+        /// No MorphMap assigned — every splat on both sides is "unmatched": Left fades out
+        /// in place, Right fades in in place, nothing lerps. Useful as a raw correspondence-free
+        /// baseline when judging how much of a morph's visual quality actually comes from the
+        /// matched-pair path versus the fade path.
+        /// </summary>
+        void BuildIndexBufferAllUnmatched()
+        {
+            m_MatchedCount = 0;
+            m_BufIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 8)
+                { name = "MorphIndices" }; // zero-length buffers aren't valid — kernel dispatch is skipped anyway (m_MatchedCount == 0)
+
+            m_UnmatchedLeftCount  = m_AssetLeft.splatCount;
+            m_UnmatchedRightCount = m_AssetRight.splatCount;
+            m_TotalMorphCount     = m_UnmatchedLeftCount + m_UnmatchedRightCount;
+
+            var uL = new int[m_UnmatchedLeftCount];
+            for (int i = 0; i < uL.Length; i++) uL[i] = i;
+            var uR = new int[m_UnmatchedRightCount];
+            for (int i = 0; i < uR.Length; i++) uR[i] = i;
+
+            m_BufUnmatchedLeft = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedLeftCount, 4)
+                { name = "MorphUnmatchedLeft" };
+            m_BufUnmatchedLeft.SetData(uL);
+            m_BufUnmatchedRight = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedRightCount, 4)
+                { name = "MorphUnmatchedRight" };
+            m_BufUnmatchedRight.SetData(uR);
         }
 
         void AllocateOutputBuffers()
