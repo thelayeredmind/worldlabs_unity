@@ -83,7 +83,7 @@ namespace GaussianSplatting.Runtime
 
             if (m_Renderer == null) return; // disabled — OnEnable will Setup() when next enabled
 
-            if (m_AssetLeft == null || m_AssetRight == null || m_MorphMap == null)
+            if (m_AssetLeft == null || m_AssetRight == null)
             {
                 m_Renderer.SetExternalBuffers(null, null, null, null, null, false, 0, 0);
                 m_Renderer.m_Asset = m_CapturedAsset;
@@ -141,12 +141,14 @@ namespace GaussianSplatting.Runtime
 
         void OnEnable()
         {
-            if (m_AssetLeft == null || m_AssetRight == null || m_MorphMap == null)
+            if (m_AssetLeft == null || m_AssetRight == null)
             {
-                Debug.LogWarning("GaussianSplatMorpher: assets or MorphMap not assigned.", this);
+                Debug.LogWarning("GaussianSplatMorpher: AssetLeft/AssetRight not assigned.", this);
                 enabled = false;
                 return;
             }
+            // m_MorphMap == null is valid — BuildIndexBuffer() treats it as "everything unmatched"
+            // (pure fade, no lerp), useful as a raw baseline when judging correspondence quality.
 
             m_Renderer      = GetComponent<GaussianSplatRenderer>();
             m_CapturedAsset = m_Renderer.m_Asset;
@@ -536,6 +538,12 @@ namespace GaussianSplatting.Runtime
 
         void BuildIndexBuffer()
         {
+            if (m_MorphMap == null)
+            {
+                BuildIndexBufferAllUnmatched();
+                return;
+            }
+
             bool swapped = MapIsSwapped();
             var pairs = m_MorphMap.matchedPairs;
             m_MatchedCount = pairs.Length;
@@ -571,6 +579,35 @@ namespace GaussianSplatting.Runtime
                     { name = "MorphUnmatchedRight" };
                 m_BufUnmatchedRight.SetData(uR);
             }
+        }
+
+        /// <summary>
+        /// No MorphMap assigned — every splat on both sides is "unmatched": Left fades out
+        /// in place, Right fades in in place, nothing lerps. Useful as a raw correspondence-free
+        /// baseline when judging how much of a morph's visual quality actually comes from the
+        /// matched-pair path versus the fade path.
+        /// </summary>
+        void BuildIndexBufferAllUnmatched()
+        {
+            m_MatchedCount = 0;
+            m_BufIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 8)
+                { name = "MorphIndices" }; // zero-length buffers aren't valid — kernel dispatch is skipped anyway (m_MatchedCount == 0)
+
+            m_UnmatchedLeftCount  = m_AssetLeft.splatCount;
+            m_UnmatchedRightCount = m_AssetRight.splatCount;
+            m_TotalMorphCount     = m_UnmatchedLeftCount + m_UnmatchedRightCount;
+
+            var uL = new int[m_UnmatchedLeftCount];
+            for (int i = 0; i < uL.Length; i++) uL[i] = i;
+            var uR = new int[m_UnmatchedRightCount];
+            for (int i = 0; i < uR.Length; i++) uR[i] = i;
+
+            m_BufUnmatchedLeft = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedLeftCount, 4)
+                { name = "MorphUnmatchedLeft" };
+            m_BufUnmatchedLeft.SetData(uL);
+            m_BufUnmatchedRight = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedRightCount, 4)
+                { name = "MorphUnmatchedRight" };
+            m_BufUnmatchedRight.SetData(uR);
         }
 
         void AllocateOutputBuffers()

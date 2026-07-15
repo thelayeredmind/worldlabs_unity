@@ -67,8 +67,10 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.PropertyField(m_MorphMap);
             bool morphMapFieldChanged = EditorGUI.EndChangeCheck();
 
-            // Auto-locate when assets change or map is missing
-            if (assetsChanged || (m_MorphMap.objectReferenceValue == null))
+            // Auto-locate only when the assets themselves changed — NOT just because the field is
+            // null, since an empty MorphMap is now a valid deliberate choice (all-unmatched/pure-fade
+            // baseline). Re-locating on every repaint would silently overwrite that choice.
+            if (assetsChanged)
             {
                 serializedObject.ApplyModifiedPropertiesWithoutUndo();
                 var found = GaussianSplatMorpher.FindMorphMap(morpher.assetLeft, morpher.assetRight);
@@ -84,8 +86,9 @@ namespace GaussianSplatting.Editor
             if (m_MorphMap.objectReferenceValue == null && morpher.assetLeft != null && morpher.assetRight != null)
             {
                 EditorGUILayout.HelpBox(
-                    "No MorphMap found for these assets. Use Tools → Gaussian Splats → Build Morph Map to create one.",
-                    MessageType.Warning);
+                    "No MorphMap found for these assets — all splats will be treated as unmatched " +
+                    "(pure fade, no lerp). Use Tools → Gaussian Splats → Build Morph Map to create one.",
+                    MessageType.Info);
             }
 
             // Reassigning the MorphMap field only updates the serialized reference — none of the
