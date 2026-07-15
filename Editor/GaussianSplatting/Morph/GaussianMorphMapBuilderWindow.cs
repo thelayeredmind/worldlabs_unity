@@ -26,6 +26,7 @@ namespace GaussianSplatting.Editor
         [SerializeField] string m_OutputFolder = "Assets/GaussianAssets";
         [SerializeField] float  m_ColorWeight  = 0.5f;
         [SerializeField] bool   m_UseSpatialProbes;
+        [SerializeField] bool   m_UseMutualTopK;
         [SerializeField] bool   m_UseRemainderFallback = true;
         [SerializeField] bool   m_UseGaleShapley;
 
@@ -132,6 +133,18 @@ namespace GaussianSplatting.Editor
                 finally { m_GpuDone.Set(); }
             }
 
+            if (m_TopKDispatchPending)
+            {
+                m_TopKDispatchPending = false;
+                try
+                {
+                    DispatchTopKMatches(m_TopKPosL, m_TopKColL, m_TopKPosR, m_TopKColR,
+                        m_TopKPosWeight, m_TopKColWeight, out m_TopKResultIndex, out m_TopKResultDist);
+                }
+                catch (Exception e) { m_TopKException = e; }
+                finally { m_GpuDone.Set(); }
+            }
+
             bool cancelled = EditorUtility.DisplayCancelableProgressBar("Building Morph Map", m_Status, m_Progress);
             if (cancelled) m_Cts?.Cancel();
 
@@ -166,8 +179,14 @@ namespace GaussianSplatting.Editor
 
             EditorGUILayout.Space(4);
             using (new EditorGUI.DisabledScope(m_UseSpatialProbes))
+                m_UseMutualTopK = EditorGUILayout.Toggle(
+                    new GUIContent("Use mutual top-K (symmetric greedy, experimental)", "Matches L and R only when each picks the other back within its own top-K candidates, instead of independent per-splat argmin. No remainder fallback — unmatched splats after convergence are reported honestly."),
+                    m_UseMutualTopK);
+
+            EditorGUILayout.Space(4);
+            using (new EditorGUI.DisabledScope(m_UseSpatialProbes || m_UseMutualTopK))
                 m_UseRemainderFallback = EditorGUILayout.Toggle(
-                    new GUIContent("Use remainder fallback (round-based only)", "When off, the round-based build reports its OWN unpadded match quality instead of silently filling gaps with an unconstrained full-cloud nearest-neighbor search — a diagnostic to see ground-truth match quality without the fallback's influence. Always off for spatial probes."),
+                    new GUIContent("Use remainder fallback (round-based only)", "When off, the round-based build reports its OWN unpadded match quality instead of silently filling gaps with an unconstrained full-cloud nearest-neighbor search — a diagnostic to see ground-truth match quality without the fallback's influence. Always off for spatial probes and mutual top-K."),
                     m_UseRemainderFallback);
 
             EditorGUILayout.Space(4);
@@ -395,6 +414,7 @@ namespace GaussianSplatting.Editor
             var assetRight  = m_AssetRight;
             float colorWeight = m_ColorWeight;
             bool useSpatialProbes = m_UseSpatialProbes;
+            bool useMutualTopK = m_UseMutualTopK;
             float probeAccuracy = m_ProbeAccuracy;
             bool useRemainderFallback = m_UseRemainderFallback;
             bool useGaleShapley = m_UseGaleShapley;
@@ -402,6 +422,7 @@ namespace GaussianSplatting.Editor
 
             var dispatcher = new MainThreadDispatcher(this);
             var probeDispatcher = new MainThreadProbeDispatcher(this);
+            var topKDispatcher = new MainThreadTopKDispatcher(this);
             var gridStrategy = new GaussianMorphMapBuilder.RegularSpatialGridStrategy(probeDispatcher);
             var resolutionStrategy = new GaussianMorphMapBuilder.GpuGreedyProbeResolutionStrategy(probeDispatcher);
             var galeShapleyDispatcher = new MainThreadGaleShapleyDispatcher(this);
@@ -423,6 +444,12 @@ namespace GaussianSplatting.Editor
                         m_Status = "Running GS-Matching (mutual-best stable matching)…";
                         result = GaussianMorphMapBuilder.BuildViaGaleShapley(posL, posR, colL, colR,
                             galeShapleyDispatcher, colorWeight, prog, ct);
+                    }
+                    else if (useMutualTopK)
+                    {
+                        m_Status = "Matching via mutual top-K agreement…";
+                        result = GaussianMorphMapBuilder.BuildViaMutualTopK(posL, posR, colL, colR,
+                            topKDispatcher, colorWeight, prog, ct);
                     }
                     else
                     {
@@ -560,6 +587,47 @@ namespace GaussianSplatting.Editor
         int[]         m_GaleShapleyNoiseResult;
         int[]         m_GaleShapleyBestResult;
         Exception     m_GaleShapleyException;
+
+        // ── Mutual top-K GPU dispatcher ──────────────────────────────────────
+
+        class MainThreadTopKDispatcher : GaussianMorphMapBuilder.ITopKDispatcher
+        {
+            readonly GaussianMorphMapBuilderWindow m_Window;
+            public MainThreadTopKDispatcher(GaussianMorphMapBuilderWindow w) => m_Window = w;
+
+            public void FindTopKMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, out int[] topKIndex, out float[] topKDist)
+            {
+                var w = m_Window;
+                w.m_TopKPosL      = posL;
+                w.m_TopKColL      = colL;
+                w.m_TopKPosR      = posR;
+                w.m_TopKColR      = colR;
+                w.m_TopKPosWeight = posWeight;
+                w.m_TopKColWeight = colWeight;
+                w.m_TopKException = null;
+                w.m_GpuDone.Reset();
+                w.m_TopKDispatchPending = true;
+
+                w.m_GpuDone.Wait();
+
+                if (w.m_TopKException != null)
+                    throw new Exception("Top-K dispatch failed", w.m_TopKException);
+
+                topKIndex = w.m_TopKResultIndex;
+                topKDist  = w.m_TopKResultDist;
+            }
+        }
+
+        // Marshalling state for mutual top-K GPU dispatch — same flag+ManualResetEventSlim pump as
+        // MainThreadDispatcher/MainThreadProbeDispatcher, serviced from OnEditorUpdate.
+        volatile bool m_TopKDispatchPending;
+        Vector3[]     m_TopKPosL, m_TopKPosR;
+        Vector4[]     m_TopKColL, m_TopKColR;
+        float         m_TopKPosWeight, m_TopKColWeight;
+        int[]         m_TopKResultIndex;
+        float[]       m_TopKResultDist;
+        Exception     m_TopKException;
 
         // ── GPU dispatcher ────────────────────────────────────────────────────
 
