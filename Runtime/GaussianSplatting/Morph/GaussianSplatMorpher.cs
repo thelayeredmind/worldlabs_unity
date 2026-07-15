@@ -32,11 +32,8 @@ namespace GaussianSplatting.Runtime
 
         [SerializeField] ComputeShader m_MorphShader;
 
-        [Header("Auto-play (optional)")]
-        [Tooltip("Automatically animate t from 0 to 1 at runtime.")]
-        [SerializeField] bool m_AutoPlay;
-        [SerializeField, Min(0.01f)] float m_Duration = 2f;
-        [SerializeField] bool m_Loop = true;
+        [Tooltip("Tint unmatched splats solid red (fading out from Left) / blue (fading in from Right) instead of their real color, to visually isolate the fade-in/fade-out path from matched-pair interpolation when judging correspondence quality.")]
+        [SerializeField] bool m_DebugTintUnmatched;
 
         // ── Public API ────────────────────────────────────────────────────────
 
@@ -211,16 +208,6 @@ namespace GaussianSplatting.Runtime
 
         void Update()
         {
-            if (m_AutoPlay)
-            {
-                m_T += Time.deltaTime / m_Duration;
-                if (m_T >= 1f)
-                {
-                    m_T = m_Loop ? 0f : 1f;
-                    if (!m_Loop) m_AutoPlay = false;
-                }
-            }
-
             BindBuffersForT();
         }
 
@@ -386,6 +373,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
                 m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
                 m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsA = (m_UnmatchedLeftCount + 63) / 64;
                 m_MorphShader.Dispatch(kA, groupsA, 1, 1);
             }
@@ -414,6 +402,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
                 m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
                 m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsB = (m_UnmatchedRightCount + 63) / 64;
                 m_MorphShader.Dispatch(kB, groupsB, 1, 1);
             }

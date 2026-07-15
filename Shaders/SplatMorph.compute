@@ -50,6 +50,11 @@ uint _OutOffset;     // first output index for this unmatched block
 float3 _OutBoundsMin;
 float3 _OutBoundsMax;
 
+// Debug: when nonzero, unmatched splats are tinted solid (red=A, blue=B) instead of their
+// real color, so the fade-in/fade-out path is visually distinguishable from matched-pair lerp
+// during algorithm evaluation. Never enabled in production — see GaussianSplatMorpher's toggle.
+uint _DebugTintUnmatched;
+
 // ── Format constants (match GaussianSplatAsset.VectorFormat) ─────────────────
 #define FMT_32F 0
 #define FMT_16  1
@@ -341,6 +346,7 @@ void CopyUnmatchedA(uint3 id : SV_DispatchThreadID)
     uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidth);
     uint2 coordDst = SplatToTexCoord(dstIdx, _OutWidth);
     float4 col = DecodeChunkColor(_ColorA.Load(int3(coordSrc, 0)), _ChunksA, _ChunkCountA, srcIdx);
+    if (_DebugTintUnmatched != 0) col.rgb = float3(1, 0, 0); // red = unmatched A (fading out)
     col.a *= (1.0 - _T);
     _OutColor[coordDst] = EncodeOutputColor(col);
 }
@@ -378,6 +384,7 @@ void CopyUnmatchedB(uint3 id : SV_DispatchThreadID)
     uint2 coordSrc = SplatToTexCoord(srcIdx, _OutWidthB);
     uint2 coordDst = SplatToTexCoord(dstIdx, _OutWidth);
     float4 col = DecodeChunkColor(_ColorB.Load(int3(coordSrc, 0)), _ChunksB, _ChunkCountB, srcIdx);
+    if (_DebugTintUnmatched != 0) col.rgb = float3(0, 0.4, 1); // blue = unmatched B (fading in)
     col.a *= _T;
     _OutColor[coordDst] = EncodeOutputColor(col);
 }
