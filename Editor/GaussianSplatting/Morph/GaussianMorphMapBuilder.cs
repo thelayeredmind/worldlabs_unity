@@ -212,6 +212,152 @@ namespace GaussianSplatting.Editor
             remainingR = Array.Empty<int>();
         }
 
+        // ── Mutual top-K (symmetric greedy) correspondence ──────────────────────
+
+        /// <summary>
+        /// Abstracts the GPU dispatch for top-K candidate lists (<see cref="FindTopKMatches"/> kernel).
+        /// Same main-thread-only constraint as <see cref="ICorrespondenceDispatcher"/>. The candidate
+        /// count per splat is fixed by the shader's TOP_K compile-time constant (see kTopK in the
+        /// window's dispatcher) — not a runtime parameter, since the kernel uses a fixed-size local
+        /// array for its sorted insertion.
+        /// </summary>
+        public interface ITopKDispatcher
+        {
+            void FindTopKMatches(Vector3[] posL, Vector4[] colL, Vector3[] posR, Vector4[] colR,
+                float posWeight, float colWeight, out int[] topKIndex, out float[] topKDist);
+        }
+
+        /// <summary>
+        /// Builds correspondence via mutual/symmetric top-K agreement instead of independent argmin.
+        /// The independent-argmin round loop above (<see cref="Build"/>) feeds ResolveOneToOne raw
+        /// per-splat "closest candidate" picks with no cross-check — a hub R splat that merely looks
+        /// close to thousands of L splats' OWN nearest-neighbor searches wins one of those claims
+        /// every round, and the other thousands lose and get pushed to the next round, which is why
+        /// the round loop stalls at a small fraction resolved on real assets (measured 2-28% this
+        /// session) and dumps the rest into an unconstrained remainder fallback. Mutual top-K requires
+        /// AGREEMENT: L must have R in its own top-K AND R must have L in ITS own top-K. A hub is
+        /// unlikely to reciprocate a specific L splat's pick, since the hub's own top-K is chosen by
+        /// the SAME distance metric from the hub's actual position/color — it can only "look close" to
+        /// many L splats, not actually have many of them in ITS short list back. No remainder fallback
+        /// is used here — unmatched splats after convergence are reported honestly (matches this
+        /// session's established "judge with remainder OFF" convention), not force-matched.
+        /// </summary>
+        /// <summary>Matches the shader's TOP_K compile-time constant — see ITopKDispatcher.</summary>
+        const int kTopK = 32;
+
+        public static Result BuildViaMutualTopK(
+            Vector3[] posL, Vector3[] posR,
+            Vector4[] colL, Vector4[] colR,
+            ITopKDispatcher dispatcher,
+            float colorWeight = 0.5f,
+            IProgress<float> progress = null,
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress?.Report(0.05f);
+
+            float posWeight = 1f - colorWeight;
+
+            var pairs = new List<int2>();
+            int[] remainingL = Enumerable.Range(0, posL.Length).ToArray();
+            int[] remainingR = Enumerable.Range(0, posR.Length).ToArray();
+
+            for (int round = 0; round < kMaxMatchRounds; round++)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (remainingL.Length == 0 || remainingR.Length == 0)
+                    break;
+
+                var subPosL = remainingL.Select(i => posL[i]).ToArray();
+                var subColL = remainingL.Select(i => colL[i]).ToArray();
+                var subPosR = remainingR.Select(j => posR[j]).ToArray();
+                var subColR = remainingR.Select(j => colR[j]).ToArray();
+
+                dispatcher.FindTopKMatches(subPosL, subColL, subPosR, subColR, posWeight, colorWeight,
+                    out int[] topKIndexLtoR, out _);
+                ct.ThrowIfCancellationRequested();
+                dispatcher.FindTopKMatches(subPosR, subColR, subPosL, subColL, posWeight, colorWeight,
+                    out int[] topKIndexRtoL, out _);
+                ct.ThrowIfCancellationRequested();
+
+                ResolveMutualTopK(topKIndexLtoR, topKIndexRtoL, subPosL.Length, subPosR.Length, kTopK,
+                    out var roundPairs, out var roundUL, out var roundUR);
+
+                if (roundPairs.Length == 0)
+                    break; // no mutual agreement left — remaining splats have no reciprocal partner
+
+                foreach (var p in roundPairs)
+                    pairs.Add(new int2(remainingL[p.x], remainingR[p.y]));
+
+                remainingL = roundUL.Select(i => remainingL[i]).ToArray();
+                remainingR = roundUR.Select(j => remainingR[j]).ToArray();
+
+                progress?.Report(0.05f + 0.9f * (round + 1) / kMaxMatchRounds);
+            }
+
+            progress?.Report(1f);
+
+            return new Result
+            {
+                matchedPairs   = pairs.ToArray(),
+                unmatchedLeft  = remainingL,
+                unmatchedRight = remainingR,
+            };
+        }
+
+        /// <summary>
+        /// A pair (i,j) is accepted only if j appears in i's top-K list AND i appears in j's top-K
+        /// list — mutual agreement, no distance-based collision arbitration needed (unlike
+        /// ResolveOneToOne, which arbitrates independent-argmin's competing single picks). Each side
+        /// still enforces its own 1:1 constraint within this round: once i or j is claimed, later
+        /// agreeing pairs involving the same index are skipped, so a splat with several mutual
+        /// candidates in one round takes its FIRST (best-ranked, since top-K lists are best-first)
+        /// available one.
+        /// </summary>
+        static void ResolveMutualTopK(int[] topKIndexLtoR, int[] topKIndexRtoL, int nL, int nR, int topK,
+            out int2[] matchedPairs, out int[] unmatchedLeft, out int[] unmatchedRight)
+        {
+            var rClaimed = new bool[nR];
+            var lClaimed = new bool[nL];
+            var pairs    = new List<int2>();
+
+            for (int i = 0; i < nL; i++)
+            {
+                if (lClaimed[i]) continue;
+
+                for (int s = 0; s < topK; s++)
+                {
+                    int j = topKIndexLtoR[i * topK + s];
+                    if (j < 0 || rClaimed[j]) continue;
+
+                    bool mutual = false;
+                    for (int t = 0; t < topK; t++)
+                    {
+                        int back = topKIndexRtoL[j * topK + t];
+                        if (back < 0) break; // top-K lists are best-first with -1 padding at the tail
+                        if (back == i) { mutual = true; break; }
+                    }
+
+                    if (mutual)
+                    {
+                        pairs.Add(new int2(i, j));
+                        lClaimed[i] = true;
+                        rClaimed[j] = true;
+                        break;
+                    }
+                }
+            }
+
+            var uL = new List<int>();
+            for (int i = 0; i < nL; i++) if (!lClaimed[i]) uL.Add(i);
+            var uR = new List<int>();
+            for (int j = 0; j < nR; j++) if (!rClaimed[j]) uR.Add(j);
+
+            matchedPairs   = pairs.ToArray();
+            unmatchedLeft  = uL.ToArray();
+            unmatchedRight = uR.ToArray();
+        }
+
         // ── Probe-based correspondence ──────────────────────────────────────────
 
         /// <summary>
