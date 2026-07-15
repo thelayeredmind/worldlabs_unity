@@ -67,6 +67,15 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.PropertyField(m_MorphMap);
             bool morphMapFieldChanged = EditorGUI.EndChangeCheck();
 
+            var currentMap = m_MorphMap.objectReferenceValue as GaussianMorphMap;
+            if (currentMap != null)
+            {
+                int matched = currentMap.MatchedCount;
+                int total = Mathf.Max(currentMap.splatCountLeft, 1);
+                EditorGUILayout.LabelField("Matched / Unmatched",
+                    $"{matched} / {currentMap.unmatchedLeft?.Length ?? 0} ({matched * 100f / total:F1}% matched)");
+            }
+
             // Auto-locate only when the assets themselves changed — NOT just because the field is
             // null, since an empty MorphMap is now a valid deliberate choice (all-unmatched/pure-fade
             // baseline). Re-locating on every repaint would silently overwrite that choice.
