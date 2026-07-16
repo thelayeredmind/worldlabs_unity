@@ -21,18 +21,26 @@ namespace GaussianSplatting.Editor
         const string kPrefOutputFolder = "GaussianSplatting.MorphMapBuilder.OutputFolder";
         const string kShaderPath       = "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatCorrespondence.compute";
 
+        enum CorrespondenceAlgorithm
+        {
+            RoundBased,
+            SpatialProbes,
+            MutualTopK,
+            GaleShapley,
+            Simple,
+        }
+
         [SerializeField] GaussianSplatAsset m_AssetLeft;
         [SerializeField] GaussianSplatAsset m_AssetRight;
         [SerializeField] string m_OutputFolder = "Assets/GaussianAssets";
         [SerializeField] float  m_ColorWeight  = 0.5f;
-        [SerializeField] bool   m_UseSpatialProbes;
-        [SerializeField] bool   m_UseMutualTopK;
-        [SerializeField] bool   m_UseRemainderFallback = true;
-        [SerializeField] bool   m_UseGaleShapley;
+        [SerializeField] CorrespondenceAlgorithm m_Algorithm = CorrespondenceAlgorithm.RoundBased;
+        [SerializeField] bool   m_ForceMatchPass = true;
 
         [SerializeField] GaussianMorphMap m_SampleMap;
         [SerializeField] int m_SampleCount = 20;
         [SerializeField] float m_ProbeAccuracy = 1f;
+        [SerializeField] bool  m_ShowDiagnostics;
         string m_SampleReport;
 
         string m_Status;
@@ -166,33 +174,32 @@ namespace GaussianSplatting.Editor
             m_AssetRight = (GaussianSplatAsset)EditorGUILayout.ObjectField("Asset Right", m_AssetRight, typeof(GaussianSplatAsset), false);
 
             EditorGUILayout.Space(4);
-            m_ColorWeight = EditorGUILayout.Slider(
-                new GUIContent("Color weight", "0 = position only, 1 = color only"),
-                m_ColorWeight, 0f, 1f);
+            m_Algorithm = (CorrespondenceAlgorithm)EditorGUILayout.EnumPopup(
+                new GUIContent("Correspondence Algorithm", "Round-based: independent per-splat argmin, greedy collision resolution. Spatial Probes: partitions both clouds into a shared spatial grid before matching. Mutual Top-K: L and R only match when each picks the other back within its own top-K candidates. GS-Matching: mutual-best stable matching (Yu et al., arXiv:2412.04855) — structurally resists hubness/mass-convergence. Simple: no matching pass at all, every splat handed straight to the Remainder Resolver — isolates the resolver's own behavior."),
+                m_Algorithm);
 
             EditorGUILayout.Space(4);
-            m_UseSpatialProbes = EditorGUILayout.Toggle(
-                new GUIContent("Use spatial probes (experimental)", "Partitions both clouds into a shared spatial grid before matching, instead of the round-based greedy search."),
-                m_UseSpatialProbes);
-            using (new EditorGUI.DisabledScope(!m_UseSpatialProbes))
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.PrefixLabel(new GUIContent("Match weight", "0 = position only, 1 = color only"));
+                GUILayout.Label("Position", GUILayout.Width(50));
+                m_ColorWeight = GUILayout.HorizontalSlider(m_ColorWeight, 0f, 1f);
+                GUILayout.Label("Color", GUILayout.Width(40));
+            }
+
+            if (m_Algorithm == CorrespondenceAlgorithm.SpatialProbes)
                 m_ProbeAccuracy = EditorGUILayout.Slider("Probe Accuracy %", m_ProbeAccuracy, 0.01f, 1f);
 
             EditorGUILayout.Space(4);
-            using (new EditorGUI.DisabledScope(m_UseSpatialProbes))
-                m_UseMutualTopK = EditorGUILayout.Toggle(
-                    new GUIContent("Use mutual top-K (symmetric greedy, experimental)", "Matches L and R only when each picks the other back within its own top-K candidates, instead of independent per-splat argmin. No remainder fallback — unmatched splats after convergence are reported honestly."),
-                    m_UseMutualTopK);
-
-            EditorGUILayout.Space(4);
-            using (new EditorGUI.DisabledScope(m_UseSpatialProbes || m_UseMutualTopK))
-                m_UseRemainderFallback = EditorGUILayout.Toggle(
-                    new GUIContent("Use remainder fallback (round-based only)", "When off, the round-based build reports its OWN unpadded match quality instead of silently filling gaps with an unconstrained full-cloud nearest-neighbor search — a diagnostic to see ground-truth match quality without the fallback's influence. Always off for spatial probes and mutual top-K."),
-                    m_UseRemainderFallback);
-
-            EditorGUILayout.Space(4);
-            m_UseGaleShapley = EditorGUILayout.Toggle(
-                new GUIContent("Use GS-Matching (Gale-Shapley, experimental)", "Mutual-best stable matching (Yu et al., arXiv:2412.04855) instead of independent-argmin greedy — both L and R must agree each round before a pair is confirmed, which structurally prevents hubness/mass-convergence. Falls back to plain nearest-neighbor for anything unmatched after the round cap."),
-                m_UseGaleShapley);
+            using (new EditorGUI.DisabledScope(m_Algorithm == CorrespondenceAlgorithm.Simple))
+            {
+                bool forceMatchPassDisplay = m_Algorithm == CorrespondenceAlgorithm.Simple ? true : m_ForceMatchPass;
+                bool newForceMatchPass = EditorGUILayout.Toggle(
+                    new GUIContent("Force Match Pass", "Guarantees every splat ends up matched by filling any gaps left after the chosen algorithm converges with an unconstrained nearest-neighbor pass. When off, the build reports the algorithm's own raw match quality instead — a diagnostic to see ground-truth quality without the fallback's influence. Locked on for Simple, which IS the resolver run in isolation."),
+                    forceMatchPassDisplay);
+                if (m_Algorithm != CorrespondenceAlgorithm.Simple)
+                    m_ForceMatchPass = newForceMatchPass;
+            }
 
             EditorGUILayout.Space(4);
             using (new EditorGUILayout.HorizontalScope())
@@ -224,46 +231,68 @@ namespace GaussianSplatting.Editor
             }
 
             EditorGUILayout.Space(12);
-            EditorGUILayout.LabelField("Match Quality Sample", EditorStyles.boldLabel);
-            m_SampleMap   = (GaussianMorphMap)EditorGUILayout.ObjectField("Map",     m_SampleMap,   typeof(GaussianMorphMap),   false);
-            m_SampleCount = EditorGUILayout.IntField("Sample count", m_SampleCount);
-
-            using (new EditorGUI.DisabledScope(m_SampleMap == null || m_AssetLeft == null || m_AssetRight == null))
+            m_ShowDiagnostics = EditorGUILayout.Foldout(m_ShowDiagnostics, "Diagnostics", true);
+            if (m_ShowDiagnostics)
             {
-                if (GUILayout.Button("Sample Match Quality"))
-                    RunSampleMatchQuality();
-            }
+                EditorGUI.indentLevel++;
 
-            using (new EditorGUI.DisabledScope(m_SampleMap == null))
-            {
-                if (GUILayout.Button("Analyze Duplicates"))
-                    RunAnalyzeDuplicates();
-            }
+                EditorGUILayout.LabelField("Analyze Morphmap", EditorStyles.boldLabel);
+                m_SampleMap   = (GaussianMorphMap)EditorGUILayout.ObjectField("Map",     m_SampleMap,   typeof(GaussianMorphMap),   false);
+                m_SampleCount = EditorGUILayout.IntField("Sample count", m_SampleCount);
 
-            using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
-            {
-                if (GUILayout.Button("Analyze Candidate Collisions"))
-                    RunAnalyzeCandidateCollisions();
-            }
+                using (new EditorGUI.DisabledScope(m_SampleMap == null || m_AssetLeft == null || m_AssetRight == null))
+                {
+                    if (GUILayout.Button("Sample Match Quality"))
+                        RunSampleMatchQuality();
+                }
 
-            using (new EditorGUI.DisabledScope(m_SampleMap == null || m_AssetRight == null))
-            {
-                if (GUILayout.Button("Top Duplicated R Splats"))
-                    RunTopDuplicatedRight();
-            }
+                using (new EditorGUI.DisabledScope(m_SampleMap == null))
+                {
+                    if (GUILayout.Button("Analyze Duplicates"))
+                        RunAnalyzeDuplicates();
+                }
 
-            using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
-            {
-                if (GUILayout.Button("Verify Top-K Matches Kernel"))
-                    RunVerifyTopKMatches();
-            }
+                using (new EditorGUI.DisabledScope(m_SampleMap == null || m_AssetRight == null))
+                {
+                    if (GUILayout.Button("Top Duplicated R Splats"))
+                        RunTopDuplicatedRight();
+                }
 
-            EditorGUILayout.Space(8);
-            EditorGUILayout.LabelField("Spatial Probe Partitioning (experimental)", EditorStyles.boldLabel);
-            using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
-            {
-                if (GUILayout.Button("Analyze Spatial Probe Occupancy"))
-                    RunAnalyzeSpatialProbeOccupancy();
+                EditorGUILayout.Space(8);
+                EditorGUILayout.LabelField("Analyze Morph Candidates", EditorStyles.boldLabel);
+
+                // Each button below only applies to one Correspondence Algorithm — shown only when
+                // that algorithm is the active dropdown selection, not just disabled, since a visible-
+                // but-inert button for an algorithm the user isn't even using is exactly the clutter
+                // this Diagnostics fold was meant to remove.
+                if (m_Algorithm == CorrespondenceAlgorithm.RoundBased)
+                {
+                    using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
+                    {
+                        if (GUILayout.Button("Analyze Candidate Collisions"))
+                            RunAnalyzeCandidateCollisions();
+                    }
+                }
+
+                if (m_Algorithm == CorrespondenceAlgorithm.MutualTopK)
+                {
+                    using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
+                    {
+                        if (GUILayout.Button("Verify Top-K Matches Kernel"))
+                            RunVerifyTopKMatches();
+                    }
+                }
+
+                if (m_Algorithm == CorrespondenceAlgorithm.SpatialProbes)
+                {
+                    using (new EditorGUI.DisabledScope(m_AssetLeft == null || m_AssetRight == null || m_Building))
+                    {
+                        if (GUILayout.Button("Analyze Spatial Probe Occupancy"))
+                            RunAnalyzeSpatialProbeOccupancy();
+                    }
+                }
+
+                EditorGUI.indentLevel--;
             }
 
             if (!string.IsNullOrEmpty(m_SampleReport))
@@ -413,11 +442,9 @@ namespace GaussianSplatting.Editor
             var assetLeft   = m_AssetLeft;
             var assetRight  = m_AssetRight;
             float colorWeight = m_ColorWeight;
-            bool useSpatialProbes = m_UseSpatialProbes;
-            bool useMutualTopK = m_UseMutualTopK;
+            var algorithm = m_Algorithm;
             float probeAccuracy = m_ProbeAccuracy;
-            bool useRemainderFallback = m_UseRemainderFallback;
-            bool useGaleShapley = m_UseGaleShapley;
+            bool forceMatchPass = m_ForceMatchPass;
             var ct = m_Cts.Token;
 
             var dispatcher = new MainThreadDispatcher(this);
@@ -433,27 +460,31 @@ namespace GaussianSplatting.Editor
                 try
                 {
                     GaussianMorphMapBuilder.Result result;
-                    if (useSpatialProbes)
+                    switch (algorithm)
                     {
-                        m_Status = "Partitioning into probes and resolving…";
-                        result = GaussianMorphMapBuilder.BuildViaProbes(posL, posR, colL, colR,
-                            gridStrategy, resolutionStrategy, probeAccuracy, colorWeight, prog);
-                    }
-                    else if (useGaleShapley)
-                    {
-                        m_Status = "Running GS-Matching (mutual-best stable matching)…";
-                        result = GaussianMorphMapBuilder.BuildViaGaleShapley(posL, posR, colL, colR,
-                            galeShapleyDispatcher, colorWeight, prog, ct);
-                    }
-                    else if (useMutualTopK)
-                    {
-                        m_Status = "Matching via mutual top-K agreement…";
-                        result = GaussianMorphMapBuilder.BuildViaMutualTopK(posL, posR, colL, colR,
-                            topKDispatcher, colorWeight, prog, ct);
-                    }
-                    else
-                    {
-                        result = GaussianMorphMapBuilder.Build(posL, posR, colL, colR, dispatcher, colorWeight, prog, ct, useRemainderFallback);
+                        case CorrespondenceAlgorithm.SpatialProbes:
+                            m_Status = "Partitioning into probes and resolving…";
+                            result = GaussianMorphMapBuilder.BuildViaProbes(posL, posR, colL, colR,
+                                gridStrategy, resolutionStrategy, probeAccuracy, colorWeight, prog);
+                            break;
+                        case CorrespondenceAlgorithm.GaleShapley:
+                            m_Status = "Running GS-Matching (mutual-best stable matching)…";
+                            result = GaussianMorphMapBuilder.BuildViaGaleShapley(posL, posR, colL, colR,
+                                galeShapleyDispatcher, colorWeight, prog, ct);
+                            break;
+                        case CorrespondenceAlgorithm.MutualTopK:
+                            m_Status = "Matching via mutual top-K agreement…";
+                            result = GaussianMorphMapBuilder.BuildViaMutualTopK(posL, posR, colL, colR,
+                                topKDispatcher, colorWeight, prog, ct);
+                            break;
+                        case CorrespondenceAlgorithm.Simple:
+                            m_Status = "Running Remainder Resolver directly (no matching pass)…";
+                            result = GaussianMorphMapBuilder.BuildViaSimple(posL, posR, colL, colR,
+                                new GaussianMorphMapBuilder.NearestNeighborRemainderResolver(dispatcher), colorWeight, prog, ct);
+                            break;
+                        default:
+                            result = GaussianMorphMapBuilder.Build(posL, posR, colL, colR, dispatcher, colorWeight, prog, ct, forceMatchPass);
+                            break;
                     }
 
                     m_Status = $"Done — {result.matchedPairs.Length} matched, {result.unmatchedLeft.Length} + {result.unmatchedRight.Length} unmatched.";

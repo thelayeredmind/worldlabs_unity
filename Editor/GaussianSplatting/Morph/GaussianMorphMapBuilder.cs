@@ -88,8 +88,10 @@ namespace GaussianSplatting.Editor
             float colorWeight = 0.5f,
             IProgress<float> progress = null,
             CancellationToken ct = default,
-            bool useRemainderFallback = true)
+            bool useRemainderFallback = true,
+            IRemainderResolver remainderResolver = null)
         {
+            remainderResolver ??= new NearestNeighborRemainderResolver(dispatcher);
             ct.ThrowIfCancellationRequested();
             progress?.Report(0.05f);
 
@@ -157,7 +159,7 @@ namespace GaussianSplatting.Editor
             // no locality constraint; it can be doing most of the real matching work and silently
             // masking a poor round-loop result behind a clean "few unmatched" status).
             if (useRemainderFallback)
-                ResolveRemainderOnGpu(posL, posR, colL, colR, dispatcher, posWeight, colorWeight,
+                remainderResolver.Resolve(posL, posR, colL, colR, posWeight, colorWeight,
                     ref remainingL, ref remainingR, pairs, ct);
 
             progress?.Report(1f);
@@ -171,45 +173,107 @@ namespace GaussianSplatting.Editor
         }
 
         /// <summary>
-        /// Resolves splats still unmatched on both sides after the round loop. Unlike the main
-        /// matching pass, this does not enforce one-to-one uniqueness — each leftover splat is
-        /// paired with its nearest neighbor in the full opposite set (matched splats included),
-        /// so a destination splat may end up claimed by several leftover splats. That is fine for
-        /// morphing purposes: the goal is that every splat converges to some position, not that
-        /// every pairing is exclusive. The search is dispatched on the GPU (same kernel/weights as
-        /// the round loop) since it is the same O(n*m) distance search as the main matching pass —
+        /// Fills in splats still unmatched on one or both sides after an algorithm's main matching
+        /// pass. Deliberately decoupled from any one algorithm: an algorithm calls a resolver
+        /// whenever ITS OWN convergence logic decides to — typically once, as a cleanup pass after
+        /// the main pass completes, but nothing requires that timing (e.g. an algorithm could invoke
+        /// one mid-run, between internal rounds, if its own logic needs that). Implementations don't
+        /// enforce one-to-one uniqueness — the only guarantee is that every remaining splat gets
+        /// SOME destination, not that every pairing is exclusive, which is all morphing actually
+        /// requires (see Build's remainder-fallback header comment for the full rationale).
+        /// </summary>
+        public interface IRemainderResolver
+        {
+            /// <summary>
+            /// Resolves every remaining index in remainingL/remainingR against the full opposite set
+            /// (matched or not), appending resolved pairs to <paramref name="pairs"/> and clearing
+            /// remainingL/remainingR once done. Must be called on the main thread if the
+            /// implementation dispatches to the GPU.
+            /// </summary>
+            void Resolve(
+                Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
+                float posWeight, float colWeight,
+                ref int[] remainingL, ref int[] remainingR,
+                List<int2> pairs, CancellationToken ct);
+        }
+
+        /// <summary>
+        /// Default <see cref="IRemainderResolver"/>: each leftover splat is paired with its nearest
+        /// neighbor in the full opposite set (matched splats included), duplicates allowed. The
+        /// search is dispatched on the GPU (same kernel/weights as the main matching pass, via
+        /// <see cref="ICorrespondenceDispatcher"/>) since it is the same O(n*m) distance search —
         /// running it on CPU instead would be orders of magnitude slower at real asset scale.
         /// </summary>
-        static void ResolveRemainderOnGpu(
-            Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
-            ICorrespondenceDispatcher dispatcher, float posWeight, float colWeight,
-            ref int[] remainingL, ref int[] remainingR,
-            List<int2> pairs, CancellationToken ct)
+        public sealed class NearestNeighborRemainderResolver : IRemainderResolver
         {
-            if (remainingL.Length > 0 && posR.Length > 0)
-            {
-                ct.ThrowIfCancellationRequested();
-                var subPosL = remainingL.Select(i => posL[i]).ToArray();
-                var subColL = remainingL.Select(i => colL[i]).ToArray();
-                dispatcher.FindBestMatches(subPosL, subColL, posR, colR, posWeight, colWeight,
-                    out int[] bestMatch, out _, out _);
-                for (int i = 0; i < remainingL.Length; i++)
-                    pairs.Add(new int2(remainingL[i], bestMatch[i]));
-            }
+            readonly ICorrespondenceDispatcher m_Dispatcher;
+            public NearestNeighborRemainderResolver(ICorrespondenceDispatcher dispatcher) => m_Dispatcher = dispatcher;
 
-            if (remainingR.Length > 0 && posL.Length > 0)
+            public void Resolve(
+                Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
+                float posWeight, float colWeight,
+                ref int[] remainingL, ref int[] remainingR,
+                List<int2> pairs, CancellationToken ct)
             {
-                ct.ThrowIfCancellationRequested();
-                var subPosR = remainingR.Select(j => posR[j]).ToArray();
-                var subColR = remainingR.Select(j => colR[j]).ToArray();
-                dispatcher.FindBestMatches(subPosR, subColR, posL, colL, posWeight, colWeight,
-                    out int[] bestMatch, out _, out _);
-                for (int j = 0; j < remainingR.Length; j++)
-                    pairs.Add(new int2(bestMatch[j], remainingR[j]));
-            }
+                if (remainingL.Length > 0 && posR.Length > 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var subPosL = remainingL.Select(i => posL[i]).ToArray();
+                    var subColL = remainingL.Select(i => colL[i]).ToArray();
+                    m_Dispatcher.FindBestMatches(subPosL, subColL, posR, colR, posWeight, colWeight,
+                        out int[] bestMatch, out _, out _);
+                    for (int i = 0; i < remainingL.Length; i++)
+                        pairs.Add(new int2(remainingL[i], bestMatch[i]));
+                }
 
-            remainingL = Array.Empty<int>();
-            remainingR = Array.Empty<int>();
+                if (remainingR.Length > 0 && posL.Length > 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var subPosR = remainingR.Select(j => posR[j]).ToArray();
+                    var subColR = remainingR.Select(j => colR[j]).ToArray();
+                    m_Dispatcher.FindBestMatches(subPosR, subColR, posL, colL, posWeight, colWeight,
+                        out int[] bestMatch, out _, out _);
+                    for (int j = 0; j < remainingR.Length; j++)
+                        pairs.Add(new int2(bestMatch[j], remainingR[j]));
+                }
+
+                remainingL = Array.Empty<int>();
+                remainingR = Array.Empty<int>();
+            }
+        }
+
+        /// <summary>
+        /// No matching pass at all — every L and R splat starts unmatched and is handed straight to
+        /// an <see cref="IRemainderResolver"/>. Exists to observe a resolver's own behavior in
+        /// isolation, decoupled from any real correspondence algorithm's influence.
+        /// </summary>
+        public static Result BuildViaSimple(
+            Vector3[] posL, Vector3[] posR,
+            Vector4[] colL, Vector4[] colR,
+            IRemainderResolver remainderResolver,
+            float colorWeight = 0.5f,
+            IProgress<float> progress = null,
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress?.Report(0.05f);
+
+            float posWeight = 1f - colorWeight;
+            var pairs = new List<int2>();
+            int[] remainingL = Enumerable.Range(0, posL.Length).ToArray();
+            int[] remainingR = Enumerable.Range(0, posR.Length).ToArray();
+
+            remainderResolver.Resolve(posL, posR, colL, colR, posWeight, colorWeight,
+                ref remainingL, ref remainingR, pairs, ct);
+
+            progress?.Report(1f);
+
+            return new Result
+            {
+                matchedPairs   = pairs.ToArray(),
+                unmatchedLeft  = remainingL,
+                unmatchedRight = remainingR,
+            };
         }
 
         // ── GS-Matching (Gale-Shapley-inspired stable matching) ─────────────────
