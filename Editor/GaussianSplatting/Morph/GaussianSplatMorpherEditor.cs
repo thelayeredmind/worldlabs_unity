@@ -71,9 +71,11 @@ namespace GaussianSplatting.Editor
             if (currentMap != null)
             {
                 int matched = currentMap.MatchedCount;
-                int total = Mathf.Max(currentMap.splatCountLeft, 1);
+                int unmatchedLeft = currentMap.unmatchedLeft?.Length ?? 0;
+                int unmatchedRight = currentMap.unmatchedRight?.Length ?? 0;
+                int total = Mathf.Max(matched + unmatchedLeft + unmatchedRight, 1);
                 EditorGUILayout.LabelField("Matched / Unmatched",
-                    $"{matched} / {currentMap.unmatchedLeft?.Length ?? 0} ({matched * 100f / total:F1}% matched)");
+                    $"{matched} / {unmatchedLeft + unmatchedRight} ({matched * 100f / total:F1}% matched)");
             }
 
             // Auto-locate only when the assets themselves changed — NOT just because the field is
