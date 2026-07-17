@@ -132,10 +132,26 @@ namespace GaussianSplatting.Runtime
         int  m_KernelCopyUnmatchedA;
         int  m_KernelCopyUnmatchedB;
 
-        // Combined world-space bounds covering both assets — output chunk
+        // Combined world-space bounds covering both assets — used for the MATCHED-PAIR output
+        // range only (MorphSplats lerps worldPosA/worldPosB directly, so both sides genuinely
+        // need one shared coordinate space to land in).
         GraphicsBuffer m_BufOutChunk;
         Vector3 m_WorldBoundsMin;
         Vector3 m_WorldBoundsMax;
+
+        // Each source asset's OWN bounds — used for the unmatched-A / unmatched-B output ranges.
+        // Unmatched splats have no correspondence to lerp toward (t only ever scales their
+        // opacity), so there is no reason to quantize their position against the OTHER asset's
+        // extent at all. Pairing a small asset (e.g. ~1 unit across) with a much larger one
+        // (e.g. ~470 units) previously forced both through m_WorldBoundsMin/Max's shared 11-bit
+        // EncodeNorm11 grid — the small asset's entire geometry collapsed onto a handful of
+        // coarse grid cells (a visible regular lattice), independent of and unrelated to the
+        // scale-saturation bug found earlier the same session. Fixed by never sharing bounds for
+        // splats that never lerp with anything on the other side.
+        Vector3 m_BoundsMinLeft;
+        Vector3 m_BoundsMaxLeft;
+        Vector3 m_BoundsMinRight;
+        Vector3 m_BoundsMaxRight;
 
         // ── Unity messages ────────────────────────────────────────────────────
 
@@ -378,8 +394,11 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetFloat("_T",             m_T);
                 m_MorphShader.SetInt("_SplatFormatA",    (int)m_SplatFormat);
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
-                m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
-                m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                // Left's own bounds, not the combined union — unmatched splats never lerp
+                // toward anything on the other side, so there is no reason to share a
+                // coordinate space (and every reason not to — see field doc comment above).
+                m_MorphShader.SetVector("_OutBoundsMin", m_BoundsMinLeft);
+                m_MorphShader.SetVector("_OutBoundsMax", m_BoundsMaxLeft);
                 m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsA = (m_UnmatchedLeftCount + 63) / 64;
                 m_MorphShader.Dispatch(kA, groupsA, 1, 1);
@@ -407,8 +426,10 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetInt("_SplatFormatB",    (int)m_SplatFormatB);
                 m_MorphShader.SetInt("_OutWidthB",       (int)m_OutTexWidthB);
                 m_MorphShader.SetInt("_OutWidth",        (int)m_OutTexWidth);
-                m_MorphShader.SetVector("_OutBoundsMin", m_WorldBoundsMin);
-                m_MorphShader.SetVector("_OutBoundsMax", m_WorldBoundsMax);
+                // Right's own bounds, not the combined union — see CopyUnmatchedA's identical
+                // reasoning above; Pass 3 is the mirror case for the other side.
+                m_MorphShader.SetVector("_OutBoundsMin", m_BoundsMinRight);
+                m_MorphShader.SetVector("_OutBoundsMax", m_BoundsMaxRight);
                 m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsB = (m_UnmatchedRightCount + 63) / 64;
                 m_MorphShader.Dispatch(kB, groupsB, 1, 1);
@@ -417,33 +438,52 @@ namespace GaussianSplatting.Runtime
 
         void ComputeOutputBoundsAndChunk()
         {
-            m_WorldBoundsMin = new Vector3(float.MaxValue,  float.MaxValue,  float.MaxValue);
-            m_WorldBoundsMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+            (m_BoundsMinLeft, m_BoundsMaxLeft)   = ComputeAssetBounds(m_AssetLeft);
+            (m_BoundsMinRight, m_BoundsMaxRight) = ComputeAssetBounds(m_AssetRight);
+            m_WorldBoundsMin = Vector3.Min(m_BoundsMinLeft, m_BoundsMinRight);
+            m_WorldBoundsMax = Vector3.Max(m_BoundsMaxLeft, m_BoundsMaxRight);
 
-            AccumulateAssetBounds(m_AssetLeft);
-            AccumulateAssetBounds(m_AssetRight);
-
-            // Write one ChunkInfo (64 bytes) per kChunkSize splats, all with the same global bounds.
-            // This way every chunkIdx maps to a valid entry — the renderer can dechunk all splats.
-            // _SplatChunkCount > 0 makes LoadSplatData() run its dechunk path for every output splat
-            // (col = lerp(colMin,colMax,col); col.a = InvSquareCentered01(col.a); scale = lerp(sclMin,sclMax,scale)^8),
-            // so colMin/colMax and sclMin/sclMax must be identity (0,1) for the morph shader's already-final
-            // RGB and scale values to survive — only position is meant to be chunk-relative here.
+            // Write one ChunkInfo (64 bytes) per kChunkSize splats. _SplatChunkCount > 0 makes
+            // LoadSplatData() run its dechunk path for every output splat (col = lerp(colMin,colMax,col);
+            // col.a = InvSquareCentered01(col.a); scale = lerp(sclMin,sclMax,scale)^8), so colMin/colMax
+            // and sclMin/sclMax must be identity (0,1) for the morph shader's already-final RGB and
+            // scale values to survive — only position is meant to be chunk-relative here.
+            //
+            // Position bounds are NOT one global value for every chunk — each chunk uses whichever
+            // region (matched-pairs / unmatched-A / unmatched-B) its FIRST splat index falls into.
+            // Matched pairs genuinely need the shared/combined bounds (MorphSplats lerps worldPosA
+            // and worldPosB directly, so both must land in one coordinate space) — but unmatched
+            // splats have no correspondence to lerp toward (only opacity depends on t) and were
+            // previously forced through this SAME shared range regardless of the other asset's
+            // scale. Pairing a small asset with a much larger one collapsed the small asset's whole
+            // geometry onto a handful of coarse EncodeNorm11 grid cells (a visible regular lattice).
+            // A chunk that straddles two regions (region boundaries aren't generally 256-aligned)
+            // is assigned by its first splat's region only — acceptable minor precision loss at a
+            // single straddle chunk, not the systemic collapse this fixes.
             // Packed half2(min=0,max=1) = 0x3C000000 (f32tof16(1.0)=0x3C00 in the high 16 bits).
             const uint kIdentityMinMax = 0x3C000000u;
+
+            int matchedEnd = m_MatchedCount;
+            int unmatchedLeftEnd = m_MatchedCount + m_UnmatchedLeftCount;
 
             int chunkCount = (m_TotalMorphCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
             var allChunkBytes = new byte[chunkCount * 64];
             for (int c = 0; c < chunkCount; c++)
             {
+                int firstSplat = c * GaussianSplatAsset.kChunkSize;
+                Vector3 chunkBoundsMin, chunkBoundsMax;
+                if (firstSplat < matchedEnd)      { chunkBoundsMin = m_WorldBoundsMin;  chunkBoundsMax = m_WorldBoundsMax; }
+                else if (firstSplat < unmatchedLeftEnd) { chunkBoundsMin = m_BoundsMinLeft;  chunkBoundsMax = m_BoundsMaxLeft; }
+                else                               { chunkBoundsMin = m_BoundsMinRight; chunkBoundsMax = m_BoundsMaxRight; }
+
                 int b = c * 64;
                 WriteUInt(allChunkBytes, b + 0,  kIdentityMinMax); // colR
                 WriteUInt(allChunkBytes, b + 4,  kIdentityMinMax); // colG
                 WriteUInt(allChunkBytes, b + 8,  kIdentityMinMax); // colB
                 WriteUInt(allChunkBytes, b + 12, kIdentityMinMax); // colA
-                WriteFloat(allChunkBytes, b + 16, m_WorldBoundsMin.x); WriteFloat(allChunkBytes, b + 20, m_WorldBoundsMax.x);
-                WriteFloat(allChunkBytes, b + 24, m_WorldBoundsMin.y); WriteFloat(allChunkBytes, b + 28, m_WorldBoundsMax.y);
-                WriteFloat(allChunkBytes, b + 32, m_WorldBoundsMin.z); WriteFloat(allChunkBytes, b + 36, m_WorldBoundsMax.z);
+                WriteFloat(allChunkBytes, b + 16, chunkBoundsMin.x); WriteFloat(allChunkBytes, b + 20, chunkBoundsMax.x);
+                WriteFloat(allChunkBytes, b + 24, chunkBoundsMin.y); WriteFloat(allChunkBytes, b + 28, chunkBoundsMax.y);
+                WriteFloat(allChunkBytes, b + 32, chunkBoundsMin.z); WriteFloat(allChunkBytes, b + 36, chunkBoundsMax.z);
                 WriteUInt(allChunkBytes, b + 40, kIdentityMinMax); // sclX
                 WriteUInt(allChunkBytes, b + 44, kIdentityMinMax); // sclY
                 WriteUInt(allChunkBytes, b + 48, kIdentityMinMax); // sclZ
@@ -453,29 +493,29 @@ namespace GaussianSplatting.Runtime
             m_BufOutChunk.SetData(allChunkBytes);
         }
 
-        void AccumulateAssetBounds(GaussianSplatAsset asset)
+        // Computes an asset's own real position bounds — chunk-union for compressed assets,
+        // asset-level import-time bounds for uncompressed ones.
+        static (Vector3 min, Vector3 max) ComputeAssetBounds(GaussianSplatAsset asset)
         {
             var layer = asset.LayerData[0];
             if (layer.m_ChunkData == null)
-            {
-                // Uncompressed assets have no per-chunk bounds to read — fall back to the
-                // asset-level bounds computed at import time.
-                m_WorldBoundsMin = Vector3.Min(m_WorldBoundsMin, asset.boundsMin);
-                m_WorldBoundsMax = Vector3.Max(m_WorldBoundsMax, asset.boundsMax);
-                return;
-            }
+                return (asset.boundsMin, asset.boundsMax);
+
+            var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
             var chunkBytes = layer.m_ChunkData.GetData<byte>();
             int chunkCount = chunkBytes.Length / 64;
             for (int i = 0; i < chunkCount; i++)
             {
                 int b = i * 64;
-                m_WorldBoundsMin.x = Mathf.Min(m_WorldBoundsMin.x, ReadFloat(chunkBytes, b + 16));
-                m_WorldBoundsMax.x = Mathf.Max(m_WorldBoundsMax.x, ReadFloat(chunkBytes, b + 20));
-                m_WorldBoundsMin.y = Mathf.Min(m_WorldBoundsMin.y, ReadFloat(chunkBytes, b + 24));
-                m_WorldBoundsMax.y = Mathf.Max(m_WorldBoundsMax.y, ReadFloat(chunkBytes, b + 28));
-                m_WorldBoundsMin.z = Mathf.Min(m_WorldBoundsMin.z, ReadFloat(chunkBytes, b + 32));
-                m_WorldBoundsMax.z = Mathf.Max(m_WorldBoundsMax.z, ReadFloat(chunkBytes, b + 36));
+                min.x = Mathf.Min(min.x, ReadFloat(chunkBytes, b + 16));
+                max.x = Mathf.Max(max.x, ReadFloat(chunkBytes, b + 20));
+                min.y = Mathf.Min(min.y, ReadFloat(chunkBytes, b + 24));
+                max.y = Mathf.Max(max.y, ReadFloat(chunkBytes, b + 28));
+                min.z = Mathf.Min(min.z, ReadFloat(chunkBytes, b + 32));
+                max.z = Mathf.Max(max.z, ReadFloat(chunkBytes, b + 36));
             }
+            return (min, max);
         }
 
         static float ReadFloat(Unity.Collections.NativeArray<byte> b, int offset) =>
