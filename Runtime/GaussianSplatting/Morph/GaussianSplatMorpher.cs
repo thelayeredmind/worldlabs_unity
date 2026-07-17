@@ -35,6 +35,11 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Tint unmatched splats solid red (fading out from Left) / blue (fading in from Right) instead of their real color, to visually isolate the fade-in/fade-out path from matched-pair interpolation when judging correspondence quality.")]
         [SerializeField] bool m_DebugTintUnmatched;
 
+        [Tooltip("Debug: hide unmatched-Left splats (the fading-out side) by forcing their output alpha to 0 — isolates the unmatched-Right/fading-in side for inspection.")]
+        [SerializeField] bool m_DebugDisableUnmatchedA;
+        [Tooltip("Debug: hide unmatched-Right splats (the fading-in side) by forcing their output alpha to 0 — isolates the unmatched-Left/fading-out side for inspection.")]
+        [SerializeField] bool m_DebugDisableUnmatchedB;
+
         // ── Public API ────────────────────────────────────────────────────────
 
         /// <summary>Blend value. 0 = AssetLeft, 1 = AssetRight. Animatable via Timeline.</summary>
@@ -413,6 +418,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetBuffer(kA, "_OutChunk", m_BufOutChunk);
                 m_MorphShader.SetInt("_OutChunkCount", m_UnmatchedSequential ? m_OutChunkCount : 0);
                 m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
+                m_MorphShader.SetInt("_DebugDisableThisPass", m_DebugDisableUnmatchedA ? 1 : 0);
                 int groupsA = (m_UnmatchedLeftCount + 63) / 64;
                 m_MorphShader.Dispatch(kA, groupsA, 1, 1);
             }
@@ -446,6 +452,7 @@ namespace GaussianSplatting.Runtime
                 m_MorphShader.SetBuffer(kB, "_OutChunk", m_BufOutChunk);
                 m_MorphShader.SetInt("_OutChunkCount", m_UnmatchedSequential ? m_OutChunkCount : 0);
                 m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
+                m_MorphShader.SetInt("_DebugDisableThisPass", m_DebugDisableUnmatchedB ? 1 : 0);
                 int groupsB = (m_UnmatchedRightCount + 63) / 64;
                 m_MorphShader.Dispatch(kB, groupsB, 1, 1);
             }
@@ -481,21 +488,19 @@ namespace GaussianSplatting.Runtime
             int matchedEnd = m_MatchedCount;
             int unmatchedLeftEnd = m_MatchedCount + m_UnmatchedLeftCount;
 
-            // Sequential case (no MorphMap): output chunk c's splats are exactly source indices
-            // [c*kChunkSize, c*kChunkSize+kChunkSize) — real LOCAL bounds for that range can be
-            // computed directly, instead of falling back to the asset's whole-extent bounds for
-            // every chunk in the region. Fixes cell-convergence: a dense/local area (e.g. flat
-            // ground) was being quantized against the FULL ~470-unit asset extent, coarse enough
-            // that many nearby splats collapsed onto the same EncodeNorm11 grid cell.
-            (Vector3 min, Vector3 max)[] localChunkBoundsLeft = null;
-            (Vector3 min, Vector3 max)[] localChunkBoundsRight = null;
-            if (m_UnmatchedSequential)
-            {
-                if (m_UnmatchedLeftCount > 0)
-                    localChunkBoundsLeft = ComputeLocalChunkBounds(m_AssetLeft);
-                if (m_UnmatchedRightCount > 0)
-                    localChunkBoundsRight = ComputeLocalChunkBounds(m_AssetRight);
-            }
+            // Sequential case (no MorphMap): output chunk c's splats are source indices
+            // [firstSplat-regionStart, firstSplat-regionStart+kChunkSize) RELATIVE TO THE REGION'S
+            // OWN START — not [0,256),[256,512)... as if the region always began 256-aligned.
+            // The unmatched-Right region's start (unmatchedLeftEnd) is only 256-aligned when
+            // Left's splat count happens to be a multiple of kChunkSize; otherwise every Right
+            // chunk after the first reads the WRONG source range if bounds are precomputed
+            // assuming index-0 alignment (found live: pairing 02_DUSK, splatCount=294404, a
+            // non-multiple of 256, as Left with 03_NIGHT as Right shifted every Right chunk's
+            // "local" bounds by a constant ~252-splat offset — visible as blocky/chunky smearing
+            // that only appeared with THAT asset in the Right role, never as Left, since Left's
+            // region always starts at output chunk 0 and is therefore always aligned by
+            // construction). Fixed by scanning each output chunk's REAL region-relative range
+            // directly, per chunk, rather than a precomputed 256-aligned-from-zero array.
 
             int chunkCount = (m_TotalMorphCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
             var allChunkBytes = new byte[chunkCount * 64];
@@ -509,17 +514,19 @@ namespace GaussianSplatting.Runtime
                 }
                 else if (firstSplat < unmatchedLeftEnd)
                 {
-                    int localChunk = (firstSplat - matchedEnd) / GaussianSplatAsset.kChunkSize;
-                    if (localChunkBoundsLeft != null && localChunk < localChunkBoundsLeft.Length)
-                        (chunkBoundsMin, chunkBoundsMax) = localChunkBoundsLeft[localChunk];
+                    int regionStart = firstSplat - matchedEnd;      // region-relative, NOT assumed 256-aligned
+                    int regionCount = m_UnmatchedLeftCount;
+                    if (m_UnmatchedSequential && regionCount > 0)
+                        (chunkBoundsMin, chunkBoundsMax) = ComputeLocalChunkBounds(m_AssetLeft, regionStart, regionCount);
                     else
                         { chunkBoundsMin = m_BoundsMinLeft;  chunkBoundsMax = m_BoundsMaxLeft; }
                 }
                 else
                 {
-                    int localChunk = (firstSplat - unmatchedLeftEnd) / GaussianSplatAsset.kChunkSize;
-                    if (localChunkBoundsRight != null && localChunk < localChunkBoundsRight.Length)
-                        (chunkBoundsMin, chunkBoundsMax) = localChunkBoundsRight[localChunk];
+                    int regionStart = firstSplat - unmatchedLeftEnd; // region-relative, NOT assumed 256-aligned
+                    int regionCount = m_UnmatchedRightCount;
+                    if (m_UnmatchedSequential && regionCount > 0)
+                        (chunkBoundsMin, chunkBoundsMax) = ComputeLocalChunkBounds(m_AssetRight, regionStart, regionCount);
                     else
                         { chunkBoundsMin = m_BoundsMinRight; chunkBoundsMax = m_BoundsMaxRight; }
                 }
@@ -547,47 +554,55 @@ namespace GaussianSplatting.Runtime
         // Compressed source: reuse its own per-chunk bounds directly (same 256-splat grouping,
         // already computed at import time). Uncompressed source (native Float32, e.g. 02_DUSK):
         // scan the raw position bytes per range directly — one-time cost at Setup(), not per-frame.
-        static (Vector3 min, Vector3 max)[] ComputeLocalChunkBounds(GaussianSplatAsset asset)
+        //
+        // regionStart/regionCount are RELATIVE TO THE UNMATCHED REGION'S OWN START, not assumed
+        // 256-aligned — the region only starts at a 256-aligned source index when the OTHER
+        // side's splat count happens to be a multiple of kChunkSize, so a fixed per-256-from-zero
+        // precomputed array (the previous approach) reads the wrong source range for every chunk
+        // after the first whenever it isn't. Computed per output chunk instead, directly from the
+        // real region-relative range — correct regardless of alignment on either side.
+        static (Vector3 min, Vector3 max) ComputeLocalChunkBounds(GaussianSplatAsset asset, int regionStart, int regionCount)
         {
             var layer = asset.LayerData[0];
-            int chunkCount = (asset.splatCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
-            var result = new (Vector3 min, Vector3 max)[chunkCount];
+            int firstSplat = regionStart;
+            int lastSplat = Mathf.Min(regionStart + GaussianSplatAsset.kChunkSize, regionCount);
+
+            var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
 
             if (layer.m_ChunkData != null)
             {
+                // Compressed source: real per-splat position isn't directly stored (only
+                // per-256-splat chunk bounds are) — union whichever source chunk(s) this
+                // region-relative range overlaps. Slightly coarser than a per-splat scan when
+                // the range straddles two source chunks, but always correct and cheap.
                 var chunkBytes = layer.m_ChunkData.GetData<byte>();
-                for (int c = 0; c < chunkCount; c++)
+                int firstSrcChunk = firstSplat / GaussianSplatAsset.kChunkSize;
+                int lastSrcChunk  = (lastSplat - 1) / GaussianSplatAsset.kChunkSize;
+                for (int sc = firstSrcChunk; sc <= lastSrcChunk; sc++)
                 {
-                    int b = c * 64;
-                    result[c] = (
-                        new Vector3(ReadFloat(chunkBytes, b + 16), ReadFloat(chunkBytes, b + 24), ReadFloat(chunkBytes, b + 32)),
-                        new Vector3(ReadFloat(chunkBytes, b + 20), ReadFloat(chunkBytes, b + 28), ReadFloat(chunkBytes, b + 36)));
+                    int b = sc * 64;
+                    min.x = Mathf.Min(min.x, ReadFloat(chunkBytes, b + 16)); max.x = Mathf.Max(max.x, ReadFloat(chunkBytes, b + 20));
+                    min.y = Mathf.Min(min.y, ReadFloat(chunkBytes, b + 24)); max.y = Mathf.Max(max.y, ReadFloat(chunkBytes, b + 28));
+                    min.z = Mathf.Min(min.z, ReadFloat(chunkBytes, b + 32)); max.z = Mathf.Max(max.z, ReadFloat(chunkBytes, b + 36));
                 }
-                return result;
+                return (min, max);
             }
 
-            // Uncompressed — posFormat is Float32 (12 bytes/splat, x/y/z), no chunking on import.
+            // Uncompressed — posFormat is Float32 (12 bytes/splat, x/y/z).
             var posBytes = layer.m_PosData.GetData<byte>();
             const int stride = 12;
-            for (int c = 0; c < chunkCount; c++)
+            for (int i = firstSplat; i < lastSplat; i++)
             {
-                var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-                var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-                int firstSplat = c * GaussianSplatAsset.kChunkSize;
-                int lastSplat = Mathf.Min(firstSplat + GaussianSplatAsset.kChunkSize, asset.splatCount);
-                for (int i = firstSplat; i < lastSplat; i++)
-                {
-                    int b = i * stride;
-                    min.x = Mathf.Min(min.x, ReadFloat(posBytes, b));
-                    max.x = Mathf.Max(max.x, ReadFloat(posBytes, b));
-                    min.y = Mathf.Min(min.y, ReadFloat(posBytes, b + 4));
-                    max.y = Mathf.Max(max.y, ReadFloat(posBytes, b + 4));
-                    min.z = Mathf.Min(min.z, ReadFloat(posBytes, b + 8));
-                    max.z = Mathf.Max(max.z, ReadFloat(posBytes, b + 8));
-                }
-                result[c] = (min, max);
+                int b = i * stride;
+                min.x = Mathf.Min(min.x, ReadFloat(posBytes, b));
+                max.x = Mathf.Max(max.x, ReadFloat(posBytes, b));
+                min.y = Mathf.Min(min.y, ReadFloat(posBytes, b + 4));
+                max.y = Mathf.Max(max.y, ReadFloat(posBytes, b + 4));
+                min.z = Mathf.Min(min.z, ReadFloat(posBytes, b + 8));
+                max.z = Mathf.Max(max.z, ReadFloat(posBytes, b + 8));
             }
-            return result;
+            return (min, max);
         }
 
         // Computes an asset's own real position bounds — chunk-union for compressed assets,

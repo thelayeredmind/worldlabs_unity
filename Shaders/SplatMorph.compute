@@ -59,6 +59,10 @@ uint _OutChunkCount;
 // real color, so the fade-in/fade-out path is visually distinguishable from matched-pair lerp
 // during algorithm evaluation. Never enabled in production — see GaussianSplatMorpher's toggle.
 uint _DebugTintUnmatched;
+// Debug: when nonzero, forces this pass's output alpha to 0 — used to isolate/inspect one
+// side's unmatched-fade contribution by hiding the other. Position/rotation/scale are still
+// written normally (only alpha is suppressed), so re-enabling shows correct data immediately.
+uint _DebugDisableThisPass;
 
 // ── Format constants (match GaussianSplatAsset.VectorFormat) ─────────────────
 #define FMT_32F 0
@@ -378,6 +382,7 @@ void CopyUnmatchedA(uint3 id : SV_DispatchThreadID)
     float4 col = DecodeChunkColor(_ColorA.Load(int3(coordSrc, 0)), _ChunksA, _ChunkCountA, srcIdx);
     if (_DebugTintUnmatched != 0) col.rgb = float3(1, 0, 0); // red = unmatched A (fading out)
     col.a *= (1.0 - _T);
+    if (_DebugDisableThisPass != 0) col.a = 0;
     _OutColor[coordDst] = EncodeOutputColor(col);
 }
 
@@ -418,5 +423,6 @@ void CopyUnmatchedB(uint3 id : SV_DispatchThreadID)
     float4 col = DecodeChunkColor(_ColorB.Load(int3(coordSrc, 0)), _ChunksB, _ChunkCountB, srcIdx);
     if (_DebugTintUnmatched != 0) col.rgb = float3(0, 0.4, 1); // blue = unmatched B (fading in)
     col.a *= _T;
+    if (_DebugDisableThisPass != 0) col.a = 0;
     _OutColor[coordDst] = EncodeOutputColor(col);
 }

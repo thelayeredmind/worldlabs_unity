@@ -14,6 +14,8 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_MorphMap;
         SerializedProperty m_T;
         SerializedProperty m_DebugTintUnmatched;
+        SerializedProperty m_DebugDisableUnmatchedA;
+        SerializedProperty m_DebugDisableUnmatchedB;
 
         void OnEnable()
         {
@@ -22,6 +24,8 @@ namespace GaussianSplatting.Editor
             m_MorphMap   = serializedObject.FindProperty("m_MorphMap");
             m_T          = serializedObject.FindProperty("m_T");
             m_DebugTintUnmatched = serializedObject.FindProperty("m_DebugTintUnmatched");
+            m_DebugDisableUnmatchedA = serializedObject.FindProperty("m_DebugDisableUnmatchedA");
+            m_DebugDisableUnmatchedB = serializedObject.FindProperty("m_DebugDisableUnmatchedB");
         }
 
         public override void OnInspectorGUI()
@@ -119,6 +123,8 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.LabelField("Interpolation", EditorStyles.boldLabel);
             EditorGUILayout.PropertyField(m_T, new GUIContent("t  (0 = Left, 1 = Right)"));
             EditorGUILayout.PropertyField(m_DebugTintUnmatched, new GUIContent("Debug Tint Unmatched", "Tint unmatched splats solid red (fading out) / blue (fading in) to visually isolate the fade path from matched-pair interpolation."));
+            EditorGUILayout.PropertyField(m_DebugDisableUnmatchedA, new GUIContent("Debug Disable Unmatched A", "Hide unmatched-Left splats (fading-out side) by forcing their output alpha to 0 — isolates the fading-in side."));
+            EditorGUILayout.PropertyField(m_DebugDisableUnmatchedB, new GUIContent("Debug Disable Unmatched B", "Hide unmatched-Right splats (fading-in side) by forcing their output alpha to 0 — isolates the fading-out side."));
 
             serializedObject.ApplyModifiedProperties();
         }
