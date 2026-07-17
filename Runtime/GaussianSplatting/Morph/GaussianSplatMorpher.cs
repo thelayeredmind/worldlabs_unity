@@ -348,10 +348,15 @@ namespace GaussianSplatting.Runtime
             m_MorphShader.SetInt(  "_OutWidth",      (int)m_OutTexWidth);
             m_MorphShader.SetInt(  "_OutWidthB",     (int)m_OutTexWidthB);
 
-            // Pass 1: matched pairs
-            int groups = (m_MatchedCount + 63) / 64;
-            if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] Dispatch MorphSplats — groups={groups} chunkA={chunkCountA} chunkB={chunkCountB} outWidth={m_OutTexWidth} outWidthB={m_OutTexWidthB}");
-            m_MorphShader.Dispatch(k, groups, 1, 1);
+            // Pass 1: matched pairs — skip when there's nothing to dispatch (e.g. no MorphMap,
+            // BuildIndexBufferAllUnmatched leaves m_MatchedCount at 0); Dispatch with 0 thread
+            // groups throws "Thread group size must be above zero" instead of being a no-op.
+            if (m_MatchedCount > 0)
+            {
+                int groups = (m_MatchedCount + 63) / 64;
+                if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] Dispatch MorphSplats — groups={groups} chunkA={chunkCountA} chunkB={chunkCountB} outWidth={m_OutTexWidth} outWidthB={m_OutTexWidthB}");
+                m_MorphShader.Dispatch(k, groups, 1, 1);
+            }
 
             // Pass 2: unmatched A — copy with opacity × (1−t), output at [matchedCount..]
             if (m_UnmatchedLeftCount > 0 && m_BufUnmatchedLeft != null && m_KernelCopyUnmatchedA >= 0)
