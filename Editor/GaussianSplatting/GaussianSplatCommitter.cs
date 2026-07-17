@@ -36,6 +36,8 @@ namespace GaussianSplatting.Editor
 
         public static void Commit(GaussianSplatRenderer gs)
         {
+            int lastProcessedSplatIdx = -1; // set inside the compaction loop, surfaced by the catch block on failure
+
             if (gs.asset.chunkDataSize > 0)
             {
                 EditorUtility.DisplayDialog("Cannot Commit",
@@ -66,6 +68,19 @@ namespace GaussianSplatting.Editor
 
                 int splatCount = gs.splatCount;
                 uint[] deletedBits = gs.SnapshotDeletedBits();
+
+                const int posStrideExpected   = 12;
+                const int otherStrideExpected = 16;
+                const int shStrideExpected    = 192;
+                const int colorBytesExpected  = 16;
+                Debug.Log($"[GaussianSplat] Commit — splatCount={splatCount} " +
+                    $"posData={posData?.Length} (expected {splatCount * posStrideExpected}) " +
+                    $"otherData={otherData?.Length} (expected {splatCount * otherStrideExpected}) " +
+                    $"shData={shData?.Length} (expected {splatCount * shStrideExpected}) " +
+                    $"colorData={colorData?.Length} (expected {splatCount * colorBytesExpected}) " +
+                    $"posFormat={gs.asset.posFormat} scaleFormat={gs.asset.scaleFormat} " +
+                    $"colorFormat={gs.asset.colorFormat} shFormat={gs.asset.shFormat} " +
+                    $"chunkDataSize={gs.asset.chunkDataSize}");
 
                 // Resolve source file paths before any writes
                 var layerData = gs.asset.LayerData;
@@ -119,6 +134,8 @@ namespace GaussianSplatting.Editor
                 int dstIdx = 0;
                 for (int i = 0; i < splatCount; i++)
                 {
+                    lastProcessedSplatIdx = i;
+
                     int wIdx = i >> 5; int bIdx = i & 31;
                     bool isDeleted = deletedBits != null && (deletedBits[wIdx] & (1u << bIdx)) != 0;
                     if (isDeleted) continue;
@@ -179,8 +196,12 @@ namespace GaussianSplatting.Editor
             catch (Exception e)
             {
                 EditorUtility.ClearProgressBar();
+                Debug.LogError($"[GaussianSplat] Commit failed at splat index {lastProcessedSplatIdx} " +
+                    $"(splatCount={gs.splatCount}, asset={AssetDatabase.GetAssetPath(gs.asset)})");
                 Debug.LogException(e);
-                EditorUtility.DisplayDialog("Error", $"Commit failed:\n{e.Message}", "OK");
+                EditorUtility.DisplayDialog("Commit Unsuccessful",
+                    $"Your splat has not been overwritten.\n\n{e.Message}\n\nSee the Console for full diagnostic details.",
+                    "OK");
             }
         }
     }
