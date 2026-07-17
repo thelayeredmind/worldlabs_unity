@@ -92,6 +92,11 @@ float _SplatScale;
 float _SplatOpacityScale;
 uint _SHOrder;
 uint _SHOnly;
+// Debug: when > 0, forces every splat's world-space scale to this uniform value on all 3 axes.
+// See SplatUtilities_DeviceRadixSort.compute for rationale — mirrored here for the FidelityFX sort path.
+float _DebugForceSplatSize;
+// Debug: when >= 0, forces every splat's alpha to this fixed value.
+float _DebugForceSplatAlpha;
 
 uint _SplatCutoutsCount;
 
@@ -286,6 +291,8 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     {
         float4 boxRot = splat.rot;
         float3 boxSize = splat.scale;
+        if (_DebugForceSplatSize > 0)
+            boxSize = _DebugForceSplatSize.xxx;
 
         float3x3 splatRotScaleMat = CalcMatrixFromRotationScale(boxRot, boxSize);
 
@@ -308,7 +315,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         // When an effect has overridden the colour entirely, replace the SH result.
         if (effectColorOverride.a >= 0)
             col.rgb = (half3)effectColorOverride.rgb;
-        col.a = min(splat.opacity * opacityScale, 65000);
+        col.a = _DebugForceSplatAlpha >= 0 ? _DebugForceSplatAlpha : min(splat.opacity * opacityScale, 65000);
         view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
         view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
     }

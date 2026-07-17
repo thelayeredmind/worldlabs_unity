@@ -124,6 +124,12 @@ namespace GaussianSplatting.Runtime
         int  m_UnmatchedRightCount;
         GraphicsBuffer m_BufUnmatchedLeft;  // int[] — indices into AssetLeft
         GraphicsBuffer m_BufUnmatchedRight; // int[] — indices into AssetRight
+        // True only for BuildIndexBufferAllUnmatched's no-MorphMap case, where unmatchedLeft/Right
+        // are the identity permutation (uL[i]=i) — lets ComputeOutputBoundsAndChunk compute real
+        // LOCAL per-chunk bounds (output chunk c == source's own contiguous [c*256, c*256+256)
+        // range) instead of one bounds pair for the whole region. A real MorphMap's unmatchedLeft/
+        // Right is an arbitrary subset with no such guarantee, so this stays false in that case.
+        bool m_UnmatchedSequential;
         uint m_SplatFormat;
         uint m_SplatFormatB;
         uint m_OutTexWidth;
@@ -136,6 +142,7 @@ namespace GaussianSplatting.Runtime
         // range only (MorphSplats lerps worldPosA/worldPosB directly, so both sides genuinely
         // need one shared coordinate space to land in).
         GraphicsBuffer m_BufOutChunk;
+        int m_OutChunkCount;
         Vector3 m_WorldBoundsMin;
         Vector3 m_WorldBoundsMax;
 
@@ -399,6 +406,12 @@ namespace GaussianSplatting.Runtime
                 // coordinate space (and every reason not to — see field doc comment above).
                 m_MorphShader.SetVector("_OutBoundsMin", m_BoundsMinLeft);
                 m_MorphShader.SetVector("_OutBoundsMax", m_BoundsMaxLeft);
+                // Per-chunk local bounds (sequential case only) — must match what the renderer
+                // will later decode against, or encode/decode disagree and positions come out
+                // garbled. Non-sequential (real MorphMap) case: _OutChunkCount=0, kernel falls
+                // back to the flat _OutBoundsMin/Max above, same as before this fix.
+                m_MorphShader.SetBuffer(kA, "_OutChunk", m_BufOutChunk);
+                m_MorphShader.SetInt("_OutChunkCount", m_UnmatchedSequential ? m_OutChunkCount : 0);
                 m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsA = (m_UnmatchedLeftCount + 63) / 64;
                 m_MorphShader.Dispatch(kA, groupsA, 1, 1);
@@ -430,6 +443,8 @@ namespace GaussianSplatting.Runtime
                 // reasoning above; Pass 3 is the mirror case for the other side.
                 m_MorphShader.SetVector("_OutBoundsMin", m_BoundsMinRight);
                 m_MorphShader.SetVector("_OutBoundsMax", m_BoundsMaxRight);
+                m_MorphShader.SetBuffer(kB, "_OutChunk", m_BufOutChunk);
+                m_MorphShader.SetInt("_OutChunkCount", m_UnmatchedSequential ? m_OutChunkCount : 0);
                 m_MorphShader.SetInt("_DebugTintUnmatched", m_DebugTintUnmatched ? 1 : 0);
                 int groupsB = (m_UnmatchedRightCount + 63) / 64;
                 m_MorphShader.Dispatch(kB, groupsB, 1, 1);
@@ -466,15 +481,48 @@ namespace GaussianSplatting.Runtime
             int matchedEnd = m_MatchedCount;
             int unmatchedLeftEnd = m_MatchedCount + m_UnmatchedLeftCount;
 
+            // Sequential case (no MorphMap): output chunk c's splats are exactly source indices
+            // [c*kChunkSize, c*kChunkSize+kChunkSize) — real LOCAL bounds for that range can be
+            // computed directly, instead of falling back to the asset's whole-extent bounds for
+            // every chunk in the region. Fixes cell-convergence: a dense/local area (e.g. flat
+            // ground) was being quantized against the FULL ~470-unit asset extent, coarse enough
+            // that many nearby splats collapsed onto the same EncodeNorm11 grid cell.
+            (Vector3 min, Vector3 max)[] localChunkBoundsLeft = null;
+            (Vector3 min, Vector3 max)[] localChunkBoundsRight = null;
+            if (m_UnmatchedSequential)
+            {
+                if (m_UnmatchedLeftCount > 0)
+                    localChunkBoundsLeft = ComputeLocalChunkBounds(m_AssetLeft);
+                if (m_UnmatchedRightCount > 0)
+                    localChunkBoundsRight = ComputeLocalChunkBounds(m_AssetRight);
+            }
+
             int chunkCount = (m_TotalMorphCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
             var allChunkBytes = new byte[chunkCount * 64];
             for (int c = 0; c < chunkCount; c++)
             {
                 int firstSplat = c * GaussianSplatAsset.kChunkSize;
                 Vector3 chunkBoundsMin, chunkBoundsMax;
-                if (firstSplat < matchedEnd)      { chunkBoundsMin = m_WorldBoundsMin;  chunkBoundsMax = m_WorldBoundsMax; }
-                else if (firstSplat < unmatchedLeftEnd) { chunkBoundsMin = m_BoundsMinLeft;  chunkBoundsMax = m_BoundsMaxLeft; }
-                else                               { chunkBoundsMin = m_BoundsMinRight; chunkBoundsMax = m_BoundsMaxRight; }
+                if (firstSplat < matchedEnd)
+                {
+                    chunkBoundsMin = m_WorldBoundsMin;  chunkBoundsMax = m_WorldBoundsMax;
+                }
+                else if (firstSplat < unmatchedLeftEnd)
+                {
+                    int localChunk = (firstSplat - matchedEnd) / GaussianSplatAsset.kChunkSize;
+                    if (localChunkBoundsLeft != null && localChunk < localChunkBoundsLeft.Length)
+                        (chunkBoundsMin, chunkBoundsMax) = localChunkBoundsLeft[localChunk];
+                    else
+                        { chunkBoundsMin = m_BoundsMinLeft;  chunkBoundsMax = m_BoundsMaxLeft; }
+                }
+                else
+                {
+                    int localChunk = (firstSplat - unmatchedLeftEnd) / GaussianSplatAsset.kChunkSize;
+                    if (localChunkBoundsRight != null && localChunk < localChunkBoundsRight.Length)
+                        (chunkBoundsMin, chunkBoundsMax) = localChunkBoundsRight[localChunk];
+                    else
+                        { chunkBoundsMin = m_BoundsMinRight; chunkBoundsMax = m_BoundsMaxRight; }
+                }
 
                 int b = c * 64;
                 WriteUInt(allChunkBytes, b + 0,  kIdentityMinMax); // colR
@@ -489,8 +537,57 @@ namespace GaussianSplatting.Runtime
                 WriteUInt(allChunkBytes, b + 48, kIdentityMinMax); // sclZ
             }
 
+            m_OutChunkCount = chunkCount;
             m_BufOutChunk = new GraphicsBuffer(GraphicsBuffer.Target.Raw, allChunkBytes.Length / 4, 4) { name = "MorphOutChunk" };
             m_BufOutChunk.SetData(allChunkBytes);
+        }
+
+        // Computes real LOCAL bounds per kChunkSize-splat range, for the sequential (no-MorphMap)
+        // unmatched case where output chunk c is exactly source splats [c*kChunkSize, ...+kChunkSize).
+        // Compressed source: reuse its own per-chunk bounds directly (same 256-splat grouping,
+        // already computed at import time). Uncompressed source (native Float32, e.g. 02_DUSK):
+        // scan the raw position bytes per range directly — one-time cost at Setup(), not per-frame.
+        static (Vector3 min, Vector3 max)[] ComputeLocalChunkBounds(GaussianSplatAsset asset)
+        {
+            var layer = asset.LayerData[0];
+            int chunkCount = (asset.splatCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
+            var result = new (Vector3 min, Vector3 max)[chunkCount];
+
+            if (layer.m_ChunkData != null)
+            {
+                var chunkBytes = layer.m_ChunkData.GetData<byte>();
+                for (int c = 0; c < chunkCount; c++)
+                {
+                    int b = c * 64;
+                    result[c] = (
+                        new Vector3(ReadFloat(chunkBytes, b + 16), ReadFloat(chunkBytes, b + 24), ReadFloat(chunkBytes, b + 32)),
+                        new Vector3(ReadFloat(chunkBytes, b + 20), ReadFloat(chunkBytes, b + 28), ReadFloat(chunkBytes, b + 36)));
+                }
+                return result;
+            }
+
+            // Uncompressed — posFormat is Float32 (12 bytes/splat, x/y/z), no chunking on import.
+            var posBytes = layer.m_PosData.GetData<byte>();
+            const int stride = 12;
+            for (int c = 0; c < chunkCount; c++)
+            {
+                var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+                var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+                int firstSplat = c * GaussianSplatAsset.kChunkSize;
+                int lastSplat = Mathf.Min(firstSplat + GaussianSplatAsset.kChunkSize, asset.splatCount);
+                for (int i = firstSplat; i < lastSplat; i++)
+                {
+                    int b = i * stride;
+                    min.x = Mathf.Min(min.x, ReadFloat(posBytes, b));
+                    max.x = Mathf.Max(max.x, ReadFloat(posBytes, b));
+                    min.y = Mathf.Min(min.y, ReadFloat(posBytes, b + 4));
+                    max.y = Mathf.Max(max.y, ReadFloat(posBytes, b + 4));
+                    min.z = Mathf.Min(min.z, ReadFloat(posBytes, b + 8));
+                    max.z = Mathf.Max(max.z, ReadFloat(posBytes, b + 8));
+                }
+                result[c] = (min, max);
+            }
+            return result;
         }
 
         // Computes an asset's own real position bounds — chunk-union for compressed assets,
@@ -589,6 +686,7 @@ namespace GaussianSplatting.Runtime
                 return;
             }
 
+            m_UnmatchedSequential = false;
             bool swapped = MapIsSwapped();
             var pairs = m_MorphMap.matchedPairs;
             m_MatchedCount = pairs.Length;
@@ -634,6 +732,7 @@ namespace GaussianSplatting.Runtime
         /// </summary>
         void BuildIndexBufferAllUnmatched()
         {
+            m_UnmatchedSequential = true;
             m_MatchedCount = 0;
             m_BufIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 8)
                 { name = "MorphIndices" }; // zero-length buffers aren't valid — kernel dispatch is skipped anyway (m_MatchedCount == 0)

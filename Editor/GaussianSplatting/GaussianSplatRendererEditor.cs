@@ -27,6 +27,10 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_PropAsset;
         SerializedProperty m_PropSplatScale;
         SerializedProperty m_PropOpacityScale;
+        SerializedProperty m_PropDebugForceUniformScale;
+        SerializedProperty m_PropDebugForceSplatSize;
+        SerializedProperty m_PropDebugForceUniformAlpha;
+        SerializedProperty m_PropDebugForceSplatAlpha;
         SerializedProperty m_PropSHOrder;
         SerializedProperty m_PropSHOnly;
         SerializedProperty m_CenterEyeOnly;
@@ -113,6 +117,10 @@ namespace GaussianSplatting.Editor
             m_PropAsset = serializedObject.FindProperty("m_Asset");
             m_PropSplatScale = serializedObject.FindProperty("m_SplatScale");
             m_PropOpacityScale = serializedObject.FindProperty("m_OpacityScale");
+            m_PropDebugForceUniformScale = serializedObject.FindProperty("m_DebugForceUniformScale");
+            m_PropDebugForceSplatSize = serializedObject.FindProperty("m_DebugForceSplatSize");
+            m_PropDebugForceUniformAlpha = serializedObject.FindProperty("m_DebugForceUniformAlpha");
+            m_PropDebugForceSplatAlpha = serializedObject.FindProperty("m_DebugForceSplatAlpha");
             m_PropSHOrder = serializedObject.FindProperty("m_SHOrder");
             m_PropSHOnly = serializedObject.FindProperty("m_SHOnly");
             m_PropRenderOrder = serializedObject.FindProperty("m_RenderOrder");
@@ -438,6 +446,13 @@ namespace GaussianSplatting.Editor
             }
             foreach (var prop in new[] { m_PropContributionCullThreshold, m_PropAlphaDiscardThreshold, m_PropHotspotDebugVisualize })
                 EditorGUILayout.PropertyField(prop);
+
+            EditorGUILayout.PropertyField(m_PropDebugForceUniformScale);
+            if (gs.m_DebugForceUniformScale)
+                EditorGUILayout.PropertyField(m_PropDebugForceSplatSize);
+            EditorGUILayout.PropertyField(m_PropDebugForceUniformAlpha);
+            if (gs.m_DebugForceUniformAlpha)
+                EditorGUILayout.PropertyField(m_PropDebugForceSplatAlpha);
 
             if (gs.HasValidAsset && gs.asset != null)
             {

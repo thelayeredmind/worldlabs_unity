@@ -311,7 +311,18 @@ namespace GaussianSplatting.Runtime
         public int m_SHOrder = 3;
         [Tooltip("Show only Spherical Harmonics contribution, using gray color")]
         public bool m_SHOnly;
-        
+
+        [Tooltip("Debug: force every splat's world-space scale to a fixed uniform value, bypassing decoded per-splat scale. Used to isolate scale-variation-driven visual artifacts from position/rotation causes.")]
+        public bool m_DebugForceUniformScale;
+        [Range(0.001f, 2.0f)]
+        [Tooltip("Debug: the fixed uniform scale value used when Debug Force Uniform Scale is enabled")]
+        public float m_DebugForceSplatSize = 0.05f;
+        [Tooltip("Debug: force every splat's alpha to a fixed uniform value, bypassing decoded per-splat opacity. Used to isolate opacity-driven visual artifacts from scale/position/rotation causes.")]
+        public bool m_DebugForceUniformAlpha;
+        [Range(0.0f, 1.0f)]
+        [Tooltip("Debug: the fixed uniform alpha value used when Debug Force Uniform Alpha is enabled")]
+        public float m_DebugForceSplatAlpha = 1.0f;
+
         [Range(0, 1f)] [Tooltip("Splats with peak opacity below this value are culled before rasterization")]
         public float m_ContributionCullThreshold = 0.05f;
         [Range(0, 1f)] [Tooltip("Fragment alpha below this value is discarded. Controls splat edge softness vs. fill rate.")]
@@ -461,6 +472,8 @@ namespace GaussianSplatting.Runtime
             public static readonly int SplatViewData = Shader.PropertyToID("_SplatViewData");
             public static readonly int OrderBuffer = Shader.PropertyToID("_OrderBuffer");
             public static readonly int SplatScale = Shader.PropertyToID("_SplatScale");
+            public static readonly int DebugForceSplatSize = Shader.PropertyToID("_DebugForceSplatSize");
+            public static readonly int DebugForceSplatAlpha = Shader.PropertyToID("_DebugForceSplatAlpha");
             public static readonly int SplatOpacityScale = Shader.PropertyToID("_SplatOpacityScale");
             public static readonly int SplatSize = Shader.PropertyToID("_SplatSize");
             public static readonly int SplatCount = Shader.PropertyToID("_SplatCount");
@@ -1282,6 +1295,8 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeVectorArrayParam(m_CSSplatUtilities, Props.FrustumPlanes, s_FrustumPlaneVectors);
 
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatScale, m_SplatScale);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DebugForceSplatSize, m_DebugForceUniformScale ? m_DebugForceSplatSize : 0f);
+            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.DebugForceSplatAlpha, m_DebugForceUniformAlpha ? m_DebugForceSplatAlpha : -1f);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatOpacityScale, m_OpacityScale);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);

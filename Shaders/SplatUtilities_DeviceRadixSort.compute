@@ -107,6 +107,12 @@ float _SplatScale;
 float _SplatOpacityScale;
 uint _SHOrder;
 uint _SHOnly;
+// Debug: when > 0, forces every splat's world-space scale to this uniform value on all 3 axes,
+// bypassing decoded per-splat scale entirely. Used to isolate scale-variation-driven visual artifacts
+// (e.g. camera-ray-grid patterns becoming visible) from position/rotation causes.
+float _DebugForceSplatSize;
+// Debug: when >= 0, forces every splat's alpha to this fixed value, bypassing decoded per-splat opacity.
+float _DebugForceSplatAlpha;
 float _ContributionCullThreshold;
 
 // Hotspot LOD — uploaded by GaussianSplatRenderer when GaussianHotspotVolume components are present.
@@ -400,6 +406,8 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     {
         float4 boxRot = splat.rot;
         float3 boxSize = splat.scale;
+        if (_DebugForceSplatSize > 0)
+            boxSize = _DebugForceSplatSize.xxx;
 
         float3x3 splatRotScaleMat = CalcMatrixFromRotationScale(boxRot, boxSize);
 
@@ -421,7 +429,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
         if (effectColorOverride.a >= 0)
             col.rgb = (half3)effectColorOverride.rgb;
-        col.a = min(splat.opacity * opacityScale, 65000);
+        col.a = _DebugForceSplatAlpha >= 0 ? _DebugForceSplatAlpha : min(splat.opacity * opacityScale, 65000);
 
         if (_HotspotDebugVisualize != 0 && _HotspotCount > 0)
         {

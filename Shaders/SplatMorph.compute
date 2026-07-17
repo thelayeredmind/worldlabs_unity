@@ -49,6 +49,11 @@ uint _UnmatchedCount;
 uint _OutOffset;     // first output index for this unmatched block
 float3 _OutBoundsMin;
 float3 _OutBoundsMax;
+// Output chunk buffer (same one the renderer dechunks against) — when _OutChunkCount > 0,
+// CopyUnmatchedA/B encode position per-chunk from this buffer instead of the flat bounds above,
+// so encode always agrees with the renderer's later per-chunk decode. See LoadOutputChunkPosBounds.
+ByteAddressBuffer _OutChunk;
+uint _OutChunkCount;
 
 // Debug: when nonzero, unmatched splats are tinted solid (red=A, blue=B) instead of their
 // real color, so the fade-in/fade-out path is visually distinguishable from matched-pair lerp
@@ -96,6 +101,29 @@ float3 DecodeChunkScale(float3 normScale, ByteAddressBuffer chunks, uint chunkCo
     float3 scale = lerp(sclMin, sclMax, normScale);
     scale = scale * scale; scale = scale * scale; scale = scale * scale;
     return scale;
+}
+
+// Reads the OUTPUT chunk buffer's real (unpacked float) position bounds for the chunk containing
+// dstIdx — the same per-chunk bounds the renderer will later decode against (LoadSplatChunk's
+// posX/posY/posZ, bytes 16-36). Used so CopyUnmatchedA/B's ENCODE step and the renderer's later
+// DECODE step always agree on which bounds apply to a given output splat; using a single flat
+// _OutBoundsMin/Max global for encode while the renderer decodes per-chunk caused encode/decode
+// bounds to mismatch, producing garbage/out-of-range positions (grid-cell-convergence regression).
+void LoadOutputChunkPosBounds(ByteAddressBuffer outChunks, uint outChunkCount, uint dstIdx,
+    float3 fallbackMin, float3 fallbackMax, out float3 boundsMin, out float3 boundsMax)
+{
+    uint chunkIdx = dstIdx / 256u;
+    if (chunkIdx >= outChunkCount)
+    {
+        boundsMin = fallbackMin;
+        boundsMax = fallbackMax;
+        return;
+    }
+    uint base = chunkIdx * 64;
+    uint4 posXY  = outChunks.Load4(base + 16);
+    uint2 posZ   = outChunks.Load2(base + 32);
+    boundsMin = float3(asfloat(posXY.x), asfloat(posXY.z), asfloat(posZ.x));
+    boundsMax = float3(asfloat(posXY.y), asfloat(posXY.w), asfloat(posZ.y));
 }
 
 // ── Decode helpers ────────────────────────────────────────────────────────────
@@ -331,8 +359,10 @@ void CopyUnmatchedA(uint3 id : SV_DispatchThreadID)
     // ── Position — dechunk and re-normalise into output bounds ───────────────
     float3 normPos  = DecodeVec(_PosA, srcIdx * PosStride(posFmtA), posFmtA);
     float3 worldPos = Dechunk(normPos, _ChunksA, _ChunkCountA, srcIdx);
-    float3 range    = max(_OutBoundsMax - _OutBoundsMin, 1e-6);
-    float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
+    float3 outBoundsMin, outBoundsMax;
+    LoadOutputChunkPosBounds(_OutChunk, _OutChunkCount, dstIdx, _OutBoundsMin, _OutBoundsMax, outBoundsMin, outBoundsMax);
+    float3 range    = max(outBoundsMax - outBoundsMin, 1e-6);
+    float3 normOut  = saturate((worldPos - outBoundsMin) / range);
     _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
 
     // ── Other (rotation + scale) — re-encode for the output's identity chunk bounds ──
@@ -369,8 +399,10 @@ void CopyUnmatchedB(uint3 id : SV_DispatchThreadID)
     // ── Position ─────────────────────────────────────────────────────────────
     float3 normPos  = DecodeVec(_PosB, srcIdx * PosStride(posFmtB), posFmtB);
     float3 worldPos = Dechunk(normPos, _ChunksB, _ChunkCountB, srcIdx);
-    float3 range    = max(_OutBoundsMax - _OutBoundsMin, 1e-6);
-    float3 normOut  = saturate((worldPos - _OutBoundsMin) / range);
+    float3 outBoundsMin, outBoundsMax;
+    LoadOutputChunkPosBounds(_OutChunk, _OutChunkCount, dstIdx, _OutBoundsMin, _OutBoundsMax, outBoundsMin, outBoundsMax);
+    float3 range    = max(outBoundsMax - outBoundsMin, 1e-6);
+    float3 normOut  = saturate((worldPos - outBoundsMin) / range);
     _OutPos.Store(dstIdx * 4, EncodeNorm11(normOut));
 
     // ── Other ────────────────────────────────────────────────────────────────
