@@ -159,8 +159,13 @@ namespace GaussianSplatting.Editor
             // no locality constraint; it can be doing most of the real matching work and silently
             // masking a poor round-loop result behind a clean "few unmatched" status).
             if (useRemainderFallback)
+            {
+                var resolverProgress = progress != null
+                    ? new Progress<float>(t => progress.Report(0.85f + 0.15f * t))
+                    : null;
                 remainderResolver.Resolve(posL, posR, colL, colR, posWeight, colorWeight,
-                    ref remainingL, ref remainingR, pairs, ct);
+                    ref remainingL, ref remainingR, pairs, ct, resolverProgress);
+            }
 
             progress?.Report(1f);
 
@@ -190,11 +195,16 @@ namespace GaussianSplatting.Editor
             /// remainingL/remainingR once done. Must be called on the main thread if the
             /// implementation dispatches to the GPU.
             /// </summary>
+            /// <summary>
+            /// progress, if supplied, should be reported in the local [0,1] range covering just this
+            /// resolve call — callers rescale it into their own overall progress the same way any
+            /// BuildVia* method's own sub-stages already do.
+            /// </summary>
             void Resolve(
                 Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
                 float posWeight, float colWeight,
                 ref int[] remainingL, ref int[] remainingR,
-                List<int2> pairs, CancellationToken ct);
+                List<int2> pairs, CancellationToken ct, IProgress<float> progress = null);
         }
 
         /// <summary>
@@ -213,7 +223,7 @@ namespace GaussianSplatting.Editor
                 Vector3[] posL, Vector3[] posR, Vector4[] colL, Vector4[] colR,
                 float posWeight, float colWeight,
                 ref int[] remainingL, ref int[] remainingR,
-                List<int2> pairs, CancellationToken ct)
+                List<int2> pairs, CancellationToken ct, IProgress<float> progress = null)
             {
                 if (remainingL.Length > 0 && posR.Length > 0)
                 {
@@ -225,6 +235,7 @@ namespace GaussianSplatting.Editor
                     for (int i = 0; i < remainingL.Length; i++)
                         pairs.Add(new int2(remainingL[i], bestMatch[i]));
                 }
+                progress?.Report(0.5f);
 
                 if (remainingR.Length > 0 && posL.Length > 0)
                 {
@@ -236,6 +247,7 @@ namespace GaussianSplatting.Editor
                     for (int j = 0; j < remainingR.Length; j++)
                         pairs.Add(new int2(bestMatch[j], remainingR[j]));
                 }
+                progress?.Report(1f);
 
                 remainingL = Array.Empty<int>();
                 remainingR = Array.Empty<int>();
@@ -263,8 +275,11 @@ namespace GaussianSplatting.Editor
             int[] remainingL = Enumerable.Range(0, posL.Length).ToArray();
             int[] remainingR = Enumerable.Range(0, posR.Length).ToArray();
 
+            var resolverProgress = progress != null
+                ? new Progress<float>(t => progress.Report(0.05f + 0.95f * t))
+                : null;
             remainderResolver.Resolve(posL, posR, colL, colR, posWeight, colorWeight,
-                ref remainingL, ref remainingR, pairs, ct);
+                ref remainingL, ref remainingR, pairs, ct, resolverProgress);
 
             progress?.Report(1f);
 

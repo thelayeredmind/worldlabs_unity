@@ -21,15 +21,6 @@ namespace GaussianSplatting.Editor
         const string kPrefOutputFolder = "GaussianSplatting.MorphMapBuilder.OutputFolder";
         const string kShaderPath       = "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatCorrespondence.compute";
 
-        enum CorrespondenceAlgorithm
-        {
-            RoundBased,
-            SpatialProbes,
-            MutualTopK,
-            GaleShapley,
-            Simple,
-        }
-
         [SerializeField] GaussianSplatAsset m_AssetLeft;
         [SerializeField] GaussianSplatAsset m_AssetRight;
         [SerializeField] string m_OutputFolder = "Assets/GaussianAssets";
@@ -488,7 +479,8 @@ namespace GaussianSplatting.Editor
                     }
 
                     m_Status = $"Done — {result.matchedPairs.Length} matched, {result.unmatchedLeft.Length} + {result.unmatchedRight.Length} unmatched.";
-                    EditorApplication.delayCall += () => SaveAsset(result, assetLeft, assetRight);
+                    EditorApplication.delayCall += () => SaveAsset(result, assetLeft, assetRight,
+                        algorithm, forceMatchPass, colorWeight, probeAccuracy);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1157,7 +1149,8 @@ namespace GaussianSplatting.Editor
 
         // ── Asset save ────────────────────────────────────────────────────────
 
-        void SaveAsset(GaussianMorphMapBuilder.Result result, GaussianSplatAsset left, GaussianSplatAsset right)
+        void SaveAsset(GaussianMorphMapBuilder.Result result, GaussianSplatAsset left, GaussianSplatAsset right,
+            CorrespondenceAlgorithm algorithm, bool forceMatchPass, float colorWeight, float probeAccuracy)
         {
             if (!AssetDatabase.IsValidFolder(m_OutputFolder))
                 System.IO.Directory.CreateDirectory(m_OutputFolder);
@@ -1172,6 +1165,7 @@ namespace GaussianSplatting.Editor
             map.matchedPairs    = result.matchedPairs;
             map.unmatchedLeft   = result.unmatchedLeft;
             map.unmatchedRight  = result.unmatchedRight;
+            map.StampBuildSettings(algorithm, forceMatchPass, colorWeight, probeAccuracy);
 
             AssetDatabase.CreateAsset(map, path);
             AssetDatabase.SaveAssets();

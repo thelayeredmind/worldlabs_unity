@@ -11,6 +11,20 @@ namespace GaussianSplatting.Runtime
     /// The morpher chooses which component is src/dst at activation time.
     /// Built once by GaussianMorphMapBuilder.
     /// </summary>
+    /// <summary>
+    /// The correspondence search strategy a GaussianMorphMap was built with. Shared between the
+    /// editor-only builder window (which drives the build) and this Runtime asset (which records
+    /// what was used), so it lives here rather than as a private nested type in the window.
+    /// </summary>
+    public enum CorrespondenceAlgorithm
+    {
+        RoundBased,
+        SpatialProbes,
+        MutualTopK,
+        GaleShapley,
+        Simple,
+    }
+
     public class GaussianMorphMap : ScriptableObject
     {
         [SerializeField] public int splatCountLeft;
@@ -23,6 +37,31 @@ namespace GaussianSplatting.Runtime
         /// </summary>
         [SerializeField] public string leftAssetGuid;
         [SerializeField] public string rightAssetGuid;
+
+        /// <summary>
+        /// Build-time settings this map was produced with — provenance only, never read by the
+        /// morph runtime path. Default on maps built before these fields existed. Read-only outside
+        /// this class; only <see cref="StampBuildSettings"/> (called by the builder window at save
+        /// time) may set them.
+        /// </summary>
+        [SerializeField] CorrespondenceAlgorithm m_BuiltWithAlgorithm;
+        [SerializeField] bool  m_BuiltWithForceMatchPass;
+        [SerializeField] float m_BuiltWithColorWeight;
+        [SerializeField] float m_BuiltWithProbeAccuracy;
+
+        public CorrespondenceAlgorithm builtWithAlgorithm      => m_BuiltWithAlgorithm;
+        public bool                    builtWithForceMatchPass => m_BuiltWithForceMatchPass;
+        public float                   builtWithColorWeight    => m_BuiltWithColorWeight;
+        public float                   builtWithProbeAccuracy  => m_BuiltWithProbeAccuracy;
+
+        /// <summary>Called once, by the builder window, right after this asset is created.</summary>
+        public void StampBuildSettings(CorrespondenceAlgorithm algorithm, bool forceMatchPass, float colorWeight, float probeAccuracy)
+        {
+            m_BuiltWithAlgorithm      = algorithm;
+            m_BuiltWithForceMatchPass = forceMatchPass;
+            m_BuiltWithColorWeight    = colorWeight;
+            m_BuiltWithProbeAccuracy  = probeAccuracy;
+        }
 
         /// <summary>
         /// Matched pairs. x = index into Left asset, y = index into Right asset.
