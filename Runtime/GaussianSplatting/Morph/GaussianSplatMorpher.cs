@@ -833,8 +833,12 @@ namespace GaussianSplatting.Runtime
             int nA = m_AssetLeft.splatCount;
             // Position and Other are always written in the morph kernels' own fixed packed
             // layout (Norm11 pos, rot+Norm6-scale Other) regardless of the source assets'
-            // formats — see SplatMorph.compute's OUT_OTHER_STRIDE. Only SH is a passthrough
-            // copy of A's source data, so its stride still derives from A's actual format.
+            // formats — see SplatMorph.compute's OUT_OTHER_STRIDE. SH is allocated at A's
+            // stride but NOT written by any kernel yet (real per-splat SH lerp/copy is a
+            // TODO) — left explicitly zeroed below rather than reading uninitialized GPU
+            // memory as SH coefficients, which previously produced random rainbow-colored
+            // splats (root-caused via live GPU buffer introspection, KitchenOfMemories
+            // BurningHouse Layers, session with attempt-inconsistent color corruption).
             const int posStride = 4;   // EncodeNorm11, 1 uint/splat
             const int otherStride = 8; // OUT_OTHER_STRIDE: rot(4) + Norm6 scale(4)
             int shStride = layerA.m_SHData != null ? layerA.m_SHData.GetData<byte>().Length / nA : 0;
@@ -847,6 +851,7 @@ namespace GaussianSplatting.Runtime
             m_BufOutPos   = new GraphicsBuffer(outTarget, posLen   / 4, 4) { name = "MorphOutPos" };
             m_BufOutOther = new GraphicsBuffer(outTarget, otherLen / 4, 4) { name = "MorphOutOther" };
             m_BufOutSH    = new GraphicsBuffer(outTarget, shLen    / 4, 4) { name = "MorphOutSH" };
+            m_BufOutSH.SetData(new uint[shLen / 4]); // zeroed — see comment above; no kernel writes this buffer yet
 
             var (tw,  th)  = GaussianSplatAsset.CalcTextureSize(m_TotalMorphCount);
             var (twB, _)   = GaussianSplatAsset.CalcTextureSize(m_AssetRight.splatCount);
