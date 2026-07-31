@@ -192,16 +192,11 @@ namespace GaussianSplatting.Runtime
         /// </summary>
         void Setup()
         {
-            Debug.Log($"[Morpher] Setup — left={m_AssetLeft.name}({m_AssetLeft.splatCount}) right={m_AssetRight.name}({m_AssetRight.splatCount})");
-
             UploadSourceBuffers();
-            Debug.Log($"[Morpher] UploadSourceBuffers — posA={m_BufPosA?.count} posB={m_BufPosB?.count} chunksA={m_BufChunksA?.count} chunksB={m_BufChunksB?.count}");
 
             BuildIndexBuffer();
-            Debug.Log($"[Morpher] BuildIndexBuffer — matched={m_MatchedCount} unmatchedL={m_UnmatchedLeftCount} unmatchedR={m_UnmatchedRightCount} total={m_TotalMorphCount}");
 
             AllocateOutputBuffers();
-            Debug.Log($"[Morpher] AllocateOutputBuffers — outPos={m_BufOutPos?.count} outOther={m_BufOutOther?.count} outTex={m_TexOutColor?.width}x{m_TexOutColor?.height} outWidth={m_OutTexWidth}");
 
 #if UNITY_EDITOR
             if (m_MorphShader == null)
@@ -214,13 +209,10 @@ namespace GaussianSplatting.Runtime
                 m_KernelCopyUnmatchedA = m_MorphShader.HasKernel("CopyUnmatchedA") ? m_MorphShader.FindKernel("CopyUnmatchedA") : -1;
                 m_KernelCopyUnmatchedB = m_MorphShader.HasKernel("CopyUnmatchedB") ? m_MorphShader.FindKernel("CopyUnmatchedB") : -1;
             }
-            Debug.Log($"[Morpher] Kernels — morphSplats={m_KernelMorphSplats} copyUnmatchedA={m_KernelCopyUnmatchedA} copyUnmatchedB={m_KernelCopyUnmatchedB}");
 
             ComputeOutputBoundsAndChunk();
-            Debug.Log($"[Morpher] OutputBounds — min={m_WorldBoundsMin} max={m_WorldBoundsMax} chunkBuf={m_BufOutChunk?.count}");
 
             BindBuffersForT();
-            Debug.Log($"[Morpher] Setup done — t={m_T:F2} renderer.splatCount={m_Renderer?.splatCount} renderer.hasExt={m_Renderer?.HasExternalBuffers}");
         }
 
         void OnDisable()
@@ -313,9 +305,7 @@ namespace GaussianSplatting.Runtime
             else
             {
                 // Blend — dispatch kernel, bind output buffers with combined chunk
-                if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] blend t={m_T:F2} matched={m_MatchedCount} total={m_TotalMorphCount} outPos={m_BufOutPos != null} outChunk={m_BufOutChunk != null} shader={m_MorphShader != null}");
                 DispatchMorph();
-                if (Time.frameCount % 60 == 0) RequestPosReadback();
 
                 // The morph kernels always write position as Norm11 and scale as Norm6-padded
                 // (GaussianSplatting.hlsl's VECTOR_FMT_6_PADDED — same bit layout as Norm6, but
@@ -382,7 +372,6 @@ namespace GaussianSplatting.Runtime
             if (m_MatchedCount > 0)
             {
                 int groups = (m_MatchedCount + 63) / 64;
-                if (Time.frameCount % 60 == 0) Debug.Log($"[Morpher] Dispatch MorphSplats — groups={groups} chunkA={chunkCountA} chunkB={chunkCountB} outWidth={m_OutTexWidth} outWidthB={m_OutTexWidthB}");
                 m_MorphShader.Dispatch(k, groups, 1, 1);
             }
 
@@ -800,20 +789,6 @@ namespace GaussianSplatting.Runtime
             m_TexOutColor  = new RenderTexture(tw, th, fmt, UnityEngine.Experimental.Rendering.GraphicsFormat.None)
                 { name = "MorphOutColor", enableRandomWrite = true };
             m_TexOutColor.Create();
-        }
-
-        void RequestPosReadback()
-        {
-            AsyncGPUReadback.Request(m_BufOutPos, 48, 0, req =>
-            {
-                if (req.hasError) { Debug.Log("[Morpher] readback error"); return; }
-                var data = req.GetData<uint>();
-                uint enc = data[0];
-                float x = (enc & 2047u) / 2047f;
-                float y = ((enc >> 11) & 1023u) / 1023f;
-                float z = ((enc >> 21) & 2047u) / 2047f;
-                Debug.Log($"[Morpher] outPos[0] enc={enc} norm=({x:F3},{y:F3},{z:F3}) | outPos[1] enc={data[1]} | outPos[2] enc={data[2]}");
-            });
         }
 
         void ReleaseGpuResources()

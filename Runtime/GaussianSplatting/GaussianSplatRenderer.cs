@@ -1337,8 +1337,10 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
 
+#if UNITY_EDITOR
             // Temporary: async-readback the cull survivor counter every 2s while wiring up per-splat GPU culling.
             // Only requested right after a real dispatch, so the value logged is always from this frame, never stale.
+            // Editor-only — this diagnostic log is not needed (and has a real perf cost) in device builds.
             if (Time.realtimeSinceStartup - m_LastCullCounterLogTime > 2f)
             {
                 m_LastCullCounterLogTime = Time.realtimeSinceStartup;
@@ -1353,7 +1355,6 @@ namespace GaussianSplatting.Runtime
                 });
             }
 
-#if UNITY_EDITOR
             // Editor-only: feed the Scene-view splat count overlay (GaussianSplatDebugOverlayWindow) while active.
             // Reuses the cull survivor counter already dispatched above -- no extra buffer needed.
             if (s_DebugCountersEnabled)
