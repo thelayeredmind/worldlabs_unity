@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 
 using System;
+using System.Diagnostics;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
+using Debug = UnityEngine.Debug;
 
 namespace GaussianSplatting.Runtime
 {
@@ -108,8 +110,26 @@ namespace GaussianSplatting.Runtime
                 return;
             }
 
+            // If WarmUpStep already fully warmed exactly this pair while disabled, consume that
+            // state instead of redoing the synchronous rebuild — same check OnEnable() does.
+            // Needed here too: once this component has been enabled at least once in its
+            // lifetime, m_Renderer stays non-null across later disable/enable cycles, so THIS
+            // path (not OnEnable(), which only reruns Setup()-adjacent logic when Unity actually
+            // flips enabled false->true) is what a caller hits on every subsequent pair change —
+            // missing this check here defeated warm-up for every pair after the very first one.
+            if (m_WarmStage == WarmStage.Done && m_WarmLeft == m_AssetLeft && m_WarmRight == m_AssetRight && m_WarmMap == m_MorphMap)
+            {
+                m_WarmStage = WarmStage.NotStarted;
+                m_WarmLeft = null; m_WarmRight = null; m_WarmMap = null;
+                BindBuffersForT();
+                m_BoundThisActivation = true; // tells a subsequent OnEnable() (same activation) not to redo this
+                return;
+            }
+            CancelWarmUp();
+
             ReleaseGpuResources();
             Setup();
+            m_BoundThisActivation = true; // tells a subsequent OnEnable() (same activation) not to redo this
         }
 
         // ── GPU resources ─────────────────────────────────────────────────────
@@ -177,6 +197,18 @@ namespace GaussianSplatting.Runtime
 
         // ── Unity messages ────────────────────────────────────────────────────
 
+        // Set true by whichever of SetAssets()/OnEnable() runs first for a given activation and
+        // already bound buffers for the current m_AssetLeft/Right/Map (via warm-consumption or a
+        // fresh Setup()) — checked by whichever of the two runs second, so the pair is never
+        // rebuilt twice for the same activation. SetAssets() (called directly from the mixer, in
+        // C#) and OnEnable() (fired by Unity when `enabled` flips false->true) both run for the
+        // same pair-change; without this flag, whichever runs second always falls through to a
+        // redundant full Setup(), regardless of what the first one already did — confirmed via
+        // Profiler: OnEnable() still cost ~194ms/call even after SetAssets() alone was fixed to
+        // consume warm state, because SetAssets() consuming/clearing warm state made OnEnable()'s
+        // OWN check fail immediately after, so it re-ran Setup() anyway.
+        bool m_BoundThisActivation;
+
         void OnEnable()
         {
             if (m_AssetLeft == null || m_AssetRight == null)
@@ -188,8 +220,27 @@ namespace GaussianSplatting.Runtime
             // m_MorphMap == null is valid — BuildIndexBuffer() treats it as "everything unmatched"
             // (pure fade, no lerp), useful as a raw baseline when judging correspondence quality.
 
+            bool alreadyBound = m_BoundThisActivation;
+            m_BoundThisActivation = false; // reset unconditionally — next activation starts fresh
+
             m_Renderer      = GetComponent<GaussianSplatRenderer>();
             m_CapturedAsset = m_Renderer.m_Asset;
+
+            if (alreadyBound) return; // SetAssets() already did the work for this exact activation
+
+            // If WarmUpStep already fully warmed exactly this pair while disabled, consume that
+            // state instead of redoing Setup() from scratch — the whole point of warming ahead
+            // of time is to avoid paying this cost synchronously here.
+            if (m_WarmStage == WarmStage.Done && m_WarmLeft == m_AssetLeft && m_WarmRight == m_AssetRight && m_WarmMap == m_MorphMap)
+            {
+                m_WarmStage = WarmStage.NotStarted;
+                m_WarmLeft = null; m_WarmRight = null; m_WarmMap = null;
+                BindBuffersForT();
+                return;
+            }
+
+            // Warm state exists but doesn't match (or is incomplete) — discard it, it's now stale.
+            CancelWarmUp();
 
             Setup();
         }
@@ -223,6 +274,220 @@ namespace GaussianSplatting.Runtime
             ComputeOutputBoundsAndChunk();
 
             BindBuffersForT();
+        }
+
+        // ── Warm-up (spread Setup() across frames) ──────────────────────────────
+        //
+        // Driven externally (by a Timeline mixer, not a coroutine here) since this component is
+        // disabled while a preceding static clip plays, and Unity doesn't tick coroutines on
+        // disabled components. WarmUpStep() runs one bounded slice of the same work Setup() does
+        // synchronously, resuming from where the previous call left off. Buffers are only bound
+        // to the renderer (BindBuffersForT) once fully warmed AND the caller explicitly activates
+        // via SetAssets/OnEnable — warming alone never makes this component visible or touches
+        // the renderer's external buffers.
+        enum WarmStage { NotStarted, Upload, Index, Allocate, Kernels, Bounds, Done }
+
+        WarmStage m_WarmStage = WarmStage.NotStarted;
+        GaussianSplatAsset m_WarmLeft, m_WarmRight;
+        GaussianMorphMap m_WarmMap;
+        int m_WarmChunkIndex; // resume cursor into ComputeOutputBoundsAndChunk's chunk loop
+        byte[] m_WarmChunkBytes; // scratch buffer being filled across resumed calls, committed to m_BufOutChunk on completion
+
+        /// <summary>
+        /// Advances warm-up for (left, right, map) by up to msBudget milliseconds of wall-clock
+        /// work, resuming from previous progress. Returns true once fully warmed (all GPU/CPU
+        /// state built, ready to bind) — false if more calls are needed. Any call whose
+        /// (left, right, map) differs from what's currently being warmed discards all progress
+        /// and starts over, matching the existing pairChanged-driven rebuild discipline
+        /// (ReleaseGpuResources + Setup) used elsewhere in this class.
+        /// </summary>
+        public bool WarmUpStep(GaussianSplatAsset left, GaussianSplatAsset right, GaussianMorphMap map, float msBudget)
+        {
+            // Enforced precondition, not just an assumption the caller has to get right:
+            // UploadSourceBuffers/BuildIndexBuffer/AllocateOutputBuffers write into the SAME
+            // fields (m_BufPosA, m_BufIndices, m_BufOutPos, ...) the LIVE pair uses while this
+            // component is enabled/rendering — running warm-up then would corrupt what's
+            // currently on screen. Warm-up is only safe while disabled (the mixer's own gating
+            // already keeps it disabled during a preceding static clip; this guard makes that a
+            // hard invariant instead of an implicit one).
+            if (enabled)
+            {
+                CancelWarmUp();
+                return false;
+            }
+
+            if (left == null || right == null)
+            {
+                CancelWarmUp();
+                return false;
+            }
+
+            bool targetChanged = m_WarmLeft != left || m_WarmRight != right || m_WarmMap != map;
+            if (targetChanged)
+            {
+                CancelWarmUp();
+                m_WarmLeft = left;
+                m_WarmRight = right;
+                m_WarmMap = map;
+                m_WarmStage = WarmStage.Upload;
+            }
+
+            if (m_WarmStage == WarmStage.Done) return true;
+
+            var sw = Stopwatch.StartNew();
+            long budgetTicks = (long)(msBudget * Stopwatch.Frequency / 1000.0);
+
+            // Assets are swapped into the real fields for the duration of warm-up so the
+            // existing (non-resumable) helper methods — UploadSourceBuffers, BuildIndexBuffer,
+            // AllocateOutputBuffers — can be reused as-is. This mirrors what Setup() already
+            // does; WarmUpStep never calls BindBuffersForT, so the renderer is never touched.
+            var prevLeft = m_AssetLeft; var prevRight = m_AssetRight; var prevMap = m_MorphMap;
+            m_AssetLeft = m_WarmLeft; m_AssetRight = m_WarmRight; m_MorphMap = m_WarmMap;
+
+            if (m_WarmStage == WarmStage.Upload)
+            {
+                UploadSourceBuffers();
+                m_WarmStage = WarmStage.Index;
+            }
+
+            if (m_WarmStage == WarmStage.Index && sw.ElapsedTicks < budgetTicks)
+            {
+                BuildIndexBuffer();
+                m_WarmStage = WarmStage.Allocate;
+            }
+
+            if (m_WarmStage == WarmStage.Allocate && sw.ElapsedTicks < budgetTicks)
+            {
+                AllocateOutputBuffers();
+                m_WarmStage = WarmStage.Kernels;
+            }
+
+            if (m_WarmStage == WarmStage.Kernels && sw.ElapsedTicks < budgetTicks)
+            {
+#if UNITY_EDITOR
+                if (m_MorphShader == null)
+                    m_MorphShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>(
+                        "Packages/com.worldlabs.gaussian-splatting/Shaders/SplatMorph.compute");
+#endif
+                if (m_MorphShader != null)
+                {
+                    m_KernelMorphSplats    = m_MorphShader.FindKernel("MorphSplats");
+                    m_KernelCopyUnmatchedA = m_MorphShader.HasKernel("CopyUnmatchedA") ? m_MorphShader.FindKernel("CopyUnmatchedA") : -1;
+                    m_KernelCopyUnmatchedB = m_MorphShader.HasKernel("CopyUnmatchedB") ? m_MorphShader.FindKernel("CopyUnmatchedB") : -1;
+                }
+                m_WarmStage = WarmStage.Bounds;
+                m_WarmChunkIndex = 0;
+                m_WarmChunkBytes = null;
+            }
+
+            if (m_WarmStage == WarmStage.Bounds)
+            {
+                bool boundsDone = StepComputeOutputBoundsAndChunk(sw, budgetTicks);
+                if (boundsDone) m_WarmStage = WarmStage.Done;
+            }
+
+            m_AssetLeft = prevLeft; m_AssetRight = prevRight; m_MorphMap = prevMap;
+
+            return m_WarmStage == WarmStage.Done;
+        }
+
+        /// <summary>
+        /// Resumable variant of ComputeOutputBoundsAndChunk's chunk loop — the one confirmed
+        /// per-chunk-count-scaling hot spot (see class-level warm-up comment). Sets up
+        /// m_WorldBoundsMin/Max and m_WarmChunkBytes on the first call (m_WarmChunkIndex == 0),
+        /// then processes chunks starting from m_WarmChunkIndex until the time budget is spent,
+        /// persisting the cursor for the next call. Commits to m_BufOutChunk and returns true
+        /// only once every chunk has been written — mirrors ComputeOutputBoundsAndChunk exactly,
+        /// just resumable. Uses m_AssetLeft/Right (already swapped to the warm pair by the caller).
+        /// </summary>
+        bool StepComputeOutputBoundsAndChunk(Stopwatch sw, long budgetTicks)
+        {
+            if (m_WarmChunkIndex == 0 && m_WarmChunkBytes == null)
+            {
+                (m_BoundsMinLeft, m_BoundsMaxLeft)   = ComputeAssetBounds(m_AssetLeft);
+                (m_BoundsMinRight, m_BoundsMaxRight) = ComputeAssetBounds(m_AssetRight);
+                m_WorldBoundsMin = Vector3.Min(m_BoundsMinLeft, m_BoundsMinRight);
+                m_WorldBoundsMax = Vector3.Max(m_BoundsMaxLeft, m_BoundsMaxRight);
+
+                int chunkCount = (m_TotalMorphCount + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
+                m_WarmChunkBytes = new byte[chunkCount * 64];
+            }
+
+            const uint kIdentityMinMax = 0x3C000000u;
+            int totalChunks = m_WarmChunkBytes.Length / 64;
+            int matchedEnd = m_MatchedCount;
+            int unmatchedLeftEnd = m_MatchedCount + m_UnmatchedLeftCount;
+
+            while (m_WarmChunkIndex < totalChunks)
+            {
+                if (sw.ElapsedTicks >= budgetTicks) return false;
+
+                int c = m_WarmChunkIndex;
+                int firstSplat = c * GaussianSplatAsset.kChunkSize;
+                Vector3 chunkBoundsMin, chunkBoundsMax;
+                if (firstSplat < matchedEnd)
+                {
+                    chunkBoundsMin = m_WorldBoundsMin;  chunkBoundsMax = m_WorldBoundsMax;
+                }
+                else if (firstSplat < unmatchedLeftEnd)
+                {
+                    int regionStart = firstSplat - matchedEnd;
+                    int regionCount = m_UnmatchedLeftCount;
+                    if (m_UnmatchedSequential && regionCount > 0)
+                        (chunkBoundsMin, chunkBoundsMax) = ComputeLocalChunkBounds(m_AssetLeft, regionStart, regionCount);
+                    else
+                        { chunkBoundsMin = m_BoundsMinLeft;  chunkBoundsMax = m_BoundsMaxLeft; }
+                }
+                else
+                {
+                    int regionStart = firstSplat - unmatchedLeftEnd;
+                    int regionCount = m_UnmatchedRightCount;
+                    if (m_UnmatchedSequential && regionCount > 0)
+                        (chunkBoundsMin, chunkBoundsMax) = ComputeLocalChunkBounds(m_AssetRight, regionStart, regionCount);
+                    else
+                        { chunkBoundsMin = m_BoundsMinRight; chunkBoundsMax = m_BoundsMaxRight; }
+                }
+
+                int b = c * 64;
+                WriteUInt(m_WarmChunkBytes, b + 0,  kIdentityMinMax);
+                WriteUInt(m_WarmChunkBytes, b + 4,  kIdentityMinMax);
+                WriteUInt(m_WarmChunkBytes, b + 8,  kIdentityMinMax);
+                WriteUInt(m_WarmChunkBytes, b + 12, kIdentityMinMax);
+                WriteFloat(m_WarmChunkBytes, b + 16, chunkBoundsMin.x); WriteFloat(m_WarmChunkBytes, b + 20, chunkBoundsMax.x);
+                WriteFloat(m_WarmChunkBytes, b + 24, chunkBoundsMin.y); WriteFloat(m_WarmChunkBytes, b + 28, chunkBoundsMax.y);
+                WriteFloat(m_WarmChunkBytes, b + 32, chunkBoundsMin.z); WriteFloat(m_WarmChunkBytes, b + 36, chunkBoundsMax.z);
+                WriteUInt(m_WarmChunkBytes, b + 40, kIdentityMinMax);
+                WriteUInt(m_WarmChunkBytes, b + 44, kIdentityMinMax);
+                WriteUInt(m_WarmChunkBytes, b + 48, kIdentityMinMax);
+
+                m_WarmChunkIndex++;
+            }
+
+            m_OutChunkCount = totalChunks;
+            m_BufOutChunk = new GraphicsBuffer(GraphicsBuffer.Target.Raw, m_WarmChunkBytes.Length / 4, 4) { name = "MorphOutChunk" };
+            m_BufOutChunk.SetData(m_WarmChunkBytes);
+            m_WarmChunkBytes = null;
+            return true;
+        }
+
+        /// <summary>Discards all warm-up progress and releases any partially-uploaded warm buffers.</summary>
+        public void CancelWarmUp()
+        {
+            if (m_WarmStage == WarmStage.NotStarted) return;
+
+            // By the time any stage past Upload has run, real GraphicsBuffers/Textures have been
+            // written into m_Buf*/m_Tex* (UploadSourceBuffers/BuildIndexBuffer/AllocateOutputBuffers
+            // all write into those same fields — see WarmUpStep's guard comment). Since WarmUpStep
+            // only ever runs while this component is disabled, nothing else can be depending on
+            // those fields' current contents, so it's always safe to release them wholesale here,
+            // the same way ReleaseGpuResources() already does for a live pair being torn down.
+            if (m_WarmStage != WarmStage.Upload)
+                ReleaseGpuResources();
+
+            m_WarmStage = WarmStage.NotStarted;
+            m_WarmLeft = null; m_WarmRight = null; m_WarmMap = null;
+            m_WarmChunkIndex = 0;
+            m_WarmChunkBytes = null;
         }
 
         void OnDisable()
@@ -629,19 +894,25 @@ namespace GaussianSplatting.Runtime
             return (min, max);
         }
 
-        static float ReadFloat(Unity.Collections.NativeArray<byte> b, int offset) =>
-            System.BitConverter.ToSingle(new[] { b[offset], b[offset+1], b[offset+2], b[offset+3] }, 0);
-
-        static void WriteFloat(byte[] b, int offset, float v)
+        // Byte-shift math instead of BitConverter — BitConverter.ToSingle/GetBytes each allocate
+        // a new byte[4] per call; at real chunk-scan scale (thousands of chunks × several reads/
+        // writes each) that becomes millions of tiny per-call allocations (confirmed via Profiler:
+        // 3.77M GC.Alloc calls inside a single GaussianSplatMorpher.OnEnable()).
+        static unsafe float ReadFloat(Unity.Collections.NativeArray<byte> b, int offset)
         {
-            var bytes = System.BitConverter.GetBytes(v);
-            b[offset] = bytes[0]; b[offset+1] = bytes[1]; b[offset+2] = bytes[2]; b[offset+3] = bytes[3];
+            uint bits = (uint)b[offset] | ((uint)b[offset + 1] << 8) | ((uint)b[offset + 2] << 16) | ((uint)b[offset + 3] << 24);
+            return *(float*)&bits;
+        }
+
+        static unsafe void WriteFloat(byte[] b, int offset, float v)
+        {
+            uint bits = *(uint*)&v;
+            b[offset] = (byte)bits; b[offset+1] = (byte)(bits >> 8); b[offset+2] = (byte)(bits >> 16); b[offset+3] = (byte)(bits >> 24);
         }
 
         static void WriteUInt(byte[] b, int offset, uint v)
         {
-            var bytes = System.BitConverter.GetBytes(v);
-            b[offset] = bytes[0]; b[offset+1] = bytes[1]; b[offset+2] = bytes[2]; b[offset+3] = bytes[3];
+            b[offset] = (byte)v; b[offset+1] = (byte)(v >> 8); b[offset+2] = (byte)(v >> 16); b[offset+3] = (byte)(v >> 24);
         }
 
         void CopySourceToOutput(GraphicsBuffer pos, GraphicsBuffer other, GraphicsBuffer sh)
