@@ -340,9 +340,12 @@ void MorphSplats(uint3 id : SV_DispatchThreadID)
     float4 colB = DecodeChunkColor(_ColorB.Load(int3(coordB, 0)), _ChunksB, _ChunkCountB, idxB);
     _OutColor[coordOut] = EncodeOutputColor(lerp(colA, colB, t));
 
-    // ── SH — passthrough A (clustered SH lerp deferred to morph/runtime) ─────
+    // ── SH — deferred, not yet implemented ────────────────────────────────────
     // TODO: proper SH lerp once formats are normalised across both assets.
-    // For now the output SH buffer is a copy of A (set at OnEnable via CopyBuffer).
+    // No kernel writes _OutSH yet — GaussianSplatMorpher.AllocateOutputBuffers zero-clears
+    // it explicitly so unmatched/matched splats render with flat (zero) SH detail instead of
+    // uninitialized GPU memory being read as SH coefficients (previously caused random
+    // rainbow-colored splats).
 }
 
 // ── CopyUnmatchedA ────────────────────────────────────────────────────────────

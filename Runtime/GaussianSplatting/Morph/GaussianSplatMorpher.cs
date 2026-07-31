@@ -28,6 +28,9 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Precomputed correspondence. Located automatically when both assets are assigned; assign manually to override.")]
         [SerializeField] GaussianMorphMap m_MorphMap;
 
+        [Tooltip("Only used when no MorphMap is assigned. Instead of treating every splat as unmatched (pure fade), pairs splat i on the Left with splat i on the Right for i in [0, min(countLeft,countRight)) — a raw, correspondence-free 1-1 index lerp. Any remainder beyond that range still fades.")]
+        [SerializeField] bool m_MatchByUnsortedIndex;
+
         [SerializeField, Range(0f, 1f)] float m_T;
 
         [SerializeField] ComputeShader m_MorphShader;
@@ -52,6 +55,13 @@ namespace GaussianSplatting.Runtime
         public GaussianSplatAsset assetLeft  => m_AssetLeft;
         public GaussianSplatAsset assetRight => m_AssetRight;
         public GaussianMorphMap   morphMap   => m_MorphMap;
+
+        /// <summary>Only used when no MorphMap is assigned — see field tooltip.</summary>
+        public bool matchByUnsortedIndex
+        {
+            get => m_MatchByUnsortedIndex;
+            set => m_MatchByUnsortedIndex = value;
+        }
 
         /// <summary>Swap Left and Right assets without rebuilding correspondence.</summary>
         public void SwapAssets()
@@ -686,7 +696,10 @@ namespace GaussianSplatting.Runtime
         {
             if (m_MorphMap == null)
             {
-                BuildIndexBufferAllUnmatched();
+                if (m_MatchByUnsortedIndex)
+                    BuildIndexBufferIdentityPairs();
+                else
+                    BuildIndexBufferAllUnmatched();
                 return;
             }
 
@@ -758,6 +771,49 @@ namespace GaussianSplatting.Runtime
             m_BufUnmatchedRight.SetData(uR);
         }
 
+        /// <summary>
+        /// No MorphMap assigned, m_MatchByUnsortedIndex is on — pairs splat i on the Left with
+        /// splat i on the Right for i in [0, min(countLeft,countRight)), a raw correspondence-free
+        /// 1-1 index lerp. Whichever asset is longer has its remainder ([min..count)) fall back to
+        /// the fade path, same as BuildIndexBufferAllUnmatched.
+        /// </summary>
+        void BuildIndexBufferIdentityPairs()
+        {
+            m_UnmatchedSequential = true;
+
+            int countLeft  = m_AssetLeft.splatCount;
+            int countRight = m_AssetRight.splatCount;
+            m_MatchedCount = Mathf.Min(countLeft, countRight);
+
+            var pairs = new int2[m_MatchedCount];
+            for (int i = 0; i < m_MatchedCount; i++) pairs[i] = new int2(i, i);
+            m_BufIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(m_MatchedCount, 1), 8)
+                { name = "MorphIndices" };
+            if (m_MatchedCount > 0)
+                m_BufIndices.SetData(pairs);
+
+            m_UnmatchedLeftCount  = countLeft  - m_MatchedCount;
+            m_UnmatchedRightCount = countRight - m_MatchedCount;
+            m_TotalMorphCount     = m_MatchedCount + m_UnmatchedLeftCount + m_UnmatchedRightCount;
+
+            if (m_UnmatchedLeftCount > 0)
+            {
+                var uL = new int[m_UnmatchedLeftCount];
+                for (int i = 0; i < uL.Length; i++) uL[i] = m_MatchedCount + i;
+                m_BufUnmatchedLeft = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedLeftCount, 4)
+                    { name = "MorphUnmatchedLeft" };
+                m_BufUnmatchedLeft.SetData(uL);
+            }
+            if (m_UnmatchedRightCount > 0)
+            {
+                var uR = new int[m_UnmatchedRightCount];
+                for (int i = 0; i < uR.Length; i++) uR[i] = m_MatchedCount + i;
+                m_BufUnmatchedRight = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_UnmatchedRightCount, 4)
+                    { name = "MorphUnmatchedRight" };
+                m_BufUnmatchedRight.SetData(uR);
+            }
+        }
+
         void AllocateOutputBuffers()
         {
             // Output buffers are sized to the full morph splat count, not just matched pairs.
@@ -766,8 +822,12 @@ namespace GaussianSplatting.Runtime
             int nA = m_AssetLeft.splatCount;
             // Position and Other are always written in the morph kernels' own fixed packed
             // layout (Norm11 pos, rot+Norm6-scale Other) regardless of the source assets'
-            // formats — see SplatMorph.compute's OUT_OTHER_STRIDE. Only SH is a passthrough
-            // copy of A's source data, so its stride still derives from A's actual format.
+            // formats — see SplatMorph.compute's OUT_OTHER_STRIDE. SH is allocated at A's
+            // stride but NOT written by any kernel yet (real per-splat SH lerp/copy is a
+            // TODO) — left explicitly zeroed below rather than reading uninitialized GPU
+            // memory as SH coefficients, which previously produced random rainbow-colored
+            // splats (root-caused via live GPU buffer introspection, KitchenOfMemories
+            // BurningHouse Layers, session with attempt-inconsistent color corruption).
             const int posStride = 4;   // EncodeNorm11, 1 uint/splat
             const int otherStride = 8; // OUT_OTHER_STRIDE: rot(4) + Norm6 scale(4)
             int shStride = layerA.m_SHData != null ? layerA.m_SHData.GetData<byte>().Length / nA : 0;
@@ -780,6 +840,7 @@ namespace GaussianSplatting.Runtime
             m_BufOutPos   = new GraphicsBuffer(outTarget, posLen   / 4, 4) { name = "MorphOutPos" };
             m_BufOutOther = new GraphicsBuffer(outTarget, otherLen / 4, 4) { name = "MorphOutOther" };
             m_BufOutSH    = new GraphicsBuffer(outTarget, shLen    / 4, 4) { name = "MorphOutSH" };
+            m_BufOutSH.SetData(new uint[shLen / 4]); // zeroed — see comment above; no kernel writes this buffer yet
 
             var (tw,  th)  = GaussianSplatAsset.CalcTextureSize(m_TotalMorphCount);
             var (twB, _)   = GaussianSplatAsset.CalcTextureSize(m_AssetRight.splatCount);

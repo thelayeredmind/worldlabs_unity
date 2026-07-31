@@ -12,6 +12,7 @@ namespace GaussianSplatting.Editor
         SerializedProperty m_AssetLeft;
         SerializedProperty m_AssetRight;
         SerializedProperty m_MorphMap;
+        SerializedProperty m_MatchByUnsortedIndex;
         SerializedProperty m_T;
         SerializedProperty m_DebugTintUnmatched;
         SerializedProperty m_DebugDisableUnmatchedA;
@@ -22,6 +23,7 @@ namespace GaussianSplatting.Editor
             m_AssetLeft  = serializedObject.FindProperty("m_AssetLeft");
             m_AssetRight = serializedObject.FindProperty("m_AssetRight");
             m_MorphMap   = serializedObject.FindProperty("m_MorphMap");
+            m_MatchByUnsortedIndex = serializedObject.FindProperty("m_MatchByUnsortedIndex");
             m_T          = serializedObject.FindProperty("m_T");
             m_DebugTintUnmatched = serializedObject.FindProperty("m_DebugTintUnmatched");
             m_DebugDisableUnmatchedA = serializedObject.FindProperty("m_DebugDisableUnmatchedA");
@@ -98,19 +100,24 @@ namespace GaussianSplatting.Editor
                 }
             }
 
+            bool matchByIndexChanged = false;
             if (m_MorphMap.objectReferenceValue == null && morpher.assetLeft != null && morpher.assetRight != null)
             {
                 EditorGUILayout.HelpBox(
                     "No MorphMap found for these assets — all splats will be treated as unmatched " +
                     "(pure fade, no lerp). Use Tools → Gaussian Splats → Build Morph Map to create one.",
                     MessageType.Info);
+
+                EditorGUI.BeginChangeCheck();
+                EditorGUILayout.PropertyField(m_MatchByUnsortedIndex, new GUIContent("Match by Unsorted Index"));
+                matchByIndexChanged = EditorGUI.EndChangeCheck();
             }
 
             // Reassigning the MorphMap field only updates the serialized reference — none of the
             // derived GPU state (matched/unmatched counts, index buffers) is rebuilt from it
             // automatically. Without this, the morpher keeps running on the PREVIOUS map's buffers
             // after you pick a different one in the inspector, silently comparing the wrong data.
-            if (morphMapFieldChanged)
+            if (morphMapFieldChanged || matchByIndexChanged)
             {
                 serializedObject.ApplyModifiedProperties();
                 morpher.SetAssets(morpher.assetLeft, morpher.assetRight, morpher.morphMap);
