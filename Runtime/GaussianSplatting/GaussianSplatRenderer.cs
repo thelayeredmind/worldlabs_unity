@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using Unity.Collections;
@@ -370,6 +371,17 @@ namespace GaussianSplatting.Runtime
         [Header("Mask")]
         public GaussianSplatMask m_Mask;
         [Range(0f, 1f)] public float m_MaskT = 0f;
+        [Tooltip("Time budget per frame (ms) for the deferred/budgeted resource load, used when a mask is assigned and m_MaskT is 0 at OnEnable.")]
+        public float m_BudgetedLoadFrameTimeMs = 2f;
+
+        /// <summary>
+        /// True once GPU resources are fully created and this renderer is safe to display.
+        /// False during a deferred/budgeted load (mask assigned + m_MaskT == 0 at OnEnable) —
+        /// external code driving a mask reveal (e.g. a Timeline gate) should wait for this
+        /// before starting to animate m_MaskT, to avoid a visual snap once loading catches up.
+        /// True immediately for the normal (non-deferred) case.
+        /// </summary>
+        public bool IsReady { get; private set; } = true;
 
         public Shader m_ShaderSplats;
         public Shader m_ShaderComposite;
@@ -881,6 +893,200 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        // Budgeted variant of UpdateRessources(), used when a mask is assigned and m_MaskT is
+        // 0 at OnEnable — the splat isn't supposed to be visible yet, so its GPU init cost can
+        // be spread across frames instead of paid synchronously in one. Mirrors the synchronous
+        // method's structure exactly, with a Stopwatch-budget yield inserted between each
+        // expensive call (same pattern as SceneRenderVisibilityToggle's ApplyBudgeted). Sets
+        // IsReady = true only once every resource this method creates is actually ready.
+        IEnumerator UpdateRessourcesBudgeted()
+        {
+            // Update()'s own asset-change-detection block (m_PrevAsset/m_PrevHash) normally
+            // gets set as a side effect of the synchronous CreateResourcesForAsset() path. This
+            // budgeted path bypasses that call entirely, so set them here too — otherwise
+            // Update()'s first tick after OnEnable would see m_PrevAsset != m_Asset as still
+            // true and re-trigger a second, synchronous load racing this coroutine.
+            if (!HasExternalBuffers && !HasValidRuntimeData)
+            {
+                m_PrevAsset = m_Asset;
+                m_PrevHash  = m_Asset ? m_Asset.dataHash : new Hash128();
+            }
+
+            DisposeResourcesForAsset();
+
+            if (!HasValidAsset)
+            {
+                IsReady = true;
+                yield break;
+            }
+
+            if (HasExternalBuffers)
+            {
+                IsReady = true;
+                yield break;
+            }
+
+            if (HasValidRuntimeData)
+            {
+                LoadFromRuntimeDataInternal(m_RuntimeData);
+                IsReady = true;
+                yield break;
+            }
+
+            if (m_LayerActivationState == null)
+            {
+                m_LayerActivationState = new List<int2>();
+                foreach (var layer in asset.layerInfo)
+                {
+                    m_LayerActivationState.Add(new int2(layer.Key, 1));
+                }
+            }
+
+            var activeLayers = m_LayerActivationState.Where(kv => kv.y > 0).Select(kv => kv.x).ToHashSet();
+            m_SplatCount = asset.layerInfo.Where(kv => activeLayers.Contains(kv.Key)).Sum(kv => kv.Value);
+
+            if (m_SplatCount == 0)
+            {
+                IsReady = true;
+                yield break;
+            }
+
+            m_centerEyeCamera = ResolveCenterEyeCamera();
+
+            int startFrame = Time.frameCount;
+            int yieldCount = 0;
+            Debug.Log($"[BudgetedLoad:{name}] started at frame {startFrame}");
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            bool CheckBudget()
+            {
+                if (sw.Elapsed.TotalMilliseconds < m_BudgetedLoadFrameTimeMs) return false;
+                sw.Restart();
+                yieldCount++;
+                Debug.Log($"[BudgetedLoad:{name}] yield #{yieldCount} at frame {Time.frameCount}");
+                return true;
+            }
+
+            int posSize, posMarker;
+            int otherSize, otherMarker;
+            int shSize, shMarker;
+            int colorSize, colorMarker;
+            int chunkSize, chunkMarker;
+            posSize = posMarker = otherSize = otherMarker = shSize = shMarker = colorSize = colorMarker = chunkSize = chunkMarker = 0;
+
+            foreach (var layerAssets in asset.LayerData.Where(l => activeLayers.Contains(l.layer)))
+            {
+                posSize += (int)layerAssets.m_PosData.dataSize;
+                otherSize += (int)layerAssets.m_OtherData.dataSize;
+                shSize += (int)(layerAssets.m_SHData != null ? layerAssets.m_SHData.dataSize : 0);
+                colorSize += (int)layerAssets.m_ColorData.dataSize;
+                chunkSize += (int)(layerAssets.m_ChunkData != null ? layerAssets.m_ChunkData.dataSize : 0);
+            }
+
+            var posDataArr = new NativeArray<byte>(NextMultipleOf(posSize, 4), Allocator.Persistent);
+            var otherDataArr = new NativeArray<byte>(NextMultipleOf(otherSize, 4), Allocator.Persistent);
+            var shDataArr = new NativeArray<byte>(NextMultipleOf(shSize, 4), Allocator.Persistent);
+            var colorDataArr = new NativeArray<byte>(colorSize, Allocator.Persistent);
+            var chunkDataArr = new NativeArray<byte>(chunkSize, Allocator.Persistent);
+
+            foreach (var layerAssets in asset.LayerData.Where(l => activeLayers.Contains(l.layer)))
+            {
+                var posAssetData = layerAssets.m_PosData.GetData<byte>();
+                var posSub = posDataArr.GetSubArray(posMarker, posAssetData.Length);
+                posMarker += posAssetData.Length;
+                posSub.CopyFrom(posAssetData);
+
+                var otherAssetData = layerAssets.m_OtherData.GetData<byte>();
+                var otherSub = otherDataArr.GetSubArray(otherMarker, otherAssetData.Length);
+                otherMarker += otherAssetData.Length;
+                otherSub.CopyFrom(otherAssetData);
+
+                var colorAssetData = layerAssets.m_ColorData.GetData<byte>();
+                var colorSub = colorDataArr.GetSubArray(colorMarker, colorAssetData.Length);
+                colorMarker += colorAssetData.Length;
+                colorSub.CopyFrom(colorAssetData);
+
+                if (layerAssets.m_SHData != null)
+                {
+                    var shAssetData = layerAssets.m_SHData.GetData<byte>();
+                    var shSub = shDataArr.GetSubArray(shMarker, shAssetData.Length);
+                    shMarker += shAssetData.Length;
+                    shSub.CopyFrom(shAssetData);
+                }
+
+                if (layerAssets.m_ChunkData != null)
+                {
+                    var chunkAssetData = layerAssets.m_ChunkData.GetData<byte>();
+                    var chunkSub = chunkDataArr.GetSubArray(chunkMarker, chunkAssetData.Length);
+                    chunkMarker += chunkAssetData.Length;
+                    chunkSub.CopyFrom(chunkAssetData);
+                }
+
+                if (CheckBudget()) yield return null;
+            }
+
+            m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, posDataArr.Length / 4, 4) { name = "GaussianPosData" };
+            m_GpuPosData.SetData(posDataArr);
+            if (CheckBudget()) yield return null;
+
+            m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, otherDataArr.Length / 4, 4) { name = "GaussianOtherData" };
+            m_GpuOtherData.SetData(otherDataArr);
+            if (CheckBudget()) yield return null;
+
+            var actualShDataArr = shDataArr;
+            if (asset.ClusteredSHData != null) actualShDataArr = asset.ClusteredSHData.GetData<byte>();
+            m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, actualShDataArr.Length / 4, 4) { name = "GaussianSHData" };
+            m_GpuSHData.SetData(actualShDataArr);
+            if (CheckBudget()) yield return null;
+
+            m_GpuColorData = CreateColorTexture(colorDataArr, asset.colorFormat, m_SplatCount);
+            if (CheckBudget()) yield return null;
+
+            if (chunkDataArr.Length > 0)
+            {
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw, chunkDataArr.Length / 4, 4) { name = "GaussianChunkData" };
+                m_GpuChunks.SetData(chunkDataArr);
+                m_GpuChunksValid = true;
+            }
+            else
+            {
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Raw,
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>() / 4, 4) { name = "GaussianChunkData" };
+                m_GpuChunksValid = false;
+            }
+            if (CheckBudget()) yield return null;
+
+            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, kGpuViewDataSize);
+            m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
+            m_GpuIndexBuffer.SetData(new ushort[]
+            {
+                0, 1, 2, 1, 3, 2,
+                4, 6, 5, 5, 6, 7,
+                0, 2, 4, 4, 2, 6,
+                1, 5, 3, 5, 7, 3,
+                0, 4, 1, 4, 5, 1,
+                2, 3, 6, 3, 7, 6
+            });
+
+            posDataArr.Dispose();
+            otherDataArr.Dispose();
+            shDataArr.Dispose();
+            colorDataArr.Dispose();
+            chunkDataArr.Dispose();
+
+            if (CheckBudget()) yield return null;
+
+            UpdateSortingType(m_gpuSortType);
+
+            if (m_CSSplatUtilities != null && m_Sorter != null)
+            {
+                InitSortBuffers(m_SplatCount);
+            }
+
+            IsReady = true;
+            Debug.Log($"[BudgetedLoad:{name}] IsReady=true at frame {Time.frameCount} ({Time.frameCount - startFrame} frames, {yieldCount} yields)");
+        }
+
         // Returns the packed format integer consumed by shaders and compute shaders.
         uint GetSplatFormat()
         {
@@ -1060,7 +1266,20 @@ namespace GaussianSplatting.Runtime
             m_MatSplats.SetInt(Props.DepthBlendOp, depthBlendOp);
 
             GaussianSplatRenderSystem.instance.RegisterSplat(this);
-            UpdateRessources();
+
+            // Mask assigned + MaskT==0 at OnEnable: not supposed to be visible yet, so the
+            // GPU init cost can be spread across frames instead of paid in one. IsReady stays
+            // false (external mask-reveal drivers should wait on it) until the coroutine
+            // finishes. Every other case keeps today's fully-synchronous behavior, unchanged.
+            if (m_Mask != null && m_MaskT == 0f)
+            {
+                IsReady = false;
+                StartCoroutine(UpdateRessourcesBudgeted());
+            }
+            else
+            {
+                UpdateRessources();
+            }
         }
 
         public void UpdateSortingType(GpuSorting.SortType sortType)
