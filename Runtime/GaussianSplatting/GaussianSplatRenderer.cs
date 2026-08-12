@@ -34,6 +34,62 @@ namespace GaussianSplatting.Runtime
 
         CommandBuffer m_CommandBuffer;
 
+        // Cross-renderer budgeted-load scheduler. Replaces each renderer starting its own
+        // UpdateRessourcesBudgeted() coroutine independently in the same activation frame
+        // (which stacked N renderers' expensive first segments together, see
+        // masking.session.md 2026-08-10). Renderers enqueue a request instead of starting
+        // their coroutine directly; Tick() (driven once/frame from any registered renderer's
+        // own Update(), deduped by frame number) starts at most one newly-queued renderer per
+        // frame, and only while fewer than BudgetedLoadConcurrentMax are already loading.
+        // Both knobs live in GaussianSplatSchedulerSettings (a Resources-loaded asset,
+        // editable via Edit > Project Settings > Gaussian Splat) rather than as fields here,
+        // since they need to be tunable from the Editor UI without a code change.
+        public float BudgetedLoadFrameTimeMs => GaussianSplatSchedulerSettings.instance.budgetedLoadFrameTimeMs;
+        public int BudgetedLoadConcurrentMax => GaussianSplatSchedulerSettings.instance.budgetedLoadConcurrentMax;
+
+        readonly Queue<GaussianSplatRenderer> m_BudgetedLoadQueue = new();
+        int m_BudgetedLoadInFlight;
+        int m_LastTickFrame = -1;
+
+        public void RequestBudgetedLoad(GaussianSplatRenderer r)
+        {
+            m_BudgetedLoadQueue.Enqueue(r);
+        }
+
+        public void NotifyBudgetedLoadFinished()
+        {
+            m_BudgetedLoadInFlight = Mathf.Max(0, m_BudgetedLoadInFlight - 1);
+        }
+
+        public void Tick(int frame)
+        {
+            if (frame == m_LastTickFrame)
+                return;
+            m_LastTickFrame = frame;
+
+            // Calling BeginBudgetedLoad()/StartCoroutine() directly here IS safe, even though
+            // it runs inline within whichever renderer's Update() triggers this Tick():
+            // UpdateRessourcesBudgetedInternal()'s own first statement is `yield return null`,
+            // which guarantees the coroutine returns immediately on this call and defers all
+            // its real work to next frame — so nothing expensive actually runs inline here.
+            // (Session-2026-08-12 briefly tried deferring this call itself by one Tick() as a
+            // fix, which was redundant/wrong: the coroutine-level yield is what actually
+            // matters, and without it deferring the CALL just moves the same inline cost to a
+            // different frame rather than removing it. Reverted back to this simpler form.)
+            if (m_BudgetedLoadInFlight >= BudgetedLoadConcurrentMax)
+                return;
+
+            while (m_BudgetedLoadQueue.Count > 0)
+            {
+                var r = m_BudgetedLoadQueue.Dequeue();
+                if (r == null)
+                    continue; // destroyed/unregistered while queued
+                m_BudgetedLoadInFlight++;
+                r.BeginBudgetedLoad();
+                break; // at most one new start per frame
+            }
+        }
+
         public void RegisterSplat(GaussianSplatRenderer r)
         {
             if (m_Splats.Count == 0)
@@ -122,7 +178,7 @@ namespace GaussianSplatting.Runtime
             foreach (var kvp in m_Splats)
             {
                 var gs = kvp.Key;
-                if (gs == null || !gs.isActiveAndEnabled || !gs.HasValidAsset || !gs.HasValidRenderSetup)
+                if (gs == null || !gs.isActiveAndEnabled || !gs.HasValidAsset || !gs.HasValidRenderSetup || !gs.IsReady)
                     continue;
                 // Frustum cull: skip renderers whose world-space bounds don't touch the camera frustum.
                 // Renderers with no bounds metadata (external-buffer path) are never culled.
@@ -371,8 +427,11 @@ namespace GaussianSplatting.Runtime
         [Header("Mask")]
         public GaussianSplatMask m_Mask;
         [Range(0f, 1f)] public float m_MaskT = 0f;
-        [Tooltip("Time budget per frame (ms) for the deferred/budgeted resource load, used when a mask is assigned and m_MaskT is 0 at OnEnable.")]
-        public float m_BudgetedLoadFrameTimeMs = 2f;
+        // Per-frame time budget for the deferred/budgeted load used to live here as a
+        // per-instance field, forcing hand-tuning on every GameObject (and, left at the
+        // shared default across many renderers, was itself part of why N renderers' loads
+        // stacked additively — see masking.session.md 2026-08-10). Now owned as a single
+        // shared setting: GaussianSplatRenderSystem.instance.BudgetedLoadFrameTimeMs.
 
         /// <summary>
         /// True once GPU resources are fully created and this renderer is safe to display.
@@ -901,6 +960,57 @@ namespace GaussianSplatting.Runtime
         // IsReady = true only once every resource this method creates is actually ready.
         IEnumerator UpdateRessourcesBudgeted()
         {
+            // Runs to completion via UpdateRessourcesBudgetedInternal(); this wrapper only
+            // exists to guarantee NotifyBudgetedLoadFinished() fires on every exit path
+            // (every yield break below, or normal fall-through) exactly once, so the
+            // scheduler's in-flight count in GaussianSplatRenderSystem stays accurate however
+            // this coroutine ends.
+            var inner = UpdateRessourcesBudgetedInternal();
+            try
+            {
+                while (inner.MoveNext())
+                    yield return inner.Current;
+            }
+            finally
+            {
+                // DisposeResourcesForAsset() (called at the top of the internal method) disposes
+                // m_GpuMaskWeights. Must be rebuilt SYNCHRONOUSLY here, not just marked dirty
+                // for Update() to pick up later — confirmed 1-2 frame race, ~95% confidence
+                // (masking.session.md 2026-08-12): Unity resumes a `yield return null`
+                // coroutine AFTER this frame's Update() calls have already run, but BEFORE
+                // this frame's rendering. IsReady is set true earlier in this same coroutine
+                // call, making GatherSplatsForCamera include this renderer in THIS SAME
+                // frame's render pass — but Update() (the only thing that previously read
+                // m_MaskDirty and called UpdateMaskBuffer()) already ran for this frame and
+                // won't run again until NEXT frame. Marking m_MaskDirty alone therefore left
+                // the renderer submitted-and-rendered for one full frame with a stale/disposed
+                // m_GpuMaskWeights before Update() got a chance to rebuild it next frame —
+                // exactly the observed "flashes for 1-2 frames every time" symptom. Calling
+                // UpdateMaskBuffer() directly closes the gap immediately, in the same
+                // coroutine call, before this frame's render pass ever runs.
+                UpdateMaskBuffer();
+                m_MaskDirty = false;
+                GaussianSplatRenderSystem.instance.NotifyBudgetedLoadFinished();
+            }
+        }
+
+        IEnumerator UpdateRessourcesBudgetedInternal()
+        {
+            // Force at least one frame boundary before ANY work below runs — including the
+            // cheap-looking DisposeResourcesForAsset()/HasValidAsset checks. StartCoroutine()
+            // always executes its callee synchronously up to its first yield, on the SAME
+            // call that invokes it, no matter WHEN that call happens — the scheduler
+            // (GaussianSplatRenderSystem.Tick/m_PendingStart) only controls which frame
+            // BeginBudgetedLoad()/StartCoroutine() gets called on, it can't stop that call
+            // itself from paying this coroutine's first segment inline. Session-2026-08-12
+            // mistakenly removed this yield, assuming the scheduler's per-frame staggering
+            // made it redundant — it doesn't: without it, whichever renderer's Update() the
+            // scheduler happens to start this frame still eats its own first segment's cost
+            // inline in that same Update() call, reproducing the original stacking symptom
+            // one layer up. This yield is what actually guarantees deferral; the scheduler's
+            // job is only to make sure at most one renderer needs it per frame.
+            yield return null;
+
             // Update()'s own asset-change-detection block (m_PrevAsset/m_PrevHash) normally
             // gets set as a side effect of the synchronous CreateResourcesForAsset() path. This
             // budgeted path bypasses that call entirely, so set them here too — otherwise
@@ -951,6 +1061,13 @@ namespace GaussianSplatting.Runtime
                 yield break;
             }
 
+            // No forced yield needed here anymore: GaussianSplatRenderSystem's scheduler
+            // (RequestBudgetedLoad/Tick) already staggers WHEN this coroutine gets started in
+            // the first place — at most one new renderer per frame, bounded by
+            // BudgetedLoadConcurrentMax in flight — so by the time this method's body runs,
+            // it's already on its own scheduled frame rather than stacked with other
+            // renderers activated in the same cascade. See masking.session.md 2026-08-10.
+
             m_centerEyeCamera = ResolveCenterEyeCamera();
 
             int startFrame = Time.frameCount;
@@ -960,7 +1077,7 @@ namespace GaussianSplatting.Runtime
             var sw = System.Diagnostics.Stopwatch.StartNew();
             bool CheckBudget()
             {
-                if (sw.Elapsed.TotalMilliseconds < m_BudgetedLoadFrameTimeMs) return false;
+                if (sw.Elapsed.TotalMilliseconds < GaussianSplatRenderSystem.instance.BudgetedLoadFrameTimeMs) return false;
                 sw.Restart();
                 yieldCount++;
                 Debug.Log($"[BudgetedLoad:{name}] yield #{yieldCount} at frame {Time.frameCount}");
@@ -1082,6 +1199,21 @@ namespace GaussianSplatting.Runtime
             {
                 InitSortBuffers(m_SplatCount);
             }
+
+            if (CheckBudget()) yield return null;
+
+            // Mask must be fully built and bound BEFORE IsReady flips — not after (a coroutine
+            // finally block would run this fully synchronously, un-budgeted, defeating the
+            // whole point of this method for large splat counts) and not deferred to Update()'s
+            // dirty-flag path (which races IsReady: Unity resumes this coroutine after that
+            // frame's Update() already ran but before that frame's render pass, so a
+            // dirty-flag-only signal would leave the renderer visible-but-unmasked for one full
+            // frame — confirmed bug, masking.session.md 2026-08-12). Building it here, as a
+            // budget-respecting step in the SAME gated sequence as the GPU resources above,
+            // makes "mask applied" part of the same readiness gate as "GPU resources ready"
+            // instead of two independently-timed signals racing each other.
+            UpdateMaskBuffer();
+            m_MaskDirty = false;
 
             IsReady = true;
             Debug.Log($"[BudgetedLoad:{name}] IsReady=true at frame {Time.frameCount} ({Time.frameCount - startFrame} frames, {yieldCount} yields)");
@@ -1271,15 +1403,29 @@ namespace GaussianSplatting.Runtime
             // GPU init cost can be spread across frames instead of paid in one. IsReady stays
             // false (external mask-reveal drivers should wait on it) until the coroutine
             // finishes. Every other case keeps today's fully-synchronous behavior, unchanged.
+            //
+            // Request goes through GaussianSplatRenderSystem's scheduler instead of starting
+            // the coroutine directly here — when N renderers activate in the same frame (e.g.
+            // one Activation Track cascade), the scheduler starts at most one new load per
+            // frame (bounded by BudgetedLoadConcurrentMax concurrently in flight), staggering
+            // each renderer's expensive first segment onto its own frame instead of stacking
+            // them together. See masking.session.md 2026-08-10.
             if (m_Mask != null && m_MaskT == 0f)
             {
                 IsReady = false;
-                StartCoroutine(UpdateRessourcesBudgeted());
+                GaussianSplatRenderSystem.instance.RequestBudgetedLoad(this);
             }
             else
             {
                 UpdateRessources();
             }
+        }
+
+        // Called by GaussianSplatRenderSystem.Tick() when this renderer's queued budgeted-load
+        // request is popped and it's this renderer's turn to actually start loading.
+        internal void BeginBudgetedLoad()
+        {
+            StartCoroutine(UpdateRessourcesBudgeted());
         }
 
         public void UpdateSortingType(GpuSorting.SortType sortType)
@@ -1653,12 +1799,30 @@ namespace GaussianSplatting.Runtime
 
         public void Update()
         {
+            // Advances the shared budgeted-load scheduler at most once per frame, regardless
+            // of how many registered renderers call Update() — dedup'd internally by frame
+            // number (GaussianSplatRenderSystem.Tick). Any registered renderer can drive this;
+            // the system itself is a plain class with no Update() of its own.
+            GaussianSplatRenderSystem.instance.Tick(Time.frameCount);
+
+            // While a budgeted load is in progress, UpdateRessourcesBudgetedInternal() (the
+            // coroutine) owns this renderer's state entirely — the material/asset/sort/mask
+            // checks below have nothing to do until it finishes. Without this guard, EVERY
+            // renderer paid real per-frame cost here (asset-hash comparison, ResolveCenterEye-
+            // Camera()'s Camera.main/SceneView lookup, the mask-dirty comparison) on EVERY
+            // frame for the entire loading window, not just once — confirmed via Profiler as
+            // direct SELF-time inside Update() itself (not a child call), consistent with N
+            // renderers' small-but-nonzero per-frame costs adding up across a multi-second
+            // load window. masking.session.md 2026-08-12.
+            if (!IsReady)
+                return;
+
             if (m_MatSplats == null || m_MatComposite == null || m_MatDebugPoints == null || m_MatDebugBoxes == null)
             {
                 DeInitialize();
                 Initialize();
             }
-            
+
             // Skip asset-change detection when external buffers or runtime data own the splat data.
             if (!HasExternalBuffers && !HasValidRuntimeData)
             {

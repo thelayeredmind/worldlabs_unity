@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Assertions;
 using UnityEngine.Rendering;
@@ -33,15 +34,41 @@ namespace GaussianSplatting.Runtime
         private FidelityFxSort _fidelityFxSort;
         private FidelityFxSort.Args _ffxSorterArgs;
 
+        // DeviceRadixSort/FidelityFxSort construction calls ComputeShader.FindKernel() and
+        // ComputeShader.IsSupported() several times each — the latter can force a synchronous
+        // driver-level shader validation on some platforms (confirmed source of a real
+        // Semaphore.WaitForSignal cost on Adreno/Vulkan, see masking.session.md 2026-08-10).
+        // Both results depend ONLY on the ComputeShader asset + SortType, never on the
+        // GameObject/GaussianSplatRenderer instance calling Create() — so when N renderers
+        // share the same compute shader (the common case), constructing a fresh
+        // DeviceRadixSort/FidelityFxSort per-renderer repeats the same expensive driver
+        // queries N times for an identical result. Cached here, keyed by (cs, sortType), so
+        // the real construction happens once per distinct shader+type combination; every
+        // renderer after the first reuses the cached instance instead of re-querying the
+        // driver. Each GpuSorting instance still owns its own _drsSorterArgs/_ffxSorterArgs
+        // (per-renderer sort buffers, set in Initialize()) — only the underlying sorter
+        // (kernel indices + validity, used read-only via .Valid/.Dispatch(cmd, args)) is
+        // shared, never the per-renderer mutable state.
+        static readonly Dictionary<ComputeShader, DeviceRadixSort> s_DeviceRadixSortCache = new();
+        static readonly Dictionary<ComputeShader, FidelityFxSort> s_FidelityFxSortCache = new();
+
         public void Create(SortType sortType, ComputeShader cs)
         {
             if (sortType == SortType.DeviceRadixSort)
             {
-                _deviceRadixSort = new DeviceRadixSort(cs);
+                if (!s_DeviceRadixSortCache.TryGetValue(cs, out _deviceRadixSort))
+                {
+                    _deviceRadixSort = new DeviceRadixSort(cs);
+                    s_DeviceRadixSortCache[cs] = _deviceRadixSort;
+                }
             }
             else if (sortType == SortType.FidelityFX)
             {
-                _fidelityFxSort = new FidelityFxSort(cs);
+                if (!s_FidelityFxSortCache.TryGetValue(cs, out _fidelityFxSort))
+                {
+                    _fidelityFxSort = new FidelityFxSort(cs);
+                    s_FidelityFxSortCache[cs] = _fidelityFxSort;
+                }
             }
             activeType = sortType;
         }
