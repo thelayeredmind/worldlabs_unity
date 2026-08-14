@@ -28,6 +28,45 @@ namespace GaussianSplatting.Runtime
         public static GaussianSplatRenderSystem instance => ms_Instance ??= new GaussianSplatRenderSystem();
         static GaussianSplatRenderSystem ms_Instance;
 
+        // Tick() used to be driven purely from "some registered renderer's own Update()" — this
+        // deadlocks the activation-staggering queue below: Unity calls OnEnable() for every
+        // GameObject in an Activation Track cascade BEFORE any of that frame's Update() calls run,
+        // so if all N renderers self-deactivate via ClaimActivationSlot() in the same cascade,
+        // NONE of them are left active to ever call Update()/Tick() again — the queue is stuck
+        // forever with nothing to drive it (confirmed live via reflection query, 2026-08-13: 9/9
+        // renderers left inactive, IsReady incorrectly true, queue non-empty, Tick() never
+        // advancing). Fix: a hidden, DontDestroyOnLoad driver GameObject/MonoBehaviour, created
+        // lazily on first use and never itself part of any content Activation Track, whose only
+        // job is calling Tick() every Update() — independent of whether any splat renderer is
+        // currently active. See performance.session.md 2026-08-13.
+        public static int DiagDriverUpdateCount;
+
+        sealed class Driver : MonoBehaviour
+        {
+            public void Update()
+            {
+                DiagDriverUpdateCount++;
+                instance.Tick(Time.frameCount);
+            }
+        }
+
+        void EnsureDriver()
+        {
+            if (m_Driver != null)
+                return;
+            // HideFlags.HideAndDontSave was tried first but leaves the GameObject outside any
+            // valid scene (confirmed live: go.scene.IsValid() == false) — Unity's Update() dispatch
+            // is scene-driven, so a HideAndDontSave object's Update() is simply never called,
+            // silently. HideInHierarchy alone (no DontSave) keeps it out of the Hierarchy window
+            // without breaking scene membership; DontDestroyOnLoad moves it to the persistent
+            // scene so it survives scene loads/unloads across the whole additive stack.
+            var go = new GameObject("GaussianSplatRenderSystem Driver") { hideFlags = HideFlags.HideInHierarchy };
+            if (Application.isPlaying)
+                UnityEngine.Object.DontDestroyOnLoad(go);
+            m_Driver = go.AddComponent<Driver>();
+        }
+        Driver m_Driver;
+
         readonly Dictionary<GaussianSplatRenderer, MaterialPropertyBlock> m_Splats = new();
         readonly HashSet<Camera> m_CameraCommandBuffersDone = new();
         readonly List<(GaussianSplatRenderer, MaterialPropertyBlock)> m_ActiveSplats = new();
@@ -50,6 +89,52 @@ namespace GaussianSplatting.Runtime
         readonly Queue<GaussianSplatRenderer> m_BudgetedLoadQueue = new();
         int m_BudgetedLoadInFlight;
         int m_LastTickFrame = -1;
+
+        // Activation staggering: at most one renderer may claim OnEnable()'s expensive work per
+        // frame. Every other renderer whose OnEnable() lands on an already-claimed frame
+        // deactivates itself and queues here instead; Tick() re-enables (SetActive(true)) one
+        // queued renderer per subsequent frame — mirroring the budgeted-load queue's one-start-
+        // per-frame pattern, but applied at GameObject activation itself rather than at the
+        // coroutine-start step. See performance.session.md (worldlabs_gaussian) 2026-08-13 [C].
+        readonly Queue<GaussianSplatRenderer> m_ActivationQueue = new();
+        int m_ActivationClaimedFrame = -1;
+
+        // Set while Tick() is actively reactivating a queued renderer, so that renderer's own
+        // OnEnable()/ClaimActivationSlot() call (fired synchronously and inline from
+        // SetActive(true) below) is let through unconditionally instead of re-queueing itself —
+        // the whole point of dequeuing it was to let it initialize THIS frame.
+        bool m_ReactivatingFromQueue;
+
+        // Called from OnEnable() itself (not Update() — the renderer may not reach Update() at
+        // all if it ends up queued). Returns true if THIS call is the one allowed to proceed with
+        // full initialization this frame; false means the caller must defer (queue + SetActive(false)).
+        // Temp diagnostic capture (in-memory, not Debug.Log — the console ring buffer is flooded
+        // by an unrelated editor-only log from GaussianSplatRendererEditor's AutoAssignResources,
+        // which was masking Debug.Log-based diagnostics here). Read via reflection after a test.
+        public static readonly List<string> DiagLog = new();
+
+        public bool ClaimActivationSlot(int frame)
+        {
+            bool claimed;
+            if (m_ReactivatingFromQueue)
+                claimed = true;
+            else if (frame == m_ActivationClaimedFrame)
+                claimed = false;
+            else
+            {
+                m_ActivationClaimedFrame = frame;
+                claimed = true;
+            }
+            DiagLog.Add($"[{Time.realtimeSinceStartup:F3}] ClaimActivationSlot frame={frame} reactivating={m_ReactivatingFromQueue} claimedFrame={m_ActivationClaimedFrame} -> {claimed} queueCount={m_ActivationQueue.Count}");
+            return claimed;
+        }
+
+        public void QueueForActivation(GaussianSplatRenderer r)
+        {
+            DiagLog.Add($"[{Time.realtimeSinceStartup:F3}] QueueForActivation {r.gameObject.name} queueCountBefore={m_ActivationQueue.Count}");
+            EnsureDriver();
+            m_ActivationQueue.Enqueue(r);
+        }
 
         public void RequestBudgetedLoad(GaussianSplatRenderer r)
         {
@@ -88,10 +173,27 @@ namespace GaussianSplatting.Runtime
                 r.BeginBudgetedLoad();
                 break; // at most one new start per frame
             }
+
+            // Re-enable at most one queued (self-deactivated) renderer per frame. SetActive(true)
+            // re-triggers OnEnable() synchronously/inline — m_ReactivatingFromQueue lets that
+            // specific call through ClaimActivationSlot() unconditionally instead of re-queueing.
+            while (m_ActivationQueue.Count > 0)
+            {
+                var r = m_ActivationQueue.Dequeue();
+                if (r == null)
+                    continue; // destroyed while queued
+                DiagLog.Add($"[{Time.realtimeSinceStartup:F3}] Tick reactivating {r.gameObject.name} frame={frame} queueCountAfterDequeue={m_ActivationQueue.Count}");
+                m_ReactivatingFromQueue = true;
+                r.gameObject.SetActive(true);
+                m_ReactivatingFromQueue = false;
+                break; // at most one reactivation per frame
+            }
         }
 
         public void RegisterSplat(GaussianSplatRenderer r)
         {
+            EnsureDriver();
+
             if (m_Splats.Count == 0)
             {
                 if (GraphicsSettings.currentRenderPipeline == null)
@@ -944,12 +1046,19 @@ namespace GaussianSplatting.Runtime
             chunkDataArr.Dispose();
 
             UpdateSortingType(m_gpuSortType);
-            
+
             // Only initialize sort buffers if we have valid compute shader and sorter
             if (m_CSSplatUtilities != null && m_Sorter != null)
             {
                 InitSortBuffers(splatCount);
             }
+
+            // Mirrors UpdateRessourcesBudgetedInternal()'s own mask build (see that method) —
+            // without this, m_GpuMaskWeights stays null after a synchronous load and the mask
+            // is never applied until something else (e.g. Update()'s m_MaskT dirty-check)
+            // happens to rebuild it.
+            UpdateMaskBuffer();
+            m_MaskDirty = false;
         }
 
         // Budgeted variant of UpdateRessources(), used when a mask is assigned and m_MaskT is
@@ -1347,6 +1456,20 @@ namespace GaussianSplatting.Runtime
 
         public void OnEnable()
         {
+            // Activation staggering: if another renderer already claimed this frame's activation
+            // slot (e.g. N renderers enabling together in one Activation Track cascade), this one
+            // deactivates itself and queues instead of paying its own OnEnable() cost inline —
+            // GaussianSplatRenderSystem re-enables one queued renderer per subsequent frame. This
+            // spreads N renderers' OnEnable() cost across N frames instead of stacking it in one.
+            // Play-Mode/runtime only — an Editor-authoring toggle should never be delayed by this.
+            // See performance.session.md 2026-08-13 [C].
+            if (Application.isPlaying && !GaussianSplatRenderSystem.instance.ClaimActivationSlot(Time.frameCount))
+            {
+                GaussianSplatRenderSystem.instance.QueueForActivation(this);
+                gameObject.SetActive(false);
+                return;
+            }
+
             RefreshEffectLayers();
             Initialize();
             GaussianQualityHUD.Register(this);
@@ -1357,16 +1480,71 @@ namespace GaussianSplatting.Runtime
             m_EffectLayers = GetComponents<GaussianSplatEffectLayer>();
         }
         
+        // Materials are stateless render templates shared across all renderers using the same
+        // shader set — every per-renderer/animated value (scale, opacity, gamma, mask, buffers)
+        // is set through a MaterialPropertyBlock at draw time (SetAssetDataOnMaterial), never on
+        // the Material object itself, so constructing one shared instance per shader combination
+        // instead of one per GameObject is safe. Cache key is the 4 source shaders (identical
+        // across every splat renderer in practice). Cuts ~4 Material constructions (each can
+        // trigger first-use shader variant compilation) per renderer OnEnable() down to a
+        // one-time cost for the whole scene. See performance.session.md 2026-08-13 [C].
+        readonly struct MatCacheKey : System.IEquatable<MatCacheKey>
+        {
+            readonly Shader splats, composite, debugPoints, debugBoxes;
+            public MatCacheKey(Shader s, Shader c, Shader dp, Shader db) { splats = s; composite = c; debugPoints = dp; debugBoxes = db; }
+            public bool Equals(MatCacheKey o) => splats == o.splats && composite == o.composite && debugPoints == o.debugPoints && debugBoxes == o.debugBoxes;
+            public override bool Equals(object o) => o is MatCacheKey k && Equals(k);
+            public override int GetHashCode() => System.HashCode.Combine(splats, composite, debugPoints, debugBoxes);
+        }
+
+        readonly struct MatCacheEntry
+        {
+            public readonly Material splats, composite, debugPoints, debugBoxes;
+            public MatCacheEntry(Material s, Material c, Material dp, Material db) { splats = s; composite = c; debugPoints = dp; debugBoxes = db; }
+        }
+
+        static readonly Dictionary<MatCacheKey, MatCacheEntry> s_MaterialCache = new();
+
+        void AcquireSharedMaterials()
+        {
+            var key = new MatCacheKey(m_ShaderSplats, m_ShaderComposite, m_ShaderDebugPoints, m_ShaderDebugBoxes);
+            if (!s_MaterialCache.TryGetValue(key, out var entry))
+            {
+                var matSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
+                var matComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
+                var matDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
+                var matDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
+
+                // Pass 1 ZTest: Vulkan/Quest uses reversed-Z (near=1, far=0) so the correct
+                // front-to-back depth test is GEqual, not LEqual as on DirectX/PCVR.
+                int zTestValue = SystemInfo.usesReversedZBuffer
+                    ? (int)UnityEngine.Rendering.CompareFunction.GreaterEqual
+                    : (int)UnityEngine.Rendering.CompareFunction.LessEqual;
+                matSplats.SetInt(Props.ZTest, zTestValue);
+
+                // Pass 2 BlendOp for the depth prepass RT:
+                // reversed-Z: keep highest depth (nearest) → BlendOp.Max (4)
+                // conventional-Z: keep lowest depth (nearest) → BlendOp.Min (3)
+                int depthBlendOp = SystemInfo.usesReversedZBuffer ? 4 : 3;
+                matSplats.SetInt(Props.DepthBlendOp, depthBlendOp);
+
+                entry = new MatCacheEntry(matSplats, matComposite, matDebugPoints, matDebugBoxes);
+                s_MaterialCache[key] = entry;
+            }
+
+            m_MatSplats = entry.splats;
+            m_MatComposite = entry.composite;
+            m_MatDebugPoints = entry.debugPoints;
+            m_MatDebugBoxes = entry.debugBoxes;
+        }
+
         public void EnsureMaterials()
         {
             if (m_MatSplats != null) return;
             if (m_ShaderSplats == null || m_ShaderComposite == null || m_ShaderDebugPoints == null || m_ShaderDebugBoxes == null) return;
             if (!SystemInfo.supportsComputeShaders) return;
 
-            m_MatSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
-            m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
-            m_MatDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
-            m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
+            AcquireSharedMaterials();
         }
 
         private void Initialize()
@@ -1379,23 +1557,7 @@ namespace GaussianSplatting.Runtime
             if (!SystemInfo.supportsComputeShaders)
                 return;
 
-            m_MatSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
-            m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
-            m_MatDebugPoints = new Material(m_ShaderDebugPoints) {name = "GaussianDebugPoints"};
-            m_MatDebugBoxes = new Material(m_ShaderDebugBoxes) {name = "GaussianDebugBoxes"};
-
-            // Pass 1 ZTest: Vulkan/Quest uses reversed-Z (near=1, far=0) so the correct
-            // front-to-back depth test is GEqual, not LEqual as on DirectX/PCVR.
-            int zTestValue = SystemInfo.usesReversedZBuffer
-                ? (int)UnityEngine.Rendering.CompareFunction.GreaterEqual
-                : (int)UnityEngine.Rendering.CompareFunction.LessEqual;
-            m_MatSplats.SetInt(Props.ZTest, zTestValue);
-
-            // Pass 2 BlendOp for the depth prepass RT:
-            // reversed-Z: keep highest depth (nearest) → BlendOp.Max (4)
-            // conventional-Z: keep lowest depth (nearest) → BlendOp.Min (3)
-            int depthBlendOp = SystemInfo.usesReversedZBuffer ? 4 : 3;
-            m_MatSplats.SetInt(Props.DepthBlendOp, depthBlendOp);
+            AcquireSharedMaterials();
 
             GaussianSplatRenderSystem.instance.RegisterSplat(this);
 
@@ -1410,7 +1572,7 @@ namespace GaussianSplatting.Runtime
             // frame (bounded by BudgetedLoadConcurrentMax concurrently in flight), staggering
             // each renderer's expensive first segment onto its own frame instead of stacking
             // them together. See masking.session.md 2026-08-10.
-            if (m_Mask != null && m_MaskT == 0f)
+            if (Application.isPlaying && m_Mask != null && m_MaskT == 0f)
             {
                 IsReady = false;
                 GaussianSplatRenderSystem.instance.RequestBudgetedLoad(this);
@@ -1599,10 +1761,13 @@ namespace GaussianSplatting.Runtime
             DisposeResourcesForAsset();
             GaussianSplatRenderSystem.instance.UnregisterSplat(this);
 
-            DestroyImmediate(m_MatSplats);
-            DestroyImmediate(m_MatComposite);
-            DestroyImmediate(m_MatDebugPoints);
-            DestroyImmediate(m_MatDebugBoxes);
+            // Materials are shared across renderers via s_MaterialCache (see AcquireSharedMaterials) —
+            // do not destroy them here, that would pull them out from under every other renderer still
+            // using the same cached entry. Just drop this instance's references; the cache owns lifetime.
+            m_MatSplats = null;
+            m_MatComposite = null;
+            m_MatDebugPoints = null;
+            m_MatDebugBoxes = null;
         }
 
         // Reused across CalcViewData calls to avoid a per-frame allocation for the frustum-plane upload.
